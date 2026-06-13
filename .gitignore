@@ -191,6 +191,18 @@ __pycache__
 
 #  utils/rk27utils 
 /utils/rk27utils/rkboottool/rkboottool
+/utils/rk27utils/nandextract/nandextract
+/utils/rk27utils/rk27load/rk27load
+/utils/rk27utils/rk27load/stage1/stage1.bin
+/utils/rk27utils/rk27load/stage1/stage1.map
+/utils/rk27utils/rk27load/stage2/stage2.bin
+/utils/rk27utils/rk27load/stage2/stage2.map
+/utils/rk27utils/rkusbtool/rkusbtool
+/utils/rk27utils/rkwtool/rkwtool
+/utils/rknanoutils/rkboottool/rkboottool
+
+# local cross-toolchain compatibility symlinks
+/cross-shim/
 
 # /utils/themeeditor/
 /utils/themeeditor/debug
