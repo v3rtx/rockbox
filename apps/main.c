@@ -344,11 +344,18 @@ static void c4pro_show_storage_verdict(void)
     unsigned fat1 = 0xffff;
     unsigned fat2 = 0xffff;
     unsigned root_sig = 0;
+    unsigned bootbin_sig = 0;
+    unsigned version_sig = 0;
+    unsigned rk28_sig = 0;
     int read0_rc;
     int read1_rc = -1;
     int read43_rc = -1;
     int root_rc = -1;
+    int bootbin_rc = -1;
+    int version_rc = -1;
+    int rk28_rc = -1;
     int root_bad = C4PRO_ROOT_EXPECTED_COUNT;
+    int content_ok = 0;
     bool boot_ok = false;
     bool fat_ok = false;
     bool root_ok = false;
@@ -395,6 +402,22 @@ static void c4pro_show_storage_verdict(void)
             root_bad = c4pro_check_expected_root_sector(sector);
             root_ok = root_bad < 0;
         }
+
+        bootbin_rc = storage_read_sectors(IF_MD(0,) 26985, 1, sector);
+        if (bootbin_rc == 0)
+            bootbin_sig = c4pro_probe_u32le(sector);
+
+        version_rc = storage_read_sectors(IF_MD(0,) 37117, 1, sector);
+        if (version_rc == 0)
+            version_sig = c4pro_probe_u32le(sector);
+
+        rk28_rc = storage_read_sectors(IF_MD(0,) 37121, 1, sector);
+        if (rk28_rc == 0)
+            rk28_sig = c4pro_probe_u32le(sector);
+
+        content_ok = bootbin_sig == 0x73726f50 &&
+                     version_sig == 0x00000198 &&
+                     rk28_sig == 0x38324b52;
     }
 
     verdict_ok = boot_ok && fat_ok && root_ok;
@@ -428,10 +451,13 @@ static void c4pro_show_storage_verdict(void)
     lcd_putsf(0, 7, "r%d m%d",
               c4pro_ftl_diag_hash_root_psec,
               c4pro_ftl_diag_hash_root_mode);
+    lcd_putsf(0, 8, "c%d b%d/%08x v%d/%08x",
+              content_ok, bootbin_rc, bootbin_sig, version_rc, version_sig);
+    lcd_putsf(0, 9, "k%d/%08x", rk28_rc, rk28_sig);
     lcd_update();
 
     if (verdict_ok)
-        sleep(3 * HZ);
+        sleep(5 * HZ);
     else
         while (1)
             sleep(HZ);
