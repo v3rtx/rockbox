@@ -456,8 +456,12 @@ static NO_INLINE int open_path_component(struct pathwalk *walkp,
 
     while ((rc = readdir_internal(stream, &compp->info, &dir_fatent)) > 0)
     {
+#ifdef C4PRO_NO_ISO_DECODE
+        (void)0;
+#else
         if (rc > 1 && !(callflags & FF_NOISO))
             iso_decode_d_name(dir_fatent.name);
+#endif
 
         if (!strcasecmp(compname, dir_fatent.name))
             break;
