@@ -46,8 +46,29 @@
 #include "strnatcmp.h"
 #include "keyboard.h"
 #include "button.h"
-#ifdef COLORFLY_C4_PRO
+#if defined(COLORFLY_C4_PRO) && \
+    (defined(C4PRO_FILETREE_PROBES) || defined(C4PRO_DIR_PROBE))
 #include "nand-target.h"
+#include "storage.h"
+#endif
+#if defined(SIMULATOR) && defined(COLORFLY_C4_PRO) && \
+    (defined(C4PRO_FILETREE_PROBES) || defined(C4PRO_DIR_PROBE))
+#include <stdint.h>
+/* C4-specific NAND access isn't available in hosted simulator builds.
+ * Provide a stub for filetree compilation; raw NAND probing is intentionally
+ * unavailable in this environment.
+ */
+uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
+                                uint32_t sector, void* databuffer,
+                                void* sparebuffer)
+{
+    (void)bank;
+    (void)page;
+    (void)sector;
+    (void)databuffer;
+    (void)sparebuffer;
+    return 1;
+}
 #endif
 
 #ifdef HAVE_MULTIVOLUME
@@ -78,7 +99,45 @@ static int strnatcasecmp_n(const char *a, const char *b, size_t n)
      return strnatcasecmp(a, b);
 }
 
-#ifdef COLORFLY_C4_PRO
+#if defined(COLORFLY_C4_PRO) && \
+    (defined(C4PRO_FILETREE_PROBES) || defined(C4PRO_DIR_PROBE))
+#define C4PRO_SYSTEM_PSEC_BASE 20480
+#define C4PRO_SECTORS_PER_PAGE 8
+#define C4PRO_ROOT_LBA 85
+#define C4PRO_ROOT_EXPECTED_COUNT 7
+#define C4PRO_PHYS_SCAN_PAGES 8192
+#define C4PRO_DIR_MIN_SCORE 16
+#define C4PRO_BAD_PSEC (-1)
+
+struct c4pro_phys_scan
+{
+    int root_psec;
+    int boot_psec;
+    int fat1_psec;
+    int fat1_dec_psec;
+    int root_dec_psec;
+    int fat1_page_dec_psec;
+    int root_page_dec_psec;
+    int dir_psec;
+    int dir_score;
+    unsigned dir_sig;
+    int dir_attr;
+    unsigned lba1_word;
+    unsigned lba43_word;
+    unsigned lba85_sig;
+    int lba85_attr;
+    unsigned boot_meta;
+    unsigned fat1_meta;
+    unsigned lba1_meta;
+    unsigned lba43_meta;
+    unsigned expect_root_meta;
+    unsigned dir_meta;
+    unsigned page0_word[C4PRO_SECTORS_PER_PAGE];
+    unsigned page0_dec_word[C4PRO_SECTORS_PER_PAGE];
+    unsigned page0_meta[C4PRO_SECTORS_PER_PAGE];
+};
+
+#ifdef C4PRO_DIR_PROBE
 struct c4pro_mapping_probe
 {
     const char *label;
@@ -86,7 +145,9 @@ struct c4pro_mapping_probe
     uint32_t spp;
     bool page_base;
 };
+#endif
 
+#if !defined(SIMULATOR) || defined(C4PRO_DIR_PROBE)
 static bool c4pro_read_mapped_sector(uint32_t base, uint32_t spp,
                                     bool page_base, uint32_t lba,
                                     unsigned char *out)
@@ -100,7 +161,44 @@ static bool c4pro_read_mapped_sector(uint32_t base, uint32_t spp,
 
     return c4pro_nand_read_sector(0, page, sec, out, NULL) == 0;
 }
+#endif
 
+#if !defined(SIMULATOR)
+static const char c4pro_root_expected_sfn[C4PRO_ROOT_EXPECTED_COUNT][11] =
+{
+    "APPDATA    ",
+    "RESOURCE   ",
+    "RK27BOOTBIN",
+    "SYSTEM     ",
+    "SYSTEM00   ",
+    "VERSION BIN",
+    "RK28IMG CHK",
+};
+
+static const char * const c4pro_root_expected_name[C4PRO_ROOT_EXPECTED_COUNT] =
+{
+    "APPDATA",
+    "RESOURCE",
+    "RK27BOOT.BIN",
+    "SYSTEM",
+    "SYSTEM00",
+    "VERSION.BIN",
+    "RK28IMG.CHK",
+};
+
+static const uint8_t c4pro_root_expected_attr[C4PRO_ROOT_EXPECTED_COUNT] =
+{
+    ATTR_DIRECTORY,
+    ATTR_DIRECTORY,
+    ATTR_ARCHIVE,
+    ATTR_DIRECTORY,
+    ATTR_DIRECTORY,
+    ATTR_ARCHIVE,
+    ATTR_ARCHIVE,
+};
+#endif
+
+#ifdef C4PRO_DIR_PROBE
 struct c4pro_boot_info
 {
     bool sig;
@@ -153,7 +251,9 @@ static bool c4pro_ascii_sfn(const unsigned char *p)
 
     return true;
 }
+#endif
 
+#if !defined(SIMULATOR) || defined(C4PRO_DIR_PROBE)
 #define C4PRO_PROBE_WAIT_MASK (BUTTON_UP | BUTTON_DOWN | BUTTON_LEFT | \
                                BUTTON_RIGHT | BUTTON_SELECT | BUTTON_NEXT | \
                                BUTTON_PREV | BUTTON_MENU | BUTTON_BACK | \
@@ -173,7 +273,422 @@ static void c4pro_wait_probe_keypress(void)
         break;
     }
 }
+#endif
 
+#if !defined(SIMULATOR)
+static int c4pro_check_root_sector(const unsigned char *sector)
+{
+    for (int i = 0; i < C4PRO_ROOT_EXPECTED_COUNT; i++)
+    {
+        const unsigned char *entry = sector + i * 32;
+        if (memcmp(entry, c4pro_root_expected_sfn[i], 11) ||
+            entry[11] != c4pro_root_expected_attr[i])
+            return i;
+    }
+
+    return -1;
+}
+
+static bool c4pro_sector_is_boot(const unsigned char *sector)
+{
+    uint32_t bps = sector[11] | ((uint32_t)sector[12] << 8);
+    uint16_t sig = sector[510] | ((uint16_t)sector[511] << 8);
+
+    return sig == 0xaa55 && bps == 512 &&
+           ((sector[0] == 0xeb && sector[2] == 0x90) || sector[0] == 0xe9) &&
+           !memcmp(sector + 3, "MSDOS5.0", 8);
+}
+
+static bool c4pro_sector_is_fat1(const unsigned char *sector)
+{
+    static const unsigned char fat1_sig[16] =
+    {
+        0xf8, 0xff, 0xff, 0xff, 0xff, 0xff, 0x04, 0x00,
+        0x05, 0x00, 0x06, 0x00, 0x07, 0x00, 0x08, 0x00,
+    };
+
+    return !memcmp(sector, fat1_sig, sizeof(fat1_sig));
+}
+
+static unsigned c4pro_pack4(const unsigned char *p)
+{
+    return ((unsigned)p[0] << 24) | ((unsigned)p[1] << 16) |
+           ((unsigned)p[2] << 8) | (unsigned)p[3];
+}
+
+static unsigned c4pro_spare_meta(const unsigned char *spare, int sec)
+{
+    const unsigned char *s = spare + sec * 16;
+    return ((unsigned)s[0] << 16) | ((unsigned)s[1] << 8) | (unsigned)s[2];
+}
+
+static unsigned c4pro_word16(const unsigned char *p)
+{
+    return (unsigned)p[0] | ((unsigned)p[1] << 8);
+}
+
+static void c4pro_descramble(const unsigned char *in, unsigned char *out,
+                             int size)
+{
+    static const unsigned char key[16] =
+    {
+        0x7c, 0x4e, 0x03, 0x04, 0x55, 0x05, 0x09, 0x07,
+        0x2d, 0x2c, 0x7b, 0x38, 0x17, 0x0d, 0x17, 0x11
+    };
+    unsigned char key1[0x100];
+    unsigned char key2[0x100];
+    int i3 = 0;
+    int idx = 0;
+
+    for (int i = 0; i < 0x100; i++)
+    {
+        key1[i] = i;
+        key2[i] = key[i & 0xf];
+    }
+
+    for (int i = 0; i < 0x100; i++)
+    {
+        int x = key1[i];
+        i3 = (key1[i] + i3 + key2[i]) & 0xff;
+        key1[i] = key1[i3];
+        key1[i3] = x;
+    }
+
+    for (int i = 0; i < size; i++)
+    {
+        int x = key1[(i + 1) & 0xff];
+        idx = (x + idx) & 0xff;
+        key1[(i + 1) & 0xff] = key1[idx];
+        key1[idx] = x & 0xff;
+        out[i] = key1[(key1[(i + 1) & 0xff] + x) & 0xff] ^ in[i];
+    }
+}
+
+static void c4pro_descramble_sector(const unsigned char *in, unsigned char *out)
+{
+    c4pro_descramble(in, out, SECTOR_SIZE);
+}
+
+static bool c4pro_sfn_byte_ok(unsigned char ch, int pos)
+{
+    if (ch == 0x20)
+        return pos > 0;
+
+    if (ch >= 'A' && ch <= 'Z')
+        return true;
+    if (ch >= '0' && ch <= '9')
+        return true;
+
+    switch (ch)
+    {
+        case '$':
+        case '%':
+        case '\'':
+        case '-':
+        case '_':
+        case '@':
+        case '~':
+        case '`':
+        case '!':
+        case '(':
+        case ')':
+        case '{':
+        case '}':
+        case '^':
+        case '#':
+        case '&':
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool c4pro_sfn_name_ok(const unsigned char *entry)
+{
+    int nonspace = 0;
+    int alpha = 0;
+    unsigned char first_nonspace = 0;
+    bool all_same = true;
+
+    for (int i = 0; i < 11; i++)
+    {
+        unsigned char ch = entry[i];
+
+        if (!c4pro_sfn_byte_ok(ch, i))
+            return false;
+
+        if (ch == 0x20)
+            continue;
+
+        if (nonspace == 0)
+            first_nonspace = ch;
+        else if (ch != first_nonspace)
+            all_same = false;
+
+        if (ch >= 'A' && ch <= 'Z')
+            alpha++;
+
+        nonspace++;
+    }
+
+    return nonspace >= 3 && alpha > 0 && !all_same;
+}
+
+static bool c4pro_attr_type_ok(unsigned char attr)
+{
+    unsigned char type = attr & (ATTR_VOLUME_ID | ATTR_DIRECTORY | ATTR_ARCHIVE);
+
+    if (attr == 0 || (attr & 0xc0) || attr == 0x0f)
+        return false;
+
+    return type == ATTR_DIRECTORY || type == ATTR_ARCHIVE ||
+           type == ATTR_VOLUME_ID;
+}
+
+static int c4pro_dir_sector_score(const unsigned char *sector,
+                                  unsigned *sig, int *matched_attr)
+{
+    int score = 0;
+    bool first_match = true;
+
+    for (int i = 0; i < 16; i++)
+    {
+        const unsigned char *entry = sector + i * 32;
+        unsigned char first = entry[0];
+        unsigned char entry_attr = entry[11];
+
+        if (first == 0x00)
+            break;
+        if (first == 0xe5 || first == 0xff)
+            continue;
+        if (!c4pro_attr_type_ok(entry_attr))
+            continue;
+        if (!c4pro_sfn_name_ok(entry))
+            continue;
+
+        if (first_match)
+        {
+            *sig = c4pro_pack4(entry);
+            *matched_attr = entry_attr;
+            first_match = false;
+        }
+
+        score += 4;
+        if ((entry_attr & (ATTR_DIRECTORY | ATTR_ARCHIVE)) == ATTR_DIRECTORY)
+            score += 2;
+        if (entry_attr == ATTR_DIRECTORY || entry_attr == ATTR_ARCHIVE)
+            score += 2;
+    }
+
+    return score;
+}
+
+static void c4pro_scan_phys(struct c4pro_phys_scan *out)
+{
+    static unsigned char page_data[C4PRO_SECTORS_PER_PAGE * SECTOR_SIZE];
+    static unsigned char page_spare[C4PRO_SECTORS_PER_PAGE * 16];
+
+    out->root_psec = C4PRO_BAD_PSEC;
+    out->boot_psec = C4PRO_BAD_PSEC;
+    out->fat1_psec = C4PRO_BAD_PSEC;
+    out->fat1_dec_psec = C4PRO_BAD_PSEC;
+    out->root_dec_psec = C4PRO_BAD_PSEC;
+    out->fat1_page_dec_psec = C4PRO_BAD_PSEC;
+    out->root_page_dec_psec = C4PRO_BAD_PSEC;
+    out->dir_psec = C4PRO_BAD_PSEC;
+    out->dir_score = 0;
+    out->dir_sig = 0;
+    out->dir_attr = -1;
+    out->lba1_word = 0xffff;
+    out->lba43_word = 0xffff;
+    out->lba85_sig = 0;
+    out->lba85_attr = -1;
+    out->boot_meta = 0xffffff;
+    out->fat1_meta = 0xffffff;
+    out->lba1_meta = 0xffffff;
+    out->lba43_meta = 0xffffff;
+    out->expect_root_meta = 0xffffff;
+    out->dir_meta = 0xffffff;
+    for (int i = 0; i < C4PRO_SECTORS_PER_PAGE; i++)
+    {
+        out->page0_word[i] = 0xffff;
+        out->page0_dec_word[i] = 0xffff;
+        out->page0_meta[i] = 0xffffff;
+    }
+
+    for (int page = 0; page < C4PRO_PHYS_SCAN_PAGES; page++)
+    {
+        static unsigned char page_dec[C4PRO_SECTORS_PER_PAGE * SECTOR_SIZE];
+
+        if (nand_read_page(0, page, page_data, page_spare, 1, 0))
+            continue;
+
+        c4pro_descramble(page_data, page_dec, sizeof(page_dec));
+
+        for (int sec = 0; sec < C4PRO_SECTORS_PER_PAGE; sec++)
+        {
+            unsigned char *sector = page_data + sec * SECTOR_SIZE;
+            unsigned char *page_dec_sector = page_dec + sec * SECTOR_SIZE;
+            int psec = page * C4PRO_SECTORS_PER_PAGE + sec;
+            int dir_score;
+            unsigned dir_sig = 0;
+            int dir_attr = -1;
+            unsigned char decoded[SECTOR_SIZE];
+
+            c4pro_descramble_sector(sector, decoded);
+
+            if (psec >= C4PRO_SYSTEM_PSEC_BASE &&
+                psec < C4PRO_SYSTEM_PSEC_BASE + C4PRO_SECTORS_PER_PAGE)
+            {
+                int i = psec - C4PRO_SYSTEM_PSEC_BASE;
+                out->page0_word[i] = c4pro_word16(sector);
+                out->page0_dec_word[i] = c4pro_word16(decoded);
+                out->page0_meta[i] = c4pro_spare_meta(page_spare, sec);
+            }
+
+            if (psec == C4PRO_SYSTEM_PSEC_BASE + 1)
+            {
+                out->lba1_word = c4pro_word16(sector);
+                out->lba1_meta = c4pro_spare_meta(page_spare, sec);
+            }
+            if (psec == C4PRO_SYSTEM_PSEC_BASE + 43)
+            {
+                out->lba43_word = c4pro_word16(sector);
+                out->lba43_meta = c4pro_spare_meta(page_spare, sec);
+            }
+            if (psec == C4PRO_SYSTEM_PSEC_BASE + C4PRO_ROOT_LBA)
+            {
+                out->lba85_sig = c4pro_pack4(sector);
+                out->lba85_attr = sector[11];
+                out->expect_root_meta = c4pro_spare_meta(page_spare, sec);
+            }
+
+            if (out->root_psec < 0 && c4pro_check_root_sector(sector) < 0)
+                out->root_psec = psec;
+
+            if (out->boot_psec < 0 && c4pro_sector_is_boot(sector))
+            {
+                out->boot_psec = psec;
+                out->boot_meta = c4pro_spare_meta(page_spare, sec);
+            }
+
+            if (out->fat1_psec < 0 && c4pro_sector_is_fat1(sector))
+            {
+                out->fat1_psec = psec;
+                out->fat1_meta = c4pro_spare_meta(page_spare, sec);
+            }
+
+            if (out->fat1_dec_psec < 0 && c4pro_sector_is_fat1(decoded))
+                out->fat1_dec_psec = psec;
+
+            if (out->root_dec_psec < 0 && c4pro_check_root_sector(decoded) < 0)
+                out->root_dec_psec = psec;
+
+            if (out->fat1_page_dec_psec < 0 &&
+                c4pro_sector_is_fat1(page_dec_sector))
+                out->fat1_page_dec_psec = psec;
+
+            if (out->root_page_dec_psec < 0 &&
+                c4pro_check_root_sector(page_dec_sector) < 0)
+                out->root_page_dec_psec = psec;
+
+            dir_score = c4pro_dir_sector_score(sector, &dir_sig, &dir_attr);
+            if (dir_score >= C4PRO_DIR_MIN_SCORE &&
+                dir_score > out->dir_score)
+            {
+                out->dir_psec = psec;
+                out->dir_score = dir_score;
+                out->dir_sig = dir_sig;
+                out->dir_attr = dir_attr;
+                out->dir_meta = c4pro_spare_meta(page_spare, sec);
+            }
+        }
+    }
+}
+
+static void c4pro_show_root_selfcheck(int direct_ok, int storage_ok,
+                                      int fat_ok, int count, int entry,
+                                      unsigned direct_sig,
+                                      unsigned storage_sig,
+                                      unsigned fat_sig,
+                                      int direct_attr,
+                                      int storage_attr,
+                                      int fat_len,
+                                      const struct c4pro_phys_scan *scan)
+{
+    static bool shown;
+
+    (void)direct_sig;
+    (void)storage_sig;
+    (void)fat_sig;
+    (void)direct_attr;
+    (void)storage_attr;
+    (void)fat_len;
+
+    if (shown)
+        return;
+    shown = true;
+
+    lcd_setfont(FONT_UI);
+    lcd_clear_display();
+    lcd_putsf(0, 0, "R D%d S%d F%d N%d E%d",
+              direct_ok, storage_ok, fat_ok, count, entry);
+    lcd_putsf(0, 1, "pR%d b%d pB%d", scan->root_psec,
+              scan->root_psec >= 0 ? scan->root_psec - C4PRO_ROOT_LBA : -1,
+              scan->boot_psec);
+    lcd_putsf(0, 2, "x1%04x x43%04x",
+              scan->lba1_word, scan->lba43_word);
+    lcd_putsf(0, 3, "x85%08x a%02x",
+              scan->lba85_sig, scan->lba85_attr);
+    lcd_putsf(0, 4, "mB%06x m1%06x",
+              scan->boot_meta, scan->lba1_meta);
+    lcd_putsf(0, 5, "m43%06x mR%06x",
+              scan->lba43_meta, scan->expect_root_meta);
+    lcd_putsf(0, 6, "pF%d mF%06x",
+              scan->fat1_psec, scan->fat1_meta);
+    lcd_putsf(0, 7, "dF%d dR%d",
+              scan->fat1_dec_psec, scan->root_dec_psec);
+    lcd_update();
+    button_clear_queue();
+    c4pro_wait_probe_keypress();
+
+    lcd_clear_display();
+    lcd_putsf(0, 0, "P0 words");
+    lcd_putsf(0, 1, "%04x %04x %04x %04x",
+              scan->page0_word[0], scan->page0_word[1],
+              scan->page0_word[2], scan->page0_word[3]);
+    lcd_putsf(0, 2, "%04x %04x %04x %04x",
+              scan->page0_word[4], scan->page0_word[5],
+              scan->page0_word[6], scan->page0_word[7]);
+    lcd_putsf(0, 3, "P0 meta");
+    lcd_putsf(0, 4, "%06x %06x",
+              scan->page0_meta[0], scan->page0_meta[1]);
+    lcd_putsf(0, 5, "%06x %06x",
+              scan->page0_meta[2], scan->page0_meta[3]);
+    lcd_putsf(0, 6, "%06x %06x",
+              scan->page0_meta[4], scan->page0_meta[5]);
+    lcd_putsf(0, 7, "%06x %06x",
+              scan->page0_meta[6], scan->page0_meta[7]);
+    lcd_update();
+    button_clear_queue();
+    c4pro_wait_probe_keypress();
+
+    lcd_clear_display();
+    lcd_putsf(0, 0, "Decode scan");
+    lcd_putsf(0, 1, "dF%d dR%d",
+              scan->fat1_dec_psec, scan->root_dec_psec);
+    lcd_putsf(0, 2, "cF%d cR%d",
+              scan->fat1_page_dec_psec, scan->root_page_dec_psec);
+    lcd_putsf(0, 3, "gP%d q%d",
+              scan->dir_psec, scan->dir_score);
+    lcd_update();
+    button_clear_queue();
+    c4pro_wait_probe_keypress();
+    lcd_setfont(FONT_UI);
+}
+#endif
+
+#ifdef C4PRO_DIR_PROBE
 static void c4pro_show_dir_probe(struct tree_context *c)
 {
     (void)c;
@@ -247,6 +762,7 @@ static void c4pro_show_dir_probe(struct tree_context *c)
     c4pro_wait_probe_keypress();
     lcd_setfont(FONT_UI);
 }
+#endif
 #endif
 
 int ft_build_playlist(struct tree_context* c, int start_index)
@@ -483,6 +999,23 @@ int ft_load(struct tree_context* c, const char* tempdir)
     struct dirent *entry;
     bool (*callback_show_item)(char *, int, struct tree_context *) = NULL;
     DIR *dir;
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_FILETREE_PROBES)
+    bool c4_root_check = false;
+    bool c4_root_error = false;
+    int c4_root_count = 0;
+    int c4_root_bad_entry = -1;
+    int c4_root_direct_ok = 1;
+    int c4_root_storage_ok = 1;
+    int c4_root_fat_ok = 1;
+    int c4_root_error_entry = -1;
+    unsigned c4_root_direct_sig = 0;
+    unsigned c4_root_storage_sig = 0;
+    unsigned c4_root_fat_sig = 0;
+    int c4_root_direct_attr = -1;
+    int c4_root_storage_attr = -1;
+    int c4_root_fat_len = -1;
+    struct c4pro_phys_scan c4_scan;
+#endif
 
     if (!c->is_browsing)
         c->browse = NULL;
@@ -496,6 +1029,10 @@ int ft_load(struct tree_context* c, const char* tempdir)
     }
     if(!dir)
         return -1; /* not a directory */
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_FILETREE_PROBES)
+    c4_root_check = !tempdir && !strcmp(c->currdir, "/");
+#endif
 
     c->dirsindir = 0;
     c->dirfull = false;
@@ -524,6 +1061,27 @@ int ft_load(struct tree_context* c, const char* tempdir)
         /* skip directories . and .. */
         if (dir_attr && is_dotdir_name(entry->d_name))
             continue;
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_FILETREE_PROBES)
+        if (c4_root_check && c4_root_count < C4PRO_ROOT_EXPECTED_COUNT)
+        {
+            if (c4_root_count == 0)
+            {
+                c4_root_fat_sig =
+                    c4pro_pack4((const unsigned char *)entry->d_name);
+                c4_root_fat_len = len;
+            }
+
+            if (strcmp((char *)entry->d_name,
+                       c4pro_root_expected_name[c4_root_count]) &&
+                c4_root_bad_entry < 0)
+            {
+                c4_root_bad_entry = c4_root_count;
+            }
+
+            c4_root_count++;
+        }
+#endif
 
         /* filter out dotfiles and hidden files */
         if (*c->dirfilter != SHOW_ALL &&
@@ -598,6 +1156,60 @@ int ft_load(struct tree_context* c, const char* tempdir)
     c->dirlength = files_in_dir;
     closedir(dir);
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_FILETREE_PROBES)
+    if (c4_root_check)
+    {
+        unsigned char direct_sector[SECTOR_SIZE];
+        unsigned char storage_sector[SECTOR_SIZE];
+        int direct_bad = -1;
+        int storage_bad = -1;
+
+        if (!c4pro_read_mapped_sector(C4PRO_SYSTEM_PSEC_BASE,
+                                      C4PRO_SECTORS_PER_PAGE, false,
+                                      C4PRO_ROOT_LBA, direct_sector))
+        {
+            c4_root_direct_ok = 0;
+        }
+        else
+        {
+            c4_root_direct_sig = c4pro_pack4(direct_sector);
+            c4_root_direct_attr = direct_sector[11];
+            direct_bad = c4pro_check_root_sector(direct_sector);
+            c4_root_direct_ok = direct_bad < 0;
+        }
+
+        if (storage_read_sectors(IF_MD(0,) C4PRO_ROOT_LBA, 1,
+                                 storage_sector) != 0)
+        {
+            c4_root_storage_ok = 0;
+        }
+        else
+        {
+            c4_root_storage_sig = c4pro_pack4(storage_sector);
+            c4_root_storage_attr = storage_sector[11];
+            storage_bad = c4pro_check_root_sector(storage_sector);
+            c4_root_storage_ok = storage_bad < 0;
+        }
+
+        c4_root_fat_ok = c4_root_bad_entry < 0 &&
+                         c4_root_count >= C4PRO_ROOT_EXPECTED_COUNT;
+
+        if (!c4_root_direct_ok)
+            c4_root_error_entry = direct_bad;
+        else if (!c4_root_storage_ok)
+            c4_root_error_entry = storage_bad;
+        else if (!c4_root_fat_ok)
+            c4_root_error_entry = c4_root_bad_entry >= 0 ?
+                                  c4_root_bad_entry : c4_root_count;
+
+        c4_root_error = !c4_root_direct_ok || !c4_root_storage_ok ||
+                        !c4_root_fat_ok;
+
+        if (c4_root_error)
+            c4pro_scan_phys(&c4_scan);
+    }
+#endif
+
     /* allow directories to be sorted into file list */
     cmp_data.sort_dir = (*c->dirfilter == SHOW_PLUGINS) ? SORT_AS_FILE : c->sort_dir;
 
@@ -622,7 +1234,7 @@ int ft_load(struct tree_context* c, const char* tempdir)
 
     qsort(tree_get_entries(c), files_in_dir, sizeof(struct entry), compare);
 
-#ifdef COLORFLY_C4_PRO
+#if defined(COLORFLY_C4_PRO) && defined(C4PRO_DIR_PROBE)
     c4pro_show_dir_probe(c);
 #endif
 
@@ -632,6 +1244,20 @@ int ft_load(struct tree_context* c, const char* tempdir)
         check_file_thumbnails(c); /* map .talk to ours */
 
     tree_unlock_cache(c);
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_FILETREE_PROBES)
+    if (c4_root_error)
+        c4pro_show_root_selfcheck(c4_root_direct_ok, c4_root_storage_ok,
+                                  c4_root_fat_ok, c4_root_count,
+                                  c4_root_error_entry,
+                                  c4_root_direct_sig,
+                                  c4_root_storage_sig,
+                                  c4_root_fat_sig,
+                                  c4_root_direct_attr,
+                                  c4_root_storage_attr,
+                                  c4_root_fat_len,
+                                  &c4_scan);
+#endif
 
     if (global_settings.keep_directory && get_current_activity() == ACTIVITY_FILEBROWSER)
     {

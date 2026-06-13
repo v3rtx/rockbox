@@ -81,6 +81,9 @@
 #if defined(HAVE_DEVICEDATA)
 #include "devicedata.h"
 #endif
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#include "nand-target.h"
+#endif
 
 #if (CONFIG_PLATFORM & PLATFORM_ANDROID)
 #include "notification.h"
@@ -96,6 +99,13 @@
 #include "tdspeed.h"
 #if defined(HAVE_RECORDING) && !defined(SIMULATOR)
 #include "pcm_record.h"
+#endif
+
+#if defined(SIMULATOR)
+#include "file.h"
+#include "dir.h"
+#include "rbunicode.h"
+#include <errno.h>
 #endif
 
 #ifdef BUTTON_REC
@@ -160,12 +170,535 @@
 
 static void init(void);
 
+#if defined(SIMULATOR)
+static void sim_dump_readdir(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (!dir)
+    {
+        printf("SIM_DUMP: failed to open %s\n", path);
+        return;
+    }
+
+    printf("SIM_DUMP: path=%s\n", path);
+    bool want_decode = getenv("SIM_DUMP_DECODE") != NULL &&
+                       strcmp(getenv("SIM_DUMP_DECODE"), "0");
+    bool want_hex = getenv("SIM_DUMP_HEX") != NULL &&
+                    strcmp(getenv("SIM_DUMP_HEX"), "0");
+    bool want_rc = getenv("SIM_DUMP_RC") != NULL &&
+                   strcmp(getenv("SIM_DUMP_RC"), "0");
+
+    struct dirent *result;
+    int idx = 0;
+    while ((result = readdir(dir)))
+    {
+        int rc = 1;
+        int len = strlen(result->d_name);
+        if (want_rc)
+            printf("SIM_DUMP[%d] path=%s len=%d rc=%d ", idx, path, len, rc);
+        else
+            printf("SIM_DUMP[%d] path=%s len=%d ", idx, path, len);
+        for (int i = 0; i < len; i++)
+            printf("%02X ", (unsigned char)result->d_name[i]);
+        if (want_decode && *result->d_name && (result->d_name[0] != '.'))
+        {
+            unsigned char decoded[FAT_DIRENTRY_NAME_MAX];
+            iso_decode((const unsigned char *)result->d_name, decoded, -1, len + 1);
+            printf("|%s| decoded=", result->d_name);
+            for (int i = 0; i < len; i++)
+                printf("%02X ", (unsigned char)decoded[i]);
+            printf("|%s|", decoded);
+        }
+        else
+        {
+            printf("|%s|", result->d_name);
+        }
+
+        if (want_hex)
+            printf(" wanthex=1");
+
+        printf("\n");
+        idx++;
+    }
+    printf("SIM_DUMP_DONE count=%d path=%s\n", idx, path);
+    closedir(dir);
+}
+#endif
+
 #ifdef COLORFLY_C4_PRO
 extern int c4pro_disk_diag_disk_init;
 extern int c4pro_disk_diag_fat0_rc;
 extern int c4pro_disk_diag_read_rc;
 extern unsigned c4pro_disk_diag_sig;
 extern unsigned c4pro_disk_diag_head;
+#if !defined(SIMULATOR)
+extern int c4pro_ftl_diag_hash_mapped;
+extern int c4pro_ftl_diag_hash_dupes;
+extern int c4pro_ftl_diag_hash_raw;
+extern int c4pro_ftl_diag_hash_secdec;
+extern int c4pro_ftl_diag_hash_pagedec;
+extern int c4pro_ftl_diag_hash_boot_psec;
+extern int c4pro_ftl_diag_hash_fat_psec;
+extern int c4pro_ftl_diag_hash_root_psec;
+extern int c4pro_ftl_diag_hash_boot_mode;
+extern int c4pro_ftl_diag_hash_fat_mode;
+extern int c4pro_ftl_diag_hash_root_mode;
+extern int c4pro_ftl_diag_hash_best_delta;
+extern int c4pro_ftl_diag_hash_best_delta_count;
+extern int c4pro_ftl_diag_sig_fat_psec;
+extern int c4pro_ftl_diag_sig_root_psec;
+extern int c4pro_ftl_diag_sig_fat_mode;
+extern int c4pro_ftl_diag_sig_root_mode;
+extern int c4pro_ftl_diag_synth_sectors;
+#endif
+
+#if !defined(SIMULATOR)
+#define C4PRO_ROOT_EXPECTED_COUNT 7
+#define C4PRO_FTL_BASE_PAGE 2560
+#define C4PRO_FTL_SCAN_PAGES 8192
+#define C4PRO_FTL_SECTORS_PER_PAGE 8
+#define C4PRO_FTL_PAGE_SIZE 4096
+#define C4PRO_FTL_SPARE_SIZE 128
+
+static const unsigned char c4pro_expected_root_sfn
+    [C4PRO_ROOT_EXPECTED_COUNT][11] =
+{
+    "APPDATA    ",
+    "RESOURCE   ",
+    "RK27BOOTBIN",
+    "SYSTEM     ",
+    "SYSTEM00   ",
+    "VERSION BIN",
+    "RK28IMG CHK",
+};
+
+static const unsigned char c4pro_expected_root_attr
+    [C4PRO_ROOT_EXPECTED_COUNT] =
+{
+    ATTR_DIRECTORY,
+    ATTR_DIRECTORY,
+    ATTR_ARCHIVE,
+    ATTR_DIRECTORY,
+    ATTR_DIRECTORY,
+    ATTR_ARCHIVE,
+    ATTR_ARCHIVE,
+};
+
+struct c4pro_boot_probe
+{
+    bool valid;
+    unsigned root_lba;
+    unsigned data_lba;
+    unsigned root_sectors;
+    unsigned sectors_per_fat;
+    unsigned fats;
+    unsigned reserved;
+};
+
+struct c4pro_root_candidate
+{
+    int psec;
+    int score;
+    unsigned meta;
+    unsigned sig;
+    unsigned char attr;
+};
+
+static unsigned c4pro_probe_u16le(const unsigned char *p)
+{
+    return (unsigned)p[0] | ((unsigned)p[1] << 8);
+}
+
+static unsigned c4pro_probe_u32le(const unsigned char *p)
+{
+    return (unsigned)p[0] | ((unsigned)p[1] << 8) |
+           ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+}
+
+static int c4pro_check_expected_root_sector(const unsigned char *sector)
+{
+    for (int i = 0; i < C4PRO_ROOT_EXPECTED_COUNT; i++)
+    {
+        const unsigned char *entry = sector + i * 32;
+
+        if (memcmp(entry, c4pro_expected_root_sfn[i], 11) ||
+            entry[11] != c4pro_expected_root_attr[i])
+            return i;
+    }
+
+    return -1;
+}
+
+static void c4pro_show_storage_verdict(void)
+{
+    static unsigned char sector[SECTOR_SIZE];
+    unsigned sig = 0;
+    unsigned bps = 0;
+    unsigned spc = 0;
+    unsigned rsvd = 0;
+    unsigned nfats = 0;
+    unsigned root_entries = 0;
+    unsigned fatsz = 0;
+    unsigned root_lba = 0;
+    unsigned first_data = 0;
+    unsigned fat1 = 0xffff;
+    unsigned fat2 = 0xffff;
+    unsigned root_sig = 0;
+    int read0_rc;
+    int read1_rc = -1;
+    int read43_rc = -1;
+    int root_rc = -1;
+    int root_bad = C4PRO_ROOT_EXPECTED_COUNT;
+    bool boot_ok = false;
+    bool fat_ok = false;
+    bool root_ok = false;
+    bool verdict_ok = false;
+
+    read0_rc = storage_read_sectors(IF_MD(0,) 0, 1, sector);
+    if (read0_rc == 0)
+    {
+        sig = c4pro_probe_u16le(sector + 510);
+        bps = c4pro_probe_u16le(sector + 11);
+        spc = sector[13];
+        rsvd = c4pro_probe_u16le(sector + 14);
+        nfats = sector[16];
+        root_entries = c4pro_probe_u16le(sector + 17);
+        fatsz = c4pro_probe_u16le(sector + 22);
+        root_lba = rsvd + nfats * fatsz;
+        if (bps != 0)
+            first_data = root_lba + (root_entries * 32 + bps - 1) / bps;
+
+        boot_ok = sig == 0xaa55 && bps == SECTOR_SIZE &&
+                  spc == 4 && rsvd == 1 && nfats == 2 &&
+                  fatsz == 42 && root_lba == 85 && first_data == 117 &&
+                  !memcmp(sector + 3, "MSDOS5.0", 8) &&
+                  !memcmp(sector + 54, "FAT16   ", 8);
+    }
+
+    if (boot_ok)
+    {
+        read1_rc = storage_read_sectors(IF_MD(0,) 1, 1, sector);
+        if (read1_rc == 0)
+            fat1 = c4pro_probe_u16le(sector);
+
+        read43_rc = storage_read_sectors(IF_MD(0,) 43, 1, sector);
+        if (read43_rc == 0)
+            fat2 = c4pro_probe_u16le(sector);
+
+        fat_ok = read1_rc == 0 && read43_rc == 0 &&
+                 fat1 == 0xfff8 && fat2 == 0x0000;
+
+        root_rc = storage_read_sectors(IF_MD(0,) root_lba, 1, sector);
+        if (root_rc == 0)
+        {
+            root_sig = c4pro_probe_u32le(sector);
+            root_bad = c4pro_check_expected_root_sector(sector);
+            root_ok = root_bad < 0;
+        }
+    }
+
+    verdict_ok = boot_ok && fat_ok && root_ok;
+
+    lcd_setfont(FONT_UI);
+    lcd_clear_display();
+    lcd_putsf(0, 0, "C4FS %s b%u r%u d%u",
+              verdict_ok ? "OK" : "BAD", bps, root_lba, first_data);
+    lcd_putsf(0, 1, "r%d f%d/%04x %d/%04x rr%d",
+              read0_rc, read1_rc, fat1, read43_rc, fat2, root_rc);
+    lcd_putsf(0, 2, "s%04x n%u z%d q%08x", sig, root_entries,
+              root_bad, root_sig);
+    lcd_putsf(0, 3, "y%d h%d u%d",
+              c4pro_ftl_diag_synth_sectors,
+              c4pro_ftl_diag_hash_mapped, c4pro_ftl_diag_hash_dupes);
+    lcd_putsf(0, 4, "x%d/%d/%d d%d n%d",
+              c4pro_ftl_diag_hash_raw, c4pro_ftl_diag_hash_secdec,
+              c4pro_ftl_diag_hash_pagedec,
+              c4pro_ftl_diag_hash_best_delta,
+              c4pro_ftl_diag_hash_best_delta_count);
+    lcd_putsf(0, 5, "b%d m%d F%d m%d",
+              c4pro_ftl_diag_hash_boot_psec,
+              c4pro_ftl_diag_hash_boot_mode,
+              c4pro_ftl_diag_sig_fat_psec,
+              c4pro_ftl_diag_sig_fat_mode);
+    lcd_putsf(0, 6, "R%d m%d f%d m%d",
+              c4pro_ftl_diag_sig_root_psec,
+              c4pro_ftl_diag_sig_root_mode,
+              c4pro_ftl_diag_hash_fat_psec,
+              c4pro_ftl_diag_hash_fat_mode);
+    lcd_putsf(0, 7, "r%d m%d",
+              c4pro_ftl_diag_hash_root_psec,
+              c4pro_ftl_diag_hash_root_mode);
+    lcd_update();
+
+    if (verdict_ok)
+        sleep(3 * HZ);
+    else
+        while (1)
+            sleep(HZ);
+}
+
+static unsigned c4pro_probe_meta(const unsigned char *spare, int sec)
+{
+    const unsigned char *s = spare + sec * 16;
+    return ((unsigned)s[0] << 16) | ((unsigned)s[1] << 8) | (unsigned)s[2];
+}
+
+static bool c4pro_probe_is_sfn_char(unsigned char c)
+{
+    static const char extra[] = "$%'-_@~`!(){}^#&";
+
+    if (c == ' ')
+        return true;
+    if (c >= 'A' && c <= 'Z')
+        return true;
+    if (c >= '0' && c <= '9')
+        return true;
+
+    return strchr(extra, c) != NULL;
+}
+
+static bool c4pro_probe_attr_valid(unsigned char attr)
+{
+    if (attr == 0 || attr == 0x0f)
+        return false;
+    if (attr & 0xc0)
+        return false;
+    if (attr & 0x08)
+        return false;
+    if ((attr & 0x30) == 0x30)
+        return false;
+
+    return (attr & 0x3f) != 0;
+}
+
+static bool c4pro_probe_repeated_fill(const unsigned char *sector)
+{
+    unsigned counts[256];
+    int max = 0;
+    int max_byte = 0;
+
+    memset(counts, 0, sizeof(counts));
+
+    for (int i = 0; i < SECTOR_SIZE; i++)
+    {
+        unsigned char b = sector[i];
+        counts[b]++;
+        if ((int)counts[b] > max)
+        {
+            max = counts[b];
+            max_byte = b;
+        }
+    }
+
+    return max_byte != 0x00 && max > 384;
+}
+
+static bool c4pro_probe_same_name(const unsigned char *a,
+                                  const unsigned char *b)
+{
+    return memcmp(a, b, 11) == 0;
+}
+
+static int c4pro_probe_sfn_score(const unsigned char *entry)
+{
+    bool has_name = false;
+    int score = 0;
+
+    if (entry[0] == 0x00 || entry[0] == 0xe5 || entry[0] == 0x05)
+        return 0;
+    if (!c4pro_probe_attr_valid(entry[11]))
+        return 0;
+
+    for (int i = 0; i < 11; i++)
+    {
+        if (!c4pro_probe_is_sfn_char(entry[i]))
+            return 0;
+        if (entry[i] != ' ')
+            has_name = true;
+    }
+
+    if (!has_name)
+        return 0;
+
+    if (entry[11] & 0x10)
+        score += 3;
+    if (entry[11] & 0x20)
+        score += 2;
+
+    return score + 1;
+}
+
+static int c4pro_probe_dir_score(const unsigned char *sector,
+                                 unsigned *sig, unsigned char *attr)
+{
+    int score = 0;
+    int entries = 0;
+    int unique_entries = 0;
+    unsigned char names[4][11];
+
+    *sig = c4pro_probe_u32le(sector);
+    *attr = sector[11];
+
+    if (c4pro_probe_repeated_fill(sector))
+        return 0;
+
+    for (int off = 0; off < SECTOR_SIZE; off += 32)
+    {
+        int entry_score;
+        bool duplicate = false;
+
+        if (sector[off] == 0x00)
+            break;
+
+        entry_score = c4pro_probe_sfn_score(sector + off);
+        if (entry_score > 0)
+        {
+            score += entry_score;
+            entries++;
+
+            for (int i = 0; i < unique_entries; i++)
+            {
+                if (c4pro_probe_same_name(names[i], sector + off))
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+
+            if (!duplicate && unique_entries < (int)ARRAYLEN(names))
+            {
+                memcpy(names[unique_entries], sector + off, 11);
+                unique_entries++;
+            }
+        }
+    }
+
+    if (entries < 2 || unique_entries < 2)
+        return 0;
+
+    return score;
+}
+
+static void c4pro_probe_consider_root(struct c4pro_root_candidate *best,
+                                      int psec, int score, unsigned meta,
+                                      unsigned sig, unsigned char attr)
+{
+    struct c4pro_root_candidate cand =
+    {
+        .psec = psec,
+        .score = score,
+        .meta = meta,
+        .sig = sig,
+        .attr = attr,
+    };
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (score <= best[i].score)
+            continue;
+
+        for (int j = 2; j > i; j--)
+            best[j] = best[j - 1];
+        best[i] = cand;
+        break;
+    }
+}
+
+static void c4pro_probe_parse_boot(const unsigned char *sector,
+                                   struct c4pro_boot_probe *boot)
+{
+    unsigned bps = c4pro_probe_u16le(sector + 11);
+    unsigned root_entries = c4pro_probe_u16le(sector + 17);
+
+    memset(boot, 0, sizeof(*boot));
+
+    if (sector[510] != 0x55 || sector[511] != 0xaa || bps != SECTOR_SIZE)
+        return;
+
+    boot->reserved = c4pro_probe_u16le(sector + 14);
+    boot->fats = sector[16];
+    boot->sectors_per_fat = c4pro_probe_u16le(sector + 22);
+    boot->root_sectors = (root_entries * 32 + bps - 1) / bps;
+    boot->root_lba = boot->reserved + boot->fats * boot->sectors_per_fat;
+    boot->data_lba = boot->root_lba + boot->root_sectors;
+    boot->valid = boot->fats > 0 && boot->sectors_per_fat > 0 &&
+                  boot->root_sectors > 0;
+}
+
+static void c4pro_show_ftl_probe(void)
+{
+#ifndef C4PRO_FTL_PROBE
+    return;
+#endif
+
+    static unsigned char page_data[C4PRO_FTL_PAGE_SIZE];
+    static unsigned char page_spare[C4PRO_FTL_SPARE_SIZE];
+    struct c4pro_boot_probe boot;
+    struct c4pro_root_candidate best[3] =
+    {
+        { -1, 0, 0, 0, 0 },
+        { -1, 0, 0, 0, 0 },
+        { -1, 0, 0, 0, 0 },
+    };
+    int boot_psec = -1;
+    unsigned boot_meta = 0xffffff;
+
+    memset(&boot, 0, sizeof(boot));
+
+    lcd_setfont(FONT_UI);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 FTL scan");
+    lcd_puts(0, 1, "wait");
+    lcd_update();
+
+    for (int page = 0; page < C4PRO_FTL_SCAN_PAGES; page++)
+    {
+        if (nand_read_page(0, page, page_data, page_spare, 1, 0))
+            continue;
+
+        for (int sec = 0; sec < C4PRO_FTL_SECTORS_PER_PAGE; sec++)
+        {
+            int psec = page * C4PRO_FTL_SECTORS_PER_PAGE + sec;
+            unsigned char *sector = page_data + sec * SECTOR_SIZE;
+            unsigned meta = c4pro_probe_meta(page_spare, sec);
+            unsigned sig;
+            unsigned char attr;
+            int dir_score;
+
+            if (psec == C4PRO_FTL_BASE_PAGE * C4PRO_FTL_SECTORS_PER_PAGE)
+            {
+                c4pro_probe_parse_boot(sector, &boot);
+                boot_psec = psec;
+                boot_meta = meta;
+            }
+
+            dir_score = c4pro_probe_dir_score(sector, &sig, &attr);
+            if (dir_score > 0)
+                c4pro_probe_consider_root(best, psec, dir_score, meta,
+                                          sig, attr);
+        }
+    }
+
+    lcd_clear_display();
+    lcd_puts(0, 0, "FTL auto");
+    lcd_putsf(0, 1, "B p%d m%06x", boot_psec, boot_meta);
+    lcd_putsf(0, 2, "R l%u d%u f%u",
+              boot.root_lba, boot.data_lba, boot.sectors_per_fat);
+    for (int i = 0; i < 3; i++)
+    {
+        int base = (boot.valid && best[i].psec >= 0) ?
+            best[i].psec - (int)boot.root_lba : -1;
+        lcd_putsf(0, 3 + i, "%d p%d b%d q%d a%02x",
+                  i + 1, best[i].psec, base, best[i].score, best[i].attr);
+    }
+    lcd_putsf(0, 6, "m %06x %06x", best[0].meta, best[1].meta);
+    lcd_putsf(0, 7, "s %08x", best[0].sig);
+    lcd_update();
+    while (true)
+        sleep(HZ);
+}
+
+#endif
 
 #define C4PRO_BOOT_STEP(step) do { } while (0)
 #define C4PRO_BOOT_HALT(step) do { } while (0)
@@ -294,6 +827,13 @@ int main(void)
      * see definition of INIT_ATTR in config.h */
     C4PRO_BOOT_STEP("root_menu");
     C4PRO_PRE_ROOT_MENU_HALT("pre root_menu");
+#if defined(SIMULATOR)
+    if (getenv("SIM_DUMP_DIR"))
+    {
+        sim_dump_readdir(getenv("SIM_DUMP_DIR"));
+        sim_dump_readdir("/");
+    }
+#endif
     CHART(">root_menu");
     root_menu();
 }
@@ -510,7 +1050,7 @@ static void init(void)
     init_dircache(true);
     init_dircache(false);
 #endif
-#ifdef HAVE_TAGCACHE
+#if defined(HAVE_TAGCACHE) && !defined(COLORFLY_C4_PRO)
     init_tagcache();
 #endif
     tree_mem_init();
@@ -884,6 +1424,10 @@ static void init(void)
 
     C4PRO_MOUNT_READY_HALT();
     C4PRO_BOOT_STEP("mount ok");
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    c4pro_show_storage_verdict();
+    c4pro_show_ftl_probe();
+#endif
     pcm_init();
     C4PRO_BOOT_STEP("pcm ok");
     dsp_init();
