@@ -178,7 +178,13 @@ file_error:
     RELEASE_DIRSTR(READER, dir);
 
     if (rc > 1)
+    {
+#ifdef C4PRO_NO_ISO_DECODE
+        (void)0;
+#else
         iso_decode_d_name(res->d_name);
+#endif
+    }
 
     return res;
 }
