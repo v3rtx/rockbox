@@ -180,14 +180,7 @@ static void c4pro_show_dir_probe(struct tree_context *c)
     unsigned char sector[SECTOR_SIZE];
     static const struct c4pro_mapping_probe probes[] =
     {
-        {"p", 20480, 8, false}, /* known logical-sector base */
-        {"q", 2520, 8, true},
-        {"r", 2544, 8, true},
-        {"s", 2552, 8, true},
-        {"t", 2560, 8, true},
-        {"u", 2568, 8, true},
-        {"v", 2576, 8, true},
-        {"x", 20480, 4, false},
+        {"p", 20480, 8, false}, /* confirmed working logical-sector base */
     };
     int scan_lba;
     int cand_lba;
