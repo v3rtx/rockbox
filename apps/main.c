@@ -284,6 +284,7 @@ static const unsigned char c4pro_expected_root_attr
     ATTR_ARCHIVE,
 };
 
+#ifdef C4PRO_FTL_PROBE
 struct c4pro_boot_probe
 {
     bool valid;
@@ -303,6 +304,7 @@ struct c4pro_root_candidate
     unsigned sig;
     unsigned char attr;
 };
+#endif
 
 static unsigned c4pro_probe_u16le(const unsigned char *p)
 {
@@ -424,45 +426,39 @@ static void c4pro_show_storage_verdict(void)
 
     lcd_setfont(FONT_UI);
     lcd_clear_display();
-    lcd_putsf(0, 0, "C4FS %s b%u r%u d%u",
-              verdict_ok ? "OK" : "BAD", bps, root_lba, first_data);
-    lcd_putsf(0, 1, "r%d f%d/%04x %d/%04x rr%d",
+    lcd_putsf(0, 0, "C4FS %s c%d y%d",
+              verdict_ok ? "OK" : "BAD", content_ok,
+              c4pro_ftl_diag_synth_sectors);
+    lcd_putsf(0, 1, "b%d/%08x",
+              bootbin_rc, bootbin_sig);
+    lcd_putsf(0, 2, "v%d/%08x k%d/%08x",
+              version_rc, version_sig, rk28_rc, rk28_sig);
+    lcd_putsf(0, 3, "r%d f%d/%04x %d/%04x rr%d",
               read0_rc, read1_rc, fat1, read43_rc, fat2, root_rc);
-    lcd_putsf(0, 2, "s%04x n%u z%d q%08x", sig, root_entries,
+    lcd_putsf(0, 4, "s%04x n%u z%d q%08x", sig, root_entries,
               root_bad, root_sig);
-    lcd_putsf(0, 3, "y%d h%d u%d",
-              c4pro_ftl_diag_synth_sectors,
-              c4pro_ftl_diag_hash_mapped, c4pro_ftl_diag_hash_dupes);
-    lcd_putsf(0, 4, "x%d/%d/%d d%d n%d",
+    lcd_putsf(0, 5, "h%d u%d x%d/%d/%d",
+              c4pro_ftl_diag_hash_mapped, c4pro_ftl_diag_hash_dupes,
               c4pro_ftl_diag_hash_raw, c4pro_ftl_diag_hash_secdec,
-              c4pro_ftl_diag_hash_pagedec,
+              c4pro_ftl_diag_hash_pagedec);
+    lcd_putsf(0, 6, "d%d n%d",
               c4pro_ftl_diag_hash_best_delta,
               c4pro_ftl_diag_hash_best_delta_count);
-    lcd_putsf(0, 5, "b%d m%d F%d m%d",
+    lcd_putsf(0, 7, "b%d m%d F%d m%d",
               c4pro_ftl_diag_hash_boot_psec,
               c4pro_ftl_diag_hash_boot_mode,
               c4pro_ftl_diag_sig_fat_psec,
               c4pro_ftl_diag_sig_fat_mode);
-    lcd_putsf(0, 6, "R%d m%d f%d m%d",
-              c4pro_ftl_diag_sig_root_psec,
-              c4pro_ftl_diag_sig_root_mode,
-              c4pro_ftl_diag_hash_fat_psec,
-              c4pro_ftl_diag_hash_fat_mode);
-    lcd_putsf(0, 7, "r%d m%d",
-              c4pro_ftl_diag_hash_root_psec,
-              c4pro_ftl_diag_hash_root_mode);
-    lcd_putsf(0, 8, "c%d b%d/%08x v%d/%08x",
-              content_ok, bootbin_rc, bootbin_sig, version_rc, version_sig);
-    lcd_putsf(0, 9, "k%d/%08x", rk28_rc, rk28_sig);
     lcd_update();
 
     if (verdict_ok)
-        sleep(5 * HZ);
+        sleep(3 * HZ);
     else
         while (1)
             sleep(HZ);
 }
 
+#ifdef C4PRO_FTL_PROBE
 static unsigned c4pro_probe_meta(const unsigned char *spare, int sec)
 {
     const unsigned char *s = spare + sec * 16;
@@ -653,10 +649,6 @@ static void c4pro_probe_parse_boot(const unsigned char *sector,
 
 static void c4pro_show_ftl_probe(void)
 {
-#ifndef C4PRO_FTL_PROBE
-    return;
-#endif
-
     static unsigned char page_data[C4PRO_FTL_PAGE_SIZE];
     static unsigned char page_spare[C4PRO_FTL_SPARE_SIZE];
     struct c4pro_boot_probe boot;
@@ -725,6 +717,8 @@ static void c4pro_show_ftl_probe(void)
 }
 
 #endif
+
+#endif /* !defined(SIMULATOR) */
 
 #define C4PRO_BOOT_STEP(step) do { } while (0)
 #define C4PRO_BOOT_HALT(step) do { } while (0)
@@ -1452,7 +1446,9 @@ static void init(void)
     C4PRO_BOOT_STEP("mount ok");
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
     c4pro_show_storage_verdict();
+#ifdef C4PRO_FTL_PROBE
     c4pro_show_ftl_probe();
+#endif
 #endif
     pcm_init();
     C4PRO_BOOT_STEP("pcm ok");
@@ -1464,6 +1460,9 @@ static void init(void)
     settings_load();
     CHART("<settings_load");
     C4PRO_BOOT_STEP("settings ok");
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    global_settings.dirfilter = SHOW_ALL;
+#endif
 
 #if defined(BUTTON_REC) || \
     (CONFIG_KEYPAD == GIGABEAT_PAD) || \
