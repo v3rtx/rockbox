@@ -40,14 +40,14 @@ static bool initialized = false;
 int nand_read_sectors(IF_MD(int drive,) sector_t start, int incount,
                      void* inbuf)
 {
-    (void)drive;
+    IF_MD( (void)drive; )
     return ftl_read(start, incount, inbuf);
 }
 
 int nand_write_sectors(IF_MD(int drive,) sector_t start, int count,
                       const void* outbuf)
 {
-    (void)drive;
+    IF_MD( (void)drive; )
     return ftl_write(start, count, outbuf);
 }
 
@@ -73,10 +73,15 @@ void nand_enable(bool on)
 
 void nand_get_info(IF_MD(int drive,) struct storage_info *info)
 {
-    (void)drive;
+    IF_MD( (void)drive; )
+#ifdef COLORFLY_C4_PRO
+    (*info).sector_size = SECTOR_SIZE;
+    (*info).num_sectors = 43008;
+#else
     uint32_t ppb = ftl_banks * (*ftl_nand_type).pagesperblock;
     (*info).sector_size = SECTOR_SIZE;
     (*info).num_sectors = (*ftl_nand_type).userblocks * ppb;
+#endif
     (*info).vendor = "";
     (*info).product = "";
     (*info).revision = "";

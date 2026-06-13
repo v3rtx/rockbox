@@ -44,8 +44,10 @@
 
 #define _DEBUG_PRINTF(a, varargs...) lcd_putsf(0, line++, (a), ##varargs);
 
+#if (CONFIG_STORAGE & STORAGE_SD)
 extern unsigned long sd_debug_time_rd;
 extern unsigned long sd_debug_time_wr;
+#endif
 extern enum lcd_type_t lcd_type;
 
 bool dbg_hw_info(void)
@@ -72,8 +74,10 @@ bool dbg_hw_info(void)
         _DEBUG_PRINTF("LCD type: %s", lcd_type == LCD_V1 ? "V1 (HX8340b)": "V2");
 #endif
         line++;
+#if (CONFIG_STORAGE & STORAGE_SD)
         _DEBUG_PRINTF("sd_debug_time_rd: %d", sd_debug_time_rd);
         _DEBUG_PRINTF("sd_debug_time_wr: %d", sd_debug_time_wr);
+#endif
         for(int i = 0; i < 4; i++)
         {
             unsigned long memmap = *(&MEMMAPA + i);
@@ -155,4 +159,3 @@ bool dbg_ports(void)
     lcd_setfont(FONT_UI);
     return false;
 }
-

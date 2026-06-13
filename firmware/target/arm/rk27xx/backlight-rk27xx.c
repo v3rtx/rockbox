@@ -82,6 +82,16 @@ static const unsigned short lin_brightness[] = {
     16133, 17963, 19968, 22156, 24534, 27110, 29893, 32890,
     36109, 39559, 43246, 47180, 51368, 55817, 60537, 65535
 };
+#elif defined(COLORFLY_C4_PRO)
+/* Placeholder curve copied from HM801 — C4 uses PWMT0 on the same pad type,
+ * but real backlight scaling needs probing.
+ */
+static const unsigned short lin_brightness[] = {
+    541, 542, 543, 544, 547, 549, 553, 556,
+    561, 566, 573, 580, 588, 597, 607, 618,
+    631, 644, 659, 676, 693, 713, 733, 756,
+    780, 806, 833, 862, 894, 927, 962, 1000
+};
 #endif
 
 bool backlight_hw_init(void)

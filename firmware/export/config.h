@@ -158,6 +158,7 @@
 #define RG_NANO_PAD        77
 #define CTRU_PAD           78
 #define HIBY_R3PROII_PAD   79
+#define C4PRO_PAD          80
 
 /* CONFIG_REMOTE_KEYPAD */
 #define H100_REMOTE   1
@@ -274,6 +275,7 @@
 #define LCD_SHANLING_Q1   70 /* as used by the Shanling Q1 */
 #define LCD_EROSQ         71 /* as used by the ErosQ (native) */
 #define LCD_ECHO_R1       72 /* ILI9342, as used by the Echo R1 */
+#define LCD_ILI9341_C4    73 /* ILI9341 as used by the Colorfly Pocket HiFi C4 Pro */
 
 /* LCD_PIXELFORMAT */
 #define HORIZONTAL_PACKING 1
@@ -487,6 +489,8 @@ Lyre prototype 1 */
 #include "config/hifimanhm60x.h"
 #elif defined(HM801)
 #include "config/hifimanhm801.h"
+#elif defined(COLORFLY_C4_PRO)
+#include "config/colorflyc4pro.h"
 #elif defined(SANSA_CONNECT)
 #include "config/sansaconnect.h"
 #elif defined(SDLAPP)

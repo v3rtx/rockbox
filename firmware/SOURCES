@@ -914,6 +914,8 @@ target/arm/as3525/lcd-ssd1303.c
 target/arm/lcd-ssd1815.c
 #elif CONFIG_LCD == LCD_HX8340B
 target/arm/rk27xx/lcd-hifiman.c
+#elif CONFIG_LCD == LCD_ILI9341_C4
+target/arm/rk27xx/lcd-c4pro.c
 #elif CONFIG_LCD == LCD_C200
 target/arm/lcd-c200_c200v2.c
 #elif CONFIG_LCD == LCD_FUZE
@@ -1680,7 +1682,9 @@ target/arm/rk27xx/kernel-rk27xx.c
 target/arm/rk27xx/system-rk27xx.c
 target/arm/rk27xx/backlight-rk27xx.c
 target/arm/rk27xx/adc-rk27xx.c
+#if (CONFIG_STORAGE & STORAGE_SD)
 target/arm/rk27xx/sd-rk27xx.c
+#endif
 target/arm/rk27xx/ftl-rk27xx.c
 target/arm/rk27xx/nand-rk27xx.c
 target/arm/rk27xx/usb-rk27xx.c
@@ -1903,6 +1907,12 @@ target/arm/rk27xx/hm60x/power-hm60x.c
 target/arm/rk27xx/hm801/button-hm801.c
 target/arm/rk27xx/hm801/powermgmt-hm801.c
 target/arm/rk27xx/hm801/power-hm801.c
+#endif
+
+#if defined(COLORFLY_C4_PRO)
+target/arm/rk27xx/c4pro/button-c4pro.c
+target/arm/rk27xx/c4pro/powermgmt-c4pro.c
+target/arm/rk27xx/c4pro/power-c4pro.c
 #endif
 
 #if defined(MA9) || defined(MA9C) || defined(MA8) || defined(MA8C)

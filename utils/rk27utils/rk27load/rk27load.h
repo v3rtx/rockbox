@@ -1,4 +1,4 @@
-#define USB_TIMEOUT     512
+#define USB_TIMEOUT     5000
 
 #define VENDORID        0x71b
 #define PRODUCTID       0x3201

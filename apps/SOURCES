@@ -254,6 +254,8 @@ keymaps/keymap-rk27xx-generic.c
 keymaps/keymap-hm60x.c
 #elif CONFIG_KEYPAD == HM801_PAD
 keymaps/keymap-hm801.c
+#elif CONFIG_KEYPAD == C4PRO_PAD
+keymaps/keymap-c4pro.c
 #elif CONFIG_KEYPAD == SANSA_CONNECT_PAD
 keymaps/keymap-sansa-connect.c
 #elif CONFIG_KEYPAD == SAMSUNG_YPR0_PAD

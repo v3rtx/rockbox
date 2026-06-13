@@ -11,5 +11,8 @@ void lcdctrl_bypass(unsigned int on_off);
 void lcd_display_init(void);
 
 void lcd_set_gram_area(int x_start, int y_start, int x_end, int y_end);
+#ifdef COLORFLY_C4_PRO
+void lcd_c4pro_direct_fill(unsigned int color);
+#endif
 
 #endif /* _LCDIF_RK27XX_H */

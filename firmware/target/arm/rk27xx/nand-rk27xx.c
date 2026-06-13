@@ -19,8 +19,11 @@
  *
  ****************************************************************************/
  
- #include "config.h"
- #include "nand-target.h"
+#include "config.h"
+#include "system.h"
+#include "kernel.h"
+#include "string.h"
+#include "nand-target.h"
 
 #if 0
 /* This is for documentation purpose as FTL has not been reverse engineered yet
@@ -416,75 +419,269 @@ void flash_read_sector(int page, unsigned char *secbuf, int nsec)
 }
 
 #endif
-const struct nand_device_info_type* nand_get_device_type(uint32_t bank);
+static const struct nand_device_info_type c4pro_micron_2cd9d53e88 =
+{
+    .id = 0x2cd9d53e,
+    .blocks = 8192,
+    .userblocks = 8192,
+    .pagesperblock = 128,
+    .blocksizeexponent = 17,
+    .tunk1 = 0,
+    .twp = 0,
+    .tunk2 = 0,
+    .tunk3 = 0,
+};
 
+static long last_activity = 0;
+
+static void nand_delay(void)
+{
+    volatile int i;
+
+    for (i = 0; i < 1000; i++)
+        ;
+}
+
+static bool nand_wait_ready(void)
+{
+    int i;
+
+    for (i = 0; i < 100000; i++)
+    {
+        if (FMCTL & FM_RDY)
+            return true;
+    }
+
+    return false;
+}
+
+static bool nand_wait_fl_ready(void)
+{
+    int i;
+
+    for (i = 0; i < 100000; i++)
+    {
+        if (FLCTL & FL_RDY)
+            return true;
+    }
+
+    return false;
+}
+
+static void nand_select(uint32_t bank)
+{
+    unsigned long ctl = FMCTL;
+
+    ctl &= 0xf0;
+    ctl |= 1u << bank;
+    FMCTL = ctl;
+}
+
+static void nand_deselect(void)
+{
+    FMCTL &= 0xf0;
+}
+
+static bool nand_read_id(uint32_t bank, unsigned char id[5])
+{
+    int i;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    FLASH_CMD(bank) = 0xff;
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return false;
+    }
+
+    FLASH_CMD(bank) = 0x90;
+    FLASH_ADDR(bank) = 0x00;
+
+    for (i = 0; i < 5; i++)
+        id[i] = FLASH_DATA(bank);
+
+    nand_deselect();
+    return true;
+}
+
+const struct nand_device_info_type* nand_get_device_type(uint32_t bank)
+{
+    unsigned char id[5];
+
+    if (bank != 0)
+        return NULL;
+
+    if (!nand_read_id(bank, id))
+        return NULL;
+
+    if (id[0] == 0x2c && id[1] == 0xd9 && id[2] == 0xd5 &&
+        id[3] == 0x3e && id[4] == 0x88)
+        return &c4pro_micron_2cd9d53e88;
+
+    return NULL;
+}
 
 uint32_t nand_read_page(uint32_t bank, uint32_t page, void* databuffer,
                         void* sparebuffer, uint32_t doecc,
                         uint32_t checkempty)
 {
-    /* TODO implement */
-    (void)bank;
-    (void)page;
-    (void)databuffer;
-    (void)sparebuffer;
+    unsigned i;
+    unsigned sector;
+#ifdef COLORFLY_C4_PRO
+    unsigned half;
+#endif
+    unsigned char *data = databuffer;
+    unsigned char *spare = sparebuffer;
+
     (void)doecc;
     (void)checkempty;
+
+    if (bank > 3 || (!data && !spare))
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    BCHCTL = 1;
+
+#ifdef COLORFLY_C4_PRO
+    for (half = 0; half < 2; half++)
+#else
+    for (half = 0; half < 1; half++)
+#endif
+    {
+        unsigned column = half * 2048;
+
+        FLASH_CMD(bank) = 0x00;
+        FLASH_ADDR(bank) = column & 0xff;
+        FLASH_ADDR(bank) = (column >> 8) & 0xff;
+        FLASH_ADDR(bank) = page & 0xff;
+        FLASH_ADDR(bank) = (page >> 8) & 0xff;
+        FLASH_ADDR(bank) = (page >> 16) & 0xff;
+        FLASH_CMD(bank) = 0x30;
+
+        nand_delay();
+
+        if (!nand_wait_ready())
+        {
+            nand_deselect();
+            return 1;
+        }
+
+        for (sector = 0; sector < 4; sector++)
+        {
+            unsigned out_sector = half * 4 + sector;
+
+            FLCTL = 0xA24 | ((sector & 3) << 3);
+            if (!nand_wait_fl_ready())
+            {
+                nand_deselect();
+                return 1;
+            }
+
+            if (data)
+            {
+                for (i = 0; i < 512; i++)
+                    data[out_sector * 512 + i] =
+                        *((volatile unsigned char *)&PAGE_BUF +
+                          ((sector & 3) << 9) + i);
+            }
+
+            if (spare)
+            {
+                for (i = 0; i < 16; i++)
+                    spare[out_sector * 16 + i] =
+                        *((volatile unsigned char *)&SPARE_BUF +
+                          ((sector & 3) << 4) + i);
+            }
+        }
+    }
+
+    nand_deselect();
+    last_activity = current_tick;
     return 0;
 }
 
 uint32_t nand_write_page(uint32_t bank, uint32_t page, void* databuffer,
                          void* sparebuffer, uint32_t doecc)
 {
-    /* TODO implement */
     (void)bank;
     (void)page;
     (void)databuffer;
     (void)sparebuffer;
     (void)doecc;
-    return 0;
+    return 1;
 }
 
 uint32_t nand_block_erase(uint32_t bank, uint32_t page)
 {
-    /* TODO implement */
     (void)bank;
     (void)page;
-    return 0;
+    return 1;
 }
 
 uint32_t nand_reset(uint32_t bank)
 {
-    /* TODO implement */
-    (void)bank;
+    if (bank > 3)
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+    nand_select(bank);
+    FLASH_CMD(bank) = 0xff;
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    nand_deselect();
+    last_activity = current_tick;
     return 0;
 }
 
 uint32_t nand_device_init(void)
 {
-    /* TODO implement */
-    return 0;
+    SCU_CLKCFG &= ~CLKCFG_NAND;
+    nand_deselect();
+
+    return nand_get_device_type(0) ? 0 : 1;
 }
 
 void nand_power_up(void)
 {
-    /* TODO implement */
+    SCU_CLKCFG &= ~CLKCFG_NAND;
 }
 
 void nand_power_down(void)
 {
-    /* TODO implement */
 }
 
 void nand_set_active(void)
 {
-    /* TODO implement */
+    nand_power_up();
+    last_activity = current_tick;
 }
 
 long nand_last_activity(void)
 {
-    /* TODO implement */
-    return 0;
+    return last_activity;
 }
 
 int nand_spinup_time(void)

@@ -140,7 +140,9 @@ void system_init(void)
                   CLKCFG_UART0      |        /* UART0 clock */
                   CLKCFG_VIP        |        /* VIP clock */
                   CLKCFG_HCLK_VIP   |        /* VIP HCLK */
+#ifndef COLORFLY_C4_PRO
                   CLKCFG_LCDC       |        /* LCDC clock */
+#endif
                   CLKCFG_NAND       |        /* NAND HCLK */
                   CLKCFG_UHC        |        /* USB host HCLK */
                   CLKCFG_DSP        |        /* DSP clock */

@@ -21,36 +21,82 @@
  
 #include "config.h"
 #include "ftl-target.h"
+#include "nand-target.h"
+#include "string.h"
 
-/* this file provides empty STUBS for now */
+#ifdef COLORFLY_C4_PRO
+/* Saved raw/logical dumps from the C4 show the system image as a contiguous
+ * read-only window: logical LBA N maps to raw physical sector 20480 + N.
+ */
+#define C4PRO_SYSTEM_PSEC_BASE 20480
+#define C4PRO_SYSTEM_SECTORS   43008
+#define C4PRO_SECTORS_PER_PAGE 8
+
+static unsigned char page_data[4096];
+static unsigned char page_spare[128];
+#endif
 
 uint32_t ftl_init(void)
 {
-    /* TODO implement */
+    if (nand_device_init())
+        return 1;
+
+    ftl_nand_type = nand_get_device_type(0);
+    if (!ftl_nand_type)
+        return 1;
+
+    ftl_banks = 1;
     return 0;
 }
 
 uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
 {
-    /* TODO implement */
+#ifdef COLORFLY_C4_PRO
+    unsigned char *out = buffer;
+    uint32_t cached_page = 0xffffffff;
+
+    if (sector > C4PRO_SYSTEM_SECTORS ||
+        count > C4PRO_SYSTEM_SECTORS - sector)
+        return 1;
+
+    while (count > 0)
+    {
+        uint32_t psec = C4PRO_SYSTEM_PSEC_BASE + sector;
+        uint32_t page = psec / C4PRO_SECTORS_PER_PAGE;
+        uint32_t sector_in_page = psec & (C4PRO_SECTORS_PER_PAGE - 1);
+
+        if (page != cached_page)
+        {
+            if (nand_read_page(0, page, page_data, page_spare, 1, 0))
+                return 1;
+
+            cached_page = page;
+        }
+
+        memcpy(out, page_data + sector_in_page * 512, 512);
+        out += 512;
+        sector++;
+        count--;
+    }
+
+    return 0;
+#else
     (void)sector;
     (void)count;
     (void)buffer;
-    return 0;
+    return 1;
+#endif
 }
 
 uint32_t ftl_write(uint32_t sector, uint32_t count, const void* buffer)
 {
-    /* TODO implement */
     (void)sector;
     (void)count;
     (void)buffer;
-    return 0;
+    return 1;
 }
 
 uint32_t ftl_sync(void)
 {
-    /* TODO implement */
     return 0;
 }
-

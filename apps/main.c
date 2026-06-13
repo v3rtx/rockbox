@@ -159,6 +159,49 @@
 // #define AUTOROCK_ARG "/jpegs/sample.jpg"
 
 static void init(void);
+
+#ifdef COLORFLY_C4_PRO
+extern int c4pro_disk_diag_disk_init;
+extern int c4pro_disk_diag_fat0_rc;
+extern int c4pro_disk_diag_read_rc;
+extern unsigned c4pro_disk_diag_sig;
+extern unsigned c4pro_disk_diag_head;
+
+#define C4PRO_BOOT_STEP(step) do { } while (0)
+#define C4PRO_BOOT_HALT(step) do { } while (0)
+#define C4PRO_APP_ENTRY_HALT() do { } while (0)
+#define C4PRO_SYSTEM_HALT() do { } while (0)
+#define C4PRO_KERNEL_HALT() do { } while (0)
+#define C4PRO_FILESYSTEM_HALT() do { } while (0)
+#define C4PRO_FREQ_HALT() do { } while (0)
+#define C4PRO_CPU_HALT() do { } while (0)
+#define C4PRO_INIT_MID_HALT() do { } while (0)
+#define C4PRO_PRE_LOGO_HALT() do { } while (0)
+#define C4PRO_LOGO_RETURN_HALT() do { } while (0)
+#define C4PRO_PRE_STORAGE_HALT() do { } while (0)
+#define C4PRO_STORAGE_HALT() do { } while (0)
+#define C4PRO_MOUNT_READY_HALT() do { } while (0)
+#define C4PRO_POST_CORE_INIT_HALT() do { } while (0)
+#define C4PRO_PRE_ROOT_MENU_HALT(step) do { } while (0)
+#else
+#define C4PRO_BOOT_STEP(step) do { } while (0)
+#define C4PRO_BOOT_HALT(step) do { } while (0)
+#define C4PRO_APP_ENTRY_HALT() do { } while (0)
+#define C4PRO_SYSTEM_HALT() do { } while (0)
+#define C4PRO_KERNEL_HALT() do { } while (0)
+#define C4PRO_FILESYSTEM_HALT() do { } while (0)
+#define C4PRO_FREQ_HALT() do { } while (0)
+#define C4PRO_CPU_HALT() do { } while (0)
+#define C4PRO_INIT_MID_HALT() do { } while (0)
+#define C4PRO_PRE_LOGO_HALT() do { } while (0)
+#define C4PRO_LOGO_RETURN_HALT() do { } while (0)
+#define C4PRO_PRE_STORAGE_HALT() do { } while (0)
+#define C4PRO_STORAGE_HALT() do { } while (0)
+#define C4PRO_MOUNT_READY_HALT() do { } while (0)
+#define C4PRO_POST_CORE_INIT_HALT() do { } while (0)
+#define C4PRO_PRE_ROOT_MENU_HALT(step) do { } while (0)
+#endif
+
 /* main(), and various functions called by main() and init() may be
  * be INIT_ATTR. These functions must not be called after the final call
  * to root_menu() at the end of main()
@@ -173,22 +216,25 @@ int main(void) INIT_ATTR MAIN_NORETURN_ATTR;
 int main(void)
 {
 #endif
+    C4PRO_APP_ENTRY_HALT();
     CHART(">init");
     init();
     CHART("<init");
+    C4PRO_BOOT_HALT("init complete");
     FOR_NB_SCREENS(i)
     {
         screens[i].clear_display();
         screens[i].update();
     }
     list_init();
+    C4PRO_BOOT_STEP("tree_init");
     tree_init();
 #if defined(HAVE_DEVICEDATA) && !defined(BOOTLOADER) /* SIMULATOR */
     verify_device_data();
 #endif
     /* Keep the order of this 3
      * Must be done before any code uses the multi-screen API */
-#ifdef HAVE_USBSTACK
+#if defined(HAVE_USBSTACK) && !defined(COLORFLY_C4_PRO)
     /* All threads should be created and public queues registered by now */
     usb_start_monitoring();
 #endif
@@ -203,6 +249,7 @@ int main(void)
 #endif
 
 #if !defined(BOOTLOADER)
+#ifndef COLORFLY_C4_PRO
     allocate_playback_log();
     if (!file_exists(ROCKBOX_DIR"/playername.txt"))
     {
@@ -213,6 +260,7 @@ int main(void)
             close(fd);
         }
     }
+#endif
 #endif
 
 #ifdef AUTOROCK
@@ -244,6 +292,8 @@ int main(void)
     validate_start_directory_init();
     /* no calls INIT_ATTR functions after this point anymore!
      * see definition of INIT_ATTR in config.h */
+    C4PRO_BOOT_STEP("root_menu");
+    C4PRO_PRE_ROOT_MENU_HALT("pre root_menu");
     CHART(">root_menu");
     root_menu();
 }
@@ -292,7 +342,7 @@ int show_logo_boot( void )
     return 0;
 }
 
-#ifdef HAVE_DIRCACHE
+#if defined(HAVE_DIRCACHE) && !defined(COLORFLY_C4_PRO)
 static int INIT_ATTR init_dircache(bool preinit)
 {
     if (preinit)
@@ -324,7 +374,9 @@ static int INIT_ATTR init_dircache(bool preinit)
                 /* Print "Scanning disk..." to the display. */
                 splash(0, str(LANG_SCANNING_DISK));
                 dircache_wait();
+#ifndef COLORFLY_C4_PRO
                 backlight_on();
+#endif
                 show_logo_boot();
             }
 
@@ -340,7 +392,7 @@ static int INIT_ATTR init_dircache(bool preinit)
 }
 #endif /* HAVE_DIRCACHE */
 
-#ifdef HAVE_TAGCACHE
+#if defined(HAVE_TAGCACHE) && !defined(COLORFLY_C4_PRO)
 static void init_tagcache(void) INIT_ATTR;
 static void init_tagcache(void)
 {
@@ -390,7 +442,9 @@ static void init_tagcache(void)
 
     if (clear)
     {
+#ifndef COLORFLY_C4_PRO
         backlight_on();
+#endif
         show_logo_boot();
     }
 }
@@ -417,7 +471,9 @@ static void init(void)
     show_logo_boot();
     button_init();
     powermgmt_init();
+#ifndef COLORFLY_C4_PRO
     backlight_init();
+#endif
     unicode_init();
 #ifdef HAVE_MULTIVOLUME
     init_volume_names();
@@ -485,8 +541,10 @@ static void init(void)
     bool mounted = false;
 
     system_init();
+    C4PRO_SYSTEM_HALT();
     core_allocator_init();
     kernel_init();
+    C4PRO_KERNEL_HALT();
 
 #if defined(HAVE_BOOTDATA) && !defined(BOOTLOADER)
     verify_boot_data();
@@ -498,14 +556,17 @@ static void init(void)
 
     /* early early early! */
     filesystem_init();
+    C4PRO_FILESYSTEM_HALT();
 
 #ifdef HAVE_ADJUSTABLE_CPU_FREQ
     set_cpu_frequency(CPUFREQ_NORMAL);
+    C4PRO_FREQ_HALT();
 #ifdef CPU_COLDFIRE
     coldfire_set_pllcr_audio_bits(DEFAULT_PLLCR_AUDIO_BITS);
 #endif
     cpu_boost(true);
 #endif
+    C4PRO_CPU_HALT();
 
     i2c_init();
 
@@ -517,6 +578,7 @@ static void init(void)
 #endif
     /* current_tick should be ticking by now */
     CHART("ticking");
+    C4PRO_INIT_MID_HALT();
 
     unicode_init();
     lcd_init();
@@ -526,14 +588,19 @@ static void init(void)
     FOR_NB_SCREENS(i)
         global_status.font_id[i] = FONT_SYSFIXED;
     font_init();
+    C4PRO_BOOT_STEP("lcd/font ok");
 
     settings_reset();
+    C4PRO_PRE_LOGO_HALT();
 
     CHART(">show_logo");
     show_logo_boot();
     CHART("<show_logo");
+    C4PRO_LOGO_RETURN_HALT();
+    C4PRO_BOOT_STEP("logo ok");
     lang_init(core_language_builtin, language_strings,
               LANG_LAST_INDEX_IN_ARRAY);
+    C4PRO_BOOT_STEP("lang ok");
 
 #ifdef DEBUG
     debug_init();
@@ -548,17 +615,23 @@ static void init(void)
 #endif
 
     adc_init();
+    C4PRO_BOOT_STEP("adc ok");
 
+#ifndef COLORFLY_C4_PRO
     usb_init();
+#endif
 #if CONFIG_USBOTG == USBOTG_ISP1362
     isp1362_init();
 #elif CONFIG_USBOTG == USBOTG_M5636
     m5636_init();
 #endif
 
+#ifndef COLORFLY_C4_PRO
     backlight_init();
+#endif
 
     button_init();
+    C4PRO_BOOT_STEP("button ok");
 
     /* Don't initialize power management here if it could incorrectly
      * measure battery voltage, and it's not needed for charging. */
@@ -578,21 +651,29 @@ static void init(void)
     /* Keep the order of this 3 (viewportmanager handles statusbars)
      * Must be done before any code uses the multi-screen API */
     CHART(">gui_syncstatusbar_init");
+    C4PRO_BOOT_STEP("statusbar_init");
     gui_syncstatusbar_init(&statusbars);
     CHART("<gui_syncstatusbar_init");
     CHART(">sb_skin_init");
+    C4PRO_BOOT_STEP("sb_skin_init");
     sb_skin_init();
     CHART("<sb_skin_init");
     CHART(">gui_sync_wps_init");
+    C4PRO_BOOT_STEP("skin_init");
     gui_sync_skin_init();
     CHART("<gui_sync_wps_init");
     CHART(">viewportmanager_init");
+    C4PRO_BOOT_STEP("viewport_init");
     viewportmanager_init();
     CHART("<viewportmanager_init");
+    C4PRO_PRE_STORAGE_HALT();
 
     CHART(">storage_init");
+    C4PRO_BOOT_STEP("storage_init");
     rc = storage_init();
     CHART("<storage_init");
+    C4PRO_BOOT_STEP("storage ok");
+    C4PRO_STORAGE_HALT();
     if(rc)
     {
         lcd_clear_display();
@@ -644,12 +725,100 @@ static void init(void)
     if (!mounted)
     {
         CHART(">disk_mount_all");
+        C4PRO_BOOT_STEP("disk_mount");
         rc = disk_mount_all();
         CHART("<disk_mount_all");
         if (rc<=0)
         {
             int line=0;
             lcd_clear_display();
+#if defined(COLORFLY_C4_PRO)
+            static unsigned char sector[SECTOR_SIZE];
+            int read_rc;
+            int fat_rc = -1;
+            int root_rc = -1;
+            bool all_zero = true;
+            int i;
+            unsigned sig = 0;
+            unsigned byps = 0;
+            unsigned spc = 0;
+            unsigned rsvd = 0;
+            unsigned nfats = 0;
+            unsigned root_entries = 0;
+            unsigned fatsz = 0;
+            unsigned long totsec = 0;
+            unsigned root_lba = 0;
+            unsigned first_data = 0;
+            unsigned head0 = 0;
+            unsigned fat_head = 0;
+            unsigned root_head = 0;
+            char oem[9];
+            char fs[9];
+
+            oem[0] = '\0';
+            fs[0] = '\0';
+
+            read_rc = storage_read_sectors(IF_MD(0,) 0, 1, sector);
+            if (read_rc == 0)
+            {
+                for (i = 0; i < SECTOR_SIZE; i++)
+                {
+                    if (sector[i] != 0)
+                    {
+                        all_zero = false;
+                        break;
+                    }
+                }
+
+                sig = sector[510] | (sector[511] << 8);
+                byps = sector[11] | (sector[12] << 8);
+                spc = sector[13];
+                rsvd = sector[14] | (sector[15] << 8);
+                nfats = sector[16];
+                root_entries = sector[17] | (sector[18] << 8);
+                totsec = sector[19] | (sector[20] << 8);
+                if (totsec == 0)
+                    totsec = (unsigned long)sector[32] |
+                             ((unsigned long)sector[33] << 8) |
+                             ((unsigned long)sector[34] << 16) |
+                             ((unsigned long)sector[35] << 24);
+                fatsz = sector[22] | (sector[23] << 8);
+                root_lba = rsvd + nfats * fatsz;
+                if (byps != 0)
+                    first_data = root_lba + (root_entries * 32 + byps - 1) / byps;
+                head0 = (sector[0] << 16) | (sector[1] << 8) | sector[2];
+                memcpy(oem, sector + 3, 8);
+                oem[8] = '\0';
+                memcpy(fs, sector + 54, 8);
+                fs[8] = '\0';
+
+                fat_rc = storage_read_sectors(IF_MD(0,) 1, 1, sector);
+                if (fat_rc == 0)
+                    fat_head = sector[0] | (sector[1] << 8);
+
+                root_rc = storage_read_sectors(IF_MD(0,) root_lba, 1, sector);
+                if (root_rc == 0)
+                    root_head = sector[0] | (sector[1] << 8);
+            }
+
+            lcd_setfont(FONT_SYSFIXED);
+            lcd_clear_display();
+            lcd_set_foreground(LCD_WHITE);
+            lcd_puts(0, line++, "C4 STORE 20260613B");
+            lcd_putsf(0, line++, "dm%d di%d r%d s%04x h%06x f0%d", rc,
+                      c4pro_disk_diag_disk_init, c4pro_disk_diag_read_rc,
+                      c4pro_disk_diag_sig, c4pro_disk_diag_head,
+                      c4pro_disk_diag_fat0_rc);
+            lcd_putsf(0, line++, "m%d r%d z%d s%04x h%06x", rc, read_rc,
+                      all_zero ? 1 : 0, sig, head0);
+            lcd_putsf(0, line++, "o%.8s fs%.8s", oem, fs);
+            lcd_putsf(0, line++, "b%u c%u rs%u nf%u f%u", byps, spc, rsvd,
+                      nfats, fatsz);
+            lcd_putsf(0, line++, "t%lu rd%u fd%u re%u", totsec, root_lba,
+                      first_data, root_entries);
+            lcd_putsf(0, line++, "l1 %d %04x rt %d %04x", fat_rc, fat_head,
+                      root_rc, root_head);
+#else
             lcd_putsf(0, line++, "No partition found (%d).", rc);
 #ifndef USB_NONE
             lcd_puts(0, line++, "Insert USB cable");
@@ -657,9 +826,10 @@ static void init(void)
 #elif !defined(DEBUG) && !(CONFIG_STORAGE & STORAGE_RAMDISK)
             lcd_puts(0, line++, "Rebooting in 5s");
 #endif
+#endif
             lcd_puts(0, line++, rbversion);
 
-#ifdef STORAGE_GET_INFO
+#if !defined(COLORFLY_C4_PRO) && defined(STORAGE_GET_INFO)
             struct storage_info sinfo;
             storage_get_info(0, &sinfo);
 #ifdef MAX_PHYS_SECTOR_SIZE
@@ -684,7 +854,13 @@ static void init(void)
                 disk_set_sector_multiplier(IF_MD(i,) DEFAULT_VIRT_SECTOR_SIZE/SECTOR_SIZE);
 #endif
 
-#ifndef USB_NONE
+#if defined(COLORFLY_C4_PRO)
+            while (1)
+            {
+                lcd_update();
+                sleep(HZ / 2);
+            }
+#elif !defined(USB_NONE)
             usb_start_monitoring();
             while(button_get(true) != SYS_USB_CONNECTED) {};
             gui_usb_screen_run(true, button_get_data());
@@ -706,12 +882,18 @@ static void init(void)
         }
     }
 
+    C4PRO_MOUNT_READY_HALT();
+    C4PRO_BOOT_STEP("mount ok");
     pcm_init();
+    C4PRO_BOOT_STEP("pcm ok");
     dsp_init();
+    C4PRO_BOOT_STEP("dsp ok");
 
     CHART(">settings_load");
+    C4PRO_BOOT_STEP("settings_load");
     settings_load();
     CHART("<settings_load");
+    C4PRO_BOOT_STEP("settings ok");
 
 #if defined(BUTTON_REC) || \
     (CONFIG_KEYPAD == GIGABEAT_PAD) || \
@@ -732,9 +914,11 @@ static void init(void)
     }
 #endif
     CHART(">init_battery_tables");
+    C4PRO_BOOT_STEP("battery_tables");
     init_battery_tables();
     CHART("<init_battery_tables");
-#ifdef HAVE_DIRCACHE
+    C4PRO_BOOT_STEP("battery ok");
+#if defined(HAVE_DIRCACHE) && !defined(COLORFLY_C4_PRO)
     CHART(">init_dircache(true)");
     rc = init_dircache(true);
     CHART("<init_dircache(true)");
@@ -745,17 +929,21 @@ static void init(void)
 #endif /* HAVE_DIRCACHE */
 
     CHART(">settings_apply(true)");
+    C4PRO_BOOT_STEP("settings_apply");
     settings_apply(true);
     CHART("<settings_apply(true)");
-#ifdef HAVE_DIRCACHE
+    C4PRO_BOOT_STEP("apply ok");
+#if defined(HAVE_DIRCACHE) && !defined(COLORFLY_C4_PRO)
     CHART(">init_dircache(false)");
     init_dircache(false);
     CHART("<init_dircache(false)");
 #endif
-#ifdef HAVE_TAGCACHE
+#if defined(HAVE_TAGCACHE) && !defined(COLORFLY_C4_PRO)
     CHART(">init_tagcache");
+    C4PRO_BOOT_STEP("tagcache");
     init_tagcache();
     CHART("<init_tagcache");
+    C4PRO_BOOT_STEP("tagcache ok");
 #endif
 
 #ifdef HAVE_EEPROM_SETTINGS
@@ -769,15 +957,27 @@ static void init(void)
     }
 #endif
     playlist_init();
+    C4PRO_BOOT_STEP("playlist ok");
     tree_mem_init();
+    C4PRO_BOOT_STEP("tree_mem ok");
     filetype_init();
+    C4PRO_BOOT_STEP("filetype ok");
 
     shortcuts_init();
+    C4PRO_BOOT_STEP("shortcuts ok");
 
+#ifndef COLORFLY_C4_PRO
     CHART(">audio_init");
+    C4PRO_BOOT_STEP("audio_init");
     audio_init();
     CHART("<audio_init");
+    C4PRO_BOOT_STEP("audio ok");
     talk_announce_voice_invalid(); /* notify user w/ voice prompt if voice file invalid */
+    C4PRO_BOOT_STEP("talk ok");
+#else
+    C4PRO_BOOT_STEP("audio skipped");
+#endif
+    C4PRO_POST_CORE_INIT_HALT();
 
 #ifdef HAVE_WIFI
     wifi_init();
@@ -804,8 +1004,10 @@ static void init(void)
     CHART(">check_bootfile(false)");
 #endif
     CHART("<settings_apply_skins");
+    C4PRO_BOOT_STEP("skins_apply");
     settings_apply_skins();
     CHART(">settings_apply_skins");
+    C4PRO_BOOT_STEP("skins ok");
 }
 
 #ifdef CPU_PP

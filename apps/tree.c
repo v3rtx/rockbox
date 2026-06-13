@@ -328,6 +328,10 @@ static int tree_voice_cb(int selected_item, void * data)
 
 bool check_rockboxdir(void)
 {
+#ifdef COLORFLY_C4_PRO
+    return true;
+#endif
+
     if(!dir_exists(ROCKBOX_DIR))
     {   /* No need to localise this message.
            If .rockbox is missing, it wouldn't work anyway */

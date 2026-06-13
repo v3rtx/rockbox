@@ -77,6 +77,8 @@ xduoo-x3ii.c
 xduoo-x20.c
 #elif (CONFIG_KEYPAD == IHIFI_770_PAD) || (CONFIG_KEYPAD == IHIFI_800_PAD)
 ihifi2.c
+#elif CONFIG_KEYPAD == C4PRO_PAD
+c4pro.c
 #elif CONFIG_KEYPAD == EROSQ_PAD
 erosq.c
 #elif CONFIG_KEYPAD == FIIO_M3K_PAD

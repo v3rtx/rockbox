@@ -46,6 +46,52 @@ struct llp_t {
  */
 static struct llp_t scr_llp[LCD_HEIGHT];
 
+#ifdef COLORFLY_C4_PRO
+#define C4PRO_LCDIF_WAIT_LIMIT 1000000
+
+static bool lcdif_wait_mcu_idle(void)
+{
+    int i;
+
+    for (i = 0; i < C4PRO_LCDIF_WAIT_LIMIT; i++)
+    {
+        if (LCDC_STA & LCDC_MCU_IDLE)
+            return true;
+    }
+
+    return false;
+}
+
+static bool lcdif_wait_dma_done(uint8_t ch)
+{
+    int i;
+
+    for (i = 0; i < C4PRO_LCDIF_WAIT_LIMIT; i++)
+    {
+        if (!(DWDMA_CTL_L(ch) & (1 << 27)))
+            return true;
+    }
+
+    DWDMA_DMA_CHEN = 0x100 << ch;
+    DWDMA_CLEAR_BLOCK = 1 << ch;
+    DWDMA_CLEAR_TFR = 1 << ch;
+    DWDMA_CLEAR_ERR = 1 << ch;
+    return false;
+}
+#else
+static bool lcdif_wait_mcu_idle(void)
+{
+    while (!(LCDC_STA & LCDC_MCU_IDLE));
+    return true;
+}
+
+static bool lcdif_wait_dma_done(uint8_t ch)
+{
+    while (DWDMA_CTL_L(ch) & (1 << 27));
+    return true;
+}
+#endif
+
 static uint32_t lcd_data_transform(uint32_t data)
 {
     unsigned int r, g, b;
@@ -216,7 +262,7 @@ static void create_llp(int x, int y, int width, int height)
  */
 void lcdctrl_bypass(unsigned int on_off)
 {
-    while (!(LCDC_STA & LCDC_MCU_IDLE));
+    lcdif_wait_mcu_idle();
 
     if (on_off)
         MCU_CTRL |= MCU_CTRL_BYPASS;
@@ -245,6 +291,34 @@ void lcd_write_reg(unsigned int reg, unsigned int val)
     lcd_cmd(reg);
     lcd_data(val);
 }
+
+#ifdef COLORFLY_C4_PRO
+void lcd_c4pro_direct_fill(unsigned int color)
+{
+    int i;
+
+    lcdctrl_bypass(1);
+    LCDC_CTRL |= RGB24B;
+
+    lcd_cmd(0x2a);
+    lcd_data(0);
+    lcd_data(0);
+    lcd_data((LCD_WIDTH - 1) >> 8);
+    lcd_data((LCD_WIDTH - 1) & 0xff);
+
+    lcd_cmd(0x2b);
+    lcd_data(0);
+    lcd_data(0);
+    lcd_data((LCD_HEIGHT - 1) >> 8);
+    lcd_data((LCD_HEIGHT - 1) & 0xff);
+
+    lcd_cmd(0x2c);
+    for (i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++)
+        lcd_data(color);
+
+    LCDC_CTRL &= ~RGB24B;
+}
+#endif
 
 /* rockbox API functions */
 void lcd_init_device(void)
@@ -275,7 +349,8 @@ void lcd_update_rect(int x, int y, int width, int height)
     /* whole framebuffer for now */
     commit_discard_dcache_range(FBADDR(0,0), 2*LCD_WIDTH*LCD_HEIGHT);
 
-    while (!(LCDC_STA & LCDC_MCU_IDLE));
+    if (!lcdif_wait_mcu_idle())
+        return;
 
     lcdctrl_buff_setup(width, height);
     dwdma_start(0, scr_llp, 6);
@@ -285,7 +360,7 @@ void lcd_update_rect(int x, int y, int width, int height)
     MCU_CTRL = MCU_CTRL_RS_HIGH|MCU_CTRL_BUFF_WRITE|MCU_CTRL_BUFF_START;
 
     /* Wait for DMA transfer to finish */
-    while (DWDMA_CTL_L(0) & (1<<27));
+    lcdif_wait_dma_done(0);
 }
 
 void lcd_update()

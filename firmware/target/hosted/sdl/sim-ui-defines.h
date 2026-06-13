@@ -482,6 +482,13 @@
 #define UI_LCD_POSX                 26
 #define UI_LCD_POSY                 40
 
+#elif defined(COLORFLY_C4_PRO)
+#define UI_TITLE                    "Colorfly C4 Pro"
+#define UI_LCD_POSX                 0
+#define UI_LCD_POSY                 0
+#define UI_WIDTH                    LCD_WIDTH
+#define UI_HEIGHT                   LCD_HEIGHT
+
 #elif defined(EROS_Q) || defined(EROS_QN)
 #define UI_TITLE                    "AIGO EROS Q"
 #define UI_WIDTH                    400 /* width of GUI window */

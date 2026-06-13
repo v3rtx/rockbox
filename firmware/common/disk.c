@@ -82,6 +82,14 @@
 static struct partinfo part[NUM_DRIVES*MAX_PARTITIONS_PER_DRIVE];
 static struct volumeinfo volumes[NUM_VOLUMES];
 
+#ifdef COLORFLY_C4_PRO
+int c4pro_disk_diag_disk_init;
+int c4pro_disk_diag_fat0_rc;
+int c4pro_disk_diag_read_rc;
+unsigned c4pro_disk_diag_sig;
+unsigned c4pro_disk_diag_head;
+#endif
+
 /* check if the entry points to a free volume */
 static bool is_free_volume(const struct volumeinfo *vi)
 {
@@ -194,7 +202,13 @@ bool disk_init(IF_MD_NONVOID(int drive))
 #endif  /* STORAGE_ATA */
 
     memset(sector, 0, DC_CACHE_BUFSIZE);
+#ifdef COLORFLY_C4_PRO
+    c4pro_disk_diag_read_rc = storage_read_sectors(IF_MD(drive,) 0, 1, sector);
+    c4pro_disk_diag_sig = BYTES2INT16(sector, 510);
+    c4pro_disk_diag_head = (sector[0] << 16) | (sector[1] << 8) | sector[2];
+#else
     storage_read_sectors(IF_MD(drive,) 0, 1, sector);
+#endif
 
     bool init = false;
 
@@ -394,6 +408,14 @@ int disk_mount(int drive)
 {
     int mounted = 0; /* reset partition-on-drive flag */
 
+#ifdef COLORFLY_C4_PRO
+    c4pro_disk_diag_disk_init = -1;
+    c4pro_disk_diag_fat0_rc = -9999;
+    c4pro_disk_diag_read_rc = -9999;
+    c4pro_disk_diag_sig = 0;
+    c4pro_disk_diag_head = 0;
+#endif
+
     disk_writer_lock();
 
     int volume = get_free_volume();
@@ -407,9 +429,15 @@ int disk_mount(int drive)
 
     if (!disk_init(IF_MD(drive)))
     {
+#ifdef COLORFLY_C4_PRO
+        c4pro_disk_diag_disk_init = 0;
+#endif
         disk_writer_unlock();
         return 0;
     }
+#ifdef COLORFLY_C4_PRO
+    c4pro_disk_diag_disk_init = 1;
+#endif
 
     struct partinfo *pinfo = &part[IF_MD_DRV(drive)*MAX_PARTITIONS_PER_DRIVE];
 #ifdef MAX_VIRT_SECTOR_SIZE
@@ -419,7 +447,12 @@ int disk_mount(int drive)
     /* try "superfloppy" mode */
     DEBUGF("Trying to mount sector 0.\n");
 
-    if (!fat_mount(IF_MV(volume,) IF_MD(drive,) 0))
+    int fat0_rc = fat_mount(IF_MV(volume,) IF_MD(drive,) 0);
+#ifdef COLORFLY_C4_PRO
+    c4pro_disk_diag_fat0_rc = fat0_rc;
+#endif
+
+    if (!fat0_rc)
     {
 #ifdef MAX_VIRT_SECTOR_SIZE
         disk_sector_multiplier[drive] = fat_get_bytes_per_sector(IF_MV(volume)) / LOG_SECTOR_SIZE(drive);
