@@ -438,7 +438,7 @@ static void nand_delay(void)
 {
     volatile int i;
 
-    for (i = 0; i < 1000; i++)
+    for (i = 0; i < 10000; i++)
         ;
 }
 
@@ -532,9 +532,7 @@ uint32_t nand_read_page(uint32_t bank, uint32_t page, void* databuffer,
 {
     unsigned i;
     unsigned sector;
-#ifdef COLORFLY_C4_PRO
     unsigned half;
-#endif
     unsigned char *data = databuffer;
     unsigned char *spare = sparebuffer;
 
@@ -615,6 +613,48 @@ uint32_t nand_read_page(uint32_t bank, uint32_t page, void* databuffer,
     last_activity = current_tick;
     return 0;
 }
+
+#ifdef COLORFLY_C4_PRO
+uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
+                                uint32_t sector, void* databuffer,
+                                void* sparebuffer)
+{
+    unsigned i;
+    unsigned char *data = databuffer;
+    unsigned char *spare = sparebuffer;
+    static unsigned char page_data[4096];
+    static unsigned char page_spare[128];
+    static uint32_t cache_bank = 0xffffffff;
+    static uint32_t cache_page = 0xffffffff;
+    bool cache_hit = (cache_bank == bank && cache_page == page);
+
+    if (bank > 3 || sector >= 8 || (!data && !spare))
+        return 1;
+
+    if (!cache_hit)
+    {
+        if (nand_read_page(bank, page, page_data, page_spare, 1, 0))
+            return 1;
+
+        cache_bank = bank;
+        cache_page = page;
+    }
+
+    if (data)
+    {
+        for (i = 0; i < 512; i++)
+            data[i] = page_data[sector * 512 + i];
+    }
+
+    if (spare)
+    {
+        for (i = 0; i < 16; i++)
+            spare[i] = page_spare[sector * 16 + i];
+    }
+
+    return 0;
+}
+#endif
 
 uint32_t nand_write_page(uint32_t bank, uint32_t page, void* databuffer,
                          void* sparebuffer, uint32_t doecc)

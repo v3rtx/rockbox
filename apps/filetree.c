@@ -45,6 +45,10 @@
 #include "misc.h"
 #include "strnatcmp.h"
 #include "keyboard.h"
+#include "button.h"
+#ifdef COLORFLY_C4_PRO
+#include "nand-target.h"
+#endif
 
 #ifdef HAVE_MULTIVOLUME
 #include "mv.h"
@@ -73,6 +77,184 @@ static int strnatcasecmp_n(const char *a, const char *b, size_t n)
     (void)n;
      return strnatcasecmp(a, b);
 }
+
+#ifdef COLORFLY_C4_PRO
+struct c4pro_mapping_probe
+{
+    const char *label;
+    uint32_t base;
+    uint32_t spp;
+    bool page_base;
+};
+
+static bool c4pro_read_mapped_sector(uint32_t base, uint32_t spp,
+                                    bool page_base, uint32_t lba,
+                                    unsigned char *out)
+{
+    uint32_t psec = (page_base ? base * spp : base) + lba;
+    if (!spp)
+        return false;
+
+    uint32_t page = psec / spp;
+    uint32_t sec = psec % spp;
+
+    return c4pro_nand_read_sector(0, page, sec, out, NULL) == 0;
+}
+
+struct c4pro_boot_info
+{
+    bool sig;
+    bool jump_ok;
+    bool media_ok;
+    uint32_t bps;
+    uint8_t media;
+};
+
+static bool c4pro_read_boot_sector_info(uint32_t base, uint32_t spp,
+                                       bool page_base,
+                                       struct c4pro_boot_info *out)
+{
+    unsigned char sector[SECTOR_SIZE];
+    if (!out || !c4pro_read_mapped_sector(base, spp, page_base, 0, sector))
+        return false;
+
+    out->sig = sector[510] == 0x55 && sector[511] == 0xaa;
+    out->jump_ok = (sector[0] == 0xEB) || (sector[0] == 0xE9);
+    out->bps = sector[11] | ((uint32_t)sector[12] << 8);
+    out->media = sector[21];
+    out->media_ok = (out->media == 0xF0) || (out->media == 0xF8) ||
+                    (out->media == 0xF9);
+    return true;
+}
+
+static bool c4pro_is_short_name(const unsigned char *p)
+{
+    for (int i = 0; i < 11; i++)
+    {
+        unsigned char ch = p[i];
+        if (ch == 0x00 || ch == 0x05 || ch == 0x20)
+            return false;
+        if (ch >= 0x7f || ch < 0x20)
+            return false;
+    }
+
+    return true;
+}
+
+static bool c4pro_ascii_sfn(const unsigned char *p)
+{
+    for (int i = 0; i < 11; i++)
+    {
+        if (p[i] == 0x00 || p[i] == 0x20)
+            return false;
+        if (p[i] < 0x20 || p[i] > 0x7e)
+            return false;
+    }
+
+    return true;
+}
+
+#define C4PRO_PROBE_WAIT_MASK (BUTTON_UP | BUTTON_DOWN | BUTTON_LEFT | \
+                               BUTTON_RIGHT | BUTTON_SELECT | BUTTON_NEXT | \
+                               BUTTON_PREV | BUTTON_MENU | BUTTON_BACK | \
+                               BUTTON_SRC | BUTTON_EQ)
+
+static void c4pro_wait_probe_keypress(void)
+{
+    while (true)
+    {
+        long btn = button_get_w_tmo(TIMEOUT_BLOCK);
+        btn &= ~BUTTON_REPEAT;
+
+        if (!btn || (btn & BUTTON_REL) ||
+            ((btn & C4PRO_PROBE_WAIT_MASK) == 0))
+            continue;
+
+        break;
+    }
+}
+
+static void c4pro_show_dir_probe(struct tree_context *c)
+{
+    (void)c;
+    unsigned char sector[SECTOR_SIZE];
+    static const struct c4pro_mapping_probe probes[] =
+    {
+        {"p", 20480, 8, false}, /* known logical-sector base */
+        {"q", 2520, 8, true},
+        {"r", 2544, 8, true},
+        {"s", 2552, 8, true},
+        {"t", 2560, 8, true},
+        {"u", 2568, 8, true},
+        {"v", 2576, 8, true},
+        {"x", 20480, 4, false},
+    };
+    int scan_lba;
+    int cand_lba;
+    bool bootok, fatok, rawok;
+    unsigned mask;
+    static bool shown;
+
+    if (shown)
+        return;
+    shown = true;
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+
+    for (uint32_t i = 0; i < ARRAYLEN(probes); i++)
+    {
+        struct c4pro_boot_info boot_info = { false };
+        bool boot_info_ok;
+        scan_lba = -1;
+        cand_lba = -1;
+        boot_info_ok = c4pro_read_boot_sector_info(probes[i].base, probes[i].spp,
+                                                  probes[i].page_base, &boot_info);
+        bootok = boot_info_ok &&
+            boot_info.sig && boot_info.bps == 512;
+        fatok = boot_info_ok &&
+            boot_info.jump_ok && boot_info.media_ok;
+        rawok = c4pro_read_mapped_sector(probes[i].base, probes[i].spp,
+                                       probes[i].page_base, 85, sector) == 0 &&
+            (sector[11] == ATTR_DIRECTORY);
+
+        for (int lba = 0; lba < 128; lba++)
+        {
+            if (c4pro_read_mapped_sector(probes[i].base, probes[i].spp,
+                                       probes[i].page_base, lba, sector))
+                continue;
+
+            for (int off = 0; off < SECTOR_SIZE; off += 32)
+            {
+                if (scan_lba < 0 &&
+                    c4pro_is_short_name(sector + off) &&
+                    memcmp(sector + off + 32, "           ", 11) != 0 &&
+                    sector[off + 11] == ATTR_DIRECTORY)
+                    scan_lba = lba;
+
+                if (cand_lba < 0 && c4pro_ascii_sfn(sector + off) &&
+                    (sector[off + 11] == ATTR_DIRECTORY ||
+                     sector[off + 11] == ATTR_ARCHIVE))
+                {
+                    cand_lba = lba;
+                }
+            }
+        }
+
+        mask = (bootok ? 1 : 0) | (fatok ? 2 : 0) |
+            (rawok ? 4 : 0) | ((cand_lba >= 0) ? 8 : 0);
+
+        lcd_putsf(0, i, "D%s b%u s%u m%x j%x mm%02X b%u",
+                  probes[i].label, probes[i].base, probes[i].spp,
+                  mask, boot_info.media, boot_info.bps);
+    }
+
+    lcd_update();
+    button_clear_queue();
+    c4pro_wait_probe_keypress();
+    lcd_setfont(FONT_UI);
+}
+#endif
 
 int ft_build_playlist(struct tree_context* c, int start_index)
 {
@@ -446,6 +628,10 @@ int ft_load(struct tree_context* c, const char* tempdir)
     }
 
     qsort(tree_get_entries(c), files_in_dir, sizeof(struct entry), compare);
+
+#ifdef COLORFLY_C4_PRO
+    c4pro_show_dir_probe(c);
+#endif
 
     /* If thumbnail talking is enabled, make an extra run to mark files with
        associated thumbnails, so we don't do unsuccessful spinups later. */
