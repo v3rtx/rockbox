@@ -432,12 +432,12 @@ static void c4pro_show_storage_verdict(void)
 
     lcd_setfont(FONT_UI);
     lcd_clear_display();
-    lcd_putsf(0, 0, "C4FS %s c%d m%d%d%d y%d",
-              verdict_ok ? "OK" : "BAD", content_ok,
+    lcd_putsf(0, 0, "C4 c%d m%d%d%d h%d",
+              content_ok,
               c4pro_ftl_diag_hash_bootbin_psec >= 0,
               c4pro_ftl_diag_hash_version_psec >= 0,
               c4pro_ftl_diag_hash_rk28_psec >= 0,
-              c4pro_ftl_diag_synth_sectors);
+              c4pro_ftl_diag_hash_mapped);
     lcd_putsf(0, 1, "b%d/%08x",
               bootbin_rc, bootbin_sig);
     lcd_putsf(0, 2, "v%d/%08x k%d/%08x",
@@ -463,7 +463,7 @@ static void c4pro_show_storage_verdict(void)
     lcd_update();
 
     if (verdict_ok)
-        sleep(3 * HZ);
+        sleep(20 * HZ);
     else
         while (1)
             sleep(HZ);
