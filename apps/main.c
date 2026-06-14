@@ -450,9 +450,10 @@ static void c4pro_show_storage_verdict(void)
               c4pro_ftl_diag_hash_best_delta_count,
               c4pro_ftl_diag_hash_raw, c4pro_ftl_diag_hash_secdec,
               c4pro_ftl_diag_hash_pagedec);
-    lcd_puts(0, 7, "press key");
+    lcd_puts(0, 7, "15s then key");
     lcd_update();
 
+    sleep(15 * HZ);
     button_clear_queue();
     while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
         ;
