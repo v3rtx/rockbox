@@ -40,5 +40,6 @@ uint32_t ftl_init(void);
 uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer);
 uint32_t ftl_write(uint32_t sector, uint32_t count, const void* buffer);
 uint32_t ftl_sync(void);
+uint32_t ftl_total_sectors(void);
 
 #endif

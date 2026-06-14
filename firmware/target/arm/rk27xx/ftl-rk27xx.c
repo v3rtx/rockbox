@@ -60,6 +60,9 @@ struct c4pro_ftl_synth_entry
 #ifndef C4PRO_SYSTEM_SECTORS
 #define C4PRO_SYSTEM_SECTORS   43008
 #endif
+#ifndef C4PRO_STORAGE_SECTORS
+#define C4PRO_STORAGE_SECTORS C4PRO_SYSTEM_SECTORS
+#endif
 #ifndef C4PRO_SECTORS_PER_PAGE
 #define C4PRO_SECTORS_PER_PAGE 8
 #endif
@@ -515,6 +518,11 @@ uint32_t ftl_init(void)
 #endif
 #endif
     return 0;
+}
+
+uint32_t ftl_total_sectors(void)
+{
+    return C4PRO_STORAGE_SECTORS;
 }
 
 uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)

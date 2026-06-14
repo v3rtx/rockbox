@@ -76,7 +76,7 @@ void nand_get_info(IF_MD(int drive,) struct storage_info *info)
     IF_MD( (void)drive; )
 #ifdef COLORFLY_C4_PRO
     (*info).sector_size = SECTOR_SIZE;
-    (*info).num_sectors = 43008;
+    (*info).num_sectors = ftl_total_sectors();
 #else
     uint32_t ppb = ftl_banks * (*ftl_nand_type).pagesperblock;
     (*info).sector_size = SECTOR_SIZE;

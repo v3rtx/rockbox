@@ -259,7 +259,6 @@ extern int c4pro_ftl_diag_synth_sectors;
 #endif
 
 #if !defined(SIMULATOR)
-#define C4PRO_ROOT_EXPECTED_COUNT 7
 #define C4PRO_FTL_BASE_PAGE 2560
 #define C4PRO_FTL_SCAN_PAGES 8192
 #define C4PRO_FTL_SECTORS_PER_PAGE 8
@@ -269,6 +268,9 @@ extern int c4pro_ftl_diag_synth_sectors;
 #define C4PRO_NAND_PAGES_PER_BLOCK 128
 #define C4PRO_SYSTEM_BOOT_PSEC 20480
 #define C4PRO_NAND_DIAG_BANKS 2
+
+#ifdef C4PRO_STORAGE_VERDICT
+#define C4PRO_ROOT_EXPECTED_COUNT 7
 
 static const unsigned char c4pro_expected_root_sfn
     [C4PRO_ROOT_EXPECTED_COUNT][11] =
@@ -293,6 +295,7 @@ static const unsigned char c4pro_expected_root_attr
     ATTR_ARCHIVE,
     ATTR_ARCHIVE,
 };
+#endif
 
 #ifdef C4PRO_FTL_PROBE
 struct c4pro_boot_probe
@@ -316,6 +319,7 @@ struct c4pro_root_candidate
 };
 #endif
 
+#if defined(C4PRO_STORAGE_VERDICT) || defined(C4PRO_FTL_PROBE)
 static unsigned c4pro_probe_u16le(const unsigned char *p)
 {
     return (unsigned)p[0] | ((unsigned)p[1] << 8);
@@ -326,7 +330,9 @@ static unsigned c4pro_probe_u32le(const unsigned char *p)
     return (unsigned)p[0] | ((unsigned)p[1] << 8) |
            ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
 }
+#endif
 
+#ifdef C4PRO_STORAGE_VERDICT
 static int c4pro_check_expected_root_sector(const unsigned char *sector)
 {
     for (int i = 0; i < C4PRO_ROOT_EXPECTED_COUNT; i++)
@@ -606,6 +612,7 @@ static void c4pro_show_storage_verdict(void)
         ;
     button_clear_queue();
 }
+#endif
 
 #ifdef C4PRO_FTL_PROBE
 static unsigned c4pro_probe_meta(const unsigned char *spare, int sec)
@@ -1594,7 +1601,9 @@ static void init(void)
     C4PRO_MOUNT_READY_HALT();
     C4PRO_BOOT_STEP("mount ok");
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#ifdef C4PRO_STORAGE_VERDICT
     c4pro_show_storage_verdict();
+#endif
 #ifdef C4PRO_FTL_PROBE
     c4pro_show_ftl_probe();
 #endif
@@ -1684,7 +1693,7 @@ static void init(void)
     shortcuts_init();
     C4PRO_BOOT_STEP("shortcuts ok");
 
-#ifndef COLORFLY_C4_PRO
+#if !defined(COLORFLY_C4_PRO) || defined(C4PRO_AUDIO_TEST)
     CHART(">audio_init");
     C4PRO_BOOT_STEP("audio_init");
     audio_init();
