@@ -103,9 +103,15 @@ int c4pro_ftl_diag_hash_pagedec;
 int c4pro_ftl_diag_hash_boot_psec = -1;
 int c4pro_ftl_diag_hash_fat_psec = -1;
 int c4pro_ftl_diag_hash_root_psec = -1;
+int c4pro_ftl_diag_hash_bootbin_psec = -1;
+int c4pro_ftl_diag_hash_version_psec = -1;
+int c4pro_ftl_diag_hash_rk28_psec = -1;
 int c4pro_ftl_diag_hash_boot_mode = -1;
 int c4pro_ftl_diag_hash_fat_mode = -1;
 int c4pro_ftl_diag_hash_root_mode = -1;
+int c4pro_ftl_diag_hash_bootbin_mode = -1;
+int c4pro_ftl_diag_hash_version_mode = -1;
+int c4pro_ftl_diag_hash_rk28_mode = -1;
 int c4pro_ftl_diag_hash_best_delta = 0;
 int c4pro_ftl_diag_hash_best_delta_count = 0;
 int c4pro_ftl_diag_sig_fat_psec = -1;
@@ -330,6 +336,21 @@ static void c4pro_ftl_record_hash_match(uint32_t psec, int lba, int mode)
         c4pro_ftl_diag_hash_root_psec = psec;
         c4pro_ftl_diag_hash_root_mode = mode;
     }
+    else if (lba == 26985)
+    {
+        c4pro_ftl_diag_hash_bootbin_psec = psec;
+        c4pro_ftl_diag_hash_bootbin_mode = mode;
+    }
+    else if (lba == 37117)
+    {
+        c4pro_ftl_diag_hash_version_psec = psec;
+        c4pro_ftl_diag_hash_version_mode = mode;
+    }
+    else if (lba == 37121)
+    {
+        c4pro_ftl_diag_hash_rk28_psec = psec;
+        c4pro_ftl_diag_hash_rk28_mode = mode;
+    }
 }
 
 static void c4pro_ftl_record_signature_match(uint32_t psec,
@@ -407,9 +428,15 @@ static void c4pro_ftl_build_hash_map(void)
     c4pro_ftl_diag_hash_boot_psec = -1;
     c4pro_ftl_diag_hash_fat_psec = -1;
     c4pro_ftl_diag_hash_root_psec = -1;
+    c4pro_ftl_diag_hash_bootbin_psec = -1;
+    c4pro_ftl_diag_hash_version_psec = -1;
+    c4pro_ftl_diag_hash_rk28_psec = -1;
     c4pro_ftl_diag_hash_boot_mode = -1;
     c4pro_ftl_diag_hash_fat_mode = -1;
     c4pro_ftl_diag_hash_root_mode = -1;
+    c4pro_ftl_diag_hash_bootbin_mode = -1;
+    c4pro_ftl_diag_hash_version_mode = -1;
+    c4pro_ftl_diag_hash_rk28_mode = -1;
     c4pro_ftl_diag_hash_best_delta = 0;
     c4pro_ftl_diag_hash_best_delta_count = 0;
     c4pro_ftl_diag_sig_fat_psec = -1;

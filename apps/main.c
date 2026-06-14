@@ -240,9 +240,15 @@ extern int c4pro_ftl_diag_hash_pagedec;
 extern int c4pro_ftl_diag_hash_boot_psec;
 extern int c4pro_ftl_diag_hash_fat_psec;
 extern int c4pro_ftl_diag_hash_root_psec;
+extern int c4pro_ftl_diag_hash_bootbin_psec;
+extern int c4pro_ftl_diag_hash_version_psec;
+extern int c4pro_ftl_diag_hash_rk28_psec;
 extern int c4pro_ftl_diag_hash_boot_mode;
 extern int c4pro_ftl_diag_hash_fat_mode;
 extern int c4pro_ftl_diag_hash_root_mode;
+extern int c4pro_ftl_diag_hash_bootbin_mode;
+extern int c4pro_ftl_diag_hash_version_mode;
+extern int c4pro_ftl_diag_hash_rk28_mode;
 extern int c4pro_ftl_diag_hash_best_delta;
 extern int c4pro_ftl_diag_hash_best_delta_count;
 extern int c4pro_ftl_diag_sig_fat_psec;
@@ -426,8 +432,11 @@ static void c4pro_show_storage_verdict(void)
 
     lcd_setfont(FONT_UI);
     lcd_clear_display();
-    lcd_putsf(0, 0, "C4FS %s c%d y%d",
+    lcd_putsf(0, 0, "C4FS %s c%d m%d%d%d y%d",
               verdict_ok ? "OK" : "BAD", content_ok,
+              c4pro_ftl_diag_hash_bootbin_psec >= 0,
+              c4pro_ftl_diag_hash_version_psec >= 0,
+              c4pro_ftl_diag_hash_rk28_psec >= 0,
               c4pro_ftl_diag_synth_sectors);
     lcd_putsf(0, 1, "b%d/%08x",
               bootbin_rc, bootbin_sig);
@@ -444,11 +453,13 @@ static void c4pro_show_storage_verdict(void)
     lcd_putsf(0, 6, "d%d n%d",
               c4pro_ftl_diag_hash_best_delta,
               c4pro_ftl_diag_hash_best_delta_count);
-    lcd_putsf(0, 7, "b%d m%d F%d m%d",
-              c4pro_ftl_diag_hash_boot_psec,
-              c4pro_ftl_diag_hash_boot_mode,
-              c4pro_ftl_diag_sig_fat_psec,
-              c4pro_ftl_diag_sig_fat_mode);
+    lcd_putsf(0, 7, "B%d/%d V%d/%d K%d/%d",
+              c4pro_ftl_diag_hash_bootbin_psec,
+              c4pro_ftl_diag_hash_bootbin_mode,
+              c4pro_ftl_diag_hash_version_psec,
+              c4pro_ftl_diag_hash_version_mode,
+              c4pro_ftl_diag_hash_rk28_psec,
+              c4pro_ftl_diag_hash_rk28_mode);
     lcd_update();
 
     if (verdict_ok)
