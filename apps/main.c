@@ -265,6 +265,9 @@ extern int c4pro_ftl_diag_synth_sectors;
 #define C4PRO_FTL_SECTORS_PER_PAGE 8
 #define C4PRO_FTL_PAGE_SIZE 4096
 #define C4PRO_FTL_SPARE_SIZE 128
+#define C4PRO_NAND_BLOCKS 8192
+#define C4PRO_NAND_PAGES_PER_BLOCK 128
+#define C4PRO_SYSTEM_BOOT_PSEC 20480
 
 static const unsigned char c4pro_expected_root_sfn
     [C4PRO_ROOT_EXPECTED_COUNT][11] =
@@ -337,6 +340,100 @@ static int c4pro_check_expected_root_sector(const unsigned char *sector)
     return -1;
 }
 
+static bool c4pro_is_power_of_two(unsigned value)
+{
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+static bool c4pro_sector_looks_like_fat_boot(const unsigned char *sector)
+{
+    unsigned sig = c4pro_probe_u16le(sector + 510);
+    unsigned bps = c4pro_probe_u16le(sector + 11);
+    unsigned spc = sector[13];
+    unsigned rsvd = c4pro_probe_u16le(sector + 14);
+    unsigned nfats = sector[16];
+    unsigned root_entries = c4pro_probe_u16le(sector + 17);
+    unsigned fatsz16 = c4pro_probe_u16le(sector + 22);
+    unsigned fatsz32 = c4pro_probe_u32le(sector + 36);
+
+    if (sig != 0xaa55 || bps != SECTOR_SIZE ||
+        !c4pro_is_power_of_two(spc) || spc > 128 ||
+        rsvd == 0 || (nfats != 1 && nfats != 2))
+        return false;
+
+    if (root_entries > 0 && fatsz16 > 0 &&
+        (!memcmp(sector + 54, "FAT16   ", 8) ||
+         !memcmp(sector + 54, "FAT12   ", 8)))
+        return true;
+
+    if (root_entries == 0 && fatsz32 > 0 &&
+        !memcmp(sector + 82, "FAT32   ", 8))
+        return true;
+
+    return false;
+}
+
+static bool c4pro_sector_looks_like_mbr(const unsigned char *sector)
+{
+    if (c4pro_probe_u16le(sector + 510) != 0xaa55)
+        return false;
+
+    for (int i = 0; i < 4; i++)
+    {
+        const unsigned char *part = sector + 446 + i * 16;
+        unsigned type = part[4];
+        unsigned size = c4pro_probe_u32le(part + 12);
+
+        if (type != 0 && size != 0)
+            return true;
+    }
+
+    return false;
+}
+
+static void c4pro_scan_raw_volume_candidates(int *fat_count,
+                                             int *first_fat_psec,
+                                             int *mbr_count,
+                                             int *first_mbr_psec)
+{
+    static unsigned char sector[SECTOR_SIZE];
+
+    *fat_count = 0;
+    *first_fat_psec = -1;
+    *mbr_count = 0;
+    *first_mbr_psec = -1;
+
+    for (int block = 0; block < C4PRO_NAND_BLOCKS; block++)
+    {
+        uint32_t page = (uint32_t)block * C4PRO_NAND_PAGES_PER_BLOCK;
+
+        for (int sec = 0; sec < C4PRO_FTL_SECTORS_PER_PAGE; sec++)
+        {
+            int psec = (int)(page * C4PRO_FTL_SECTORS_PER_PAGE + sec);
+
+            if (psec == C4PRO_SYSTEM_BOOT_PSEC)
+                continue;
+
+            if (c4pro_nand_read_sector(0, page, sec, sector, NULL))
+                continue;
+
+            if (c4pro_sector_looks_like_fat_boot(sector))
+            {
+                if (*first_fat_psec < 0)
+                    *first_fat_psec = psec;
+                (*fat_count)++;
+            }
+
+            if (c4pro_sector_looks_like_mbr(sector))
+            {
+                if (*first_mbr_psec < 0)
+                    *first_mbr_psec = psec;
+                (*mbr_count)++;
+            }
+        }
+    }
+}
+
 static void c4pro_show_storage_verdict(void)
 {
     static unsigned char sector[SECTOR_SIZE];
@@ -366,6 +463,10 @@ static void c4pro_show_storage_verdict(void)
     bool verdict_ok = false;
     bool generic_fat = false;
     const char *vol_kind = "BAD";
+    int raw_fat_count;
+    int raw_fat_psec;
+    int raw_mbr_count;
+    int raw_mbr_psec;
 
     read0_rc = storage_read_sectors(IF_MD(0,) 0, 1, sector);
     if (read0_rc == 0)
@@ -431,24 +532,29 @@ static void c4pro_show_storage_verdict(void)
     else if (generic_fat)
         vol_kind = "FAT";
 
+    c4pro_scan_raw_volume_candidates(&raw_fat_count, &raw_fat_psec,
+                                     &raw_mbr_count, &raw_mbr_psec);
+
     lcd_setfont(FONT_SYSFIXED);
     lcd_clear_display();
-    lcd_putsf(0, 0, "C4VOL %s u%d c%d y%d h%d", vol_kind,
+    lcd_putsf(0, 0, "C4VOL %s u%d c%d rf%d rm%d", vol_kind,
               verdict_ok ? 0 : (generic_fat ? 1 : -1), content_ok,
-              c4pro_ftl_diag_synth_sectors, c4pro_ftl_diag_hash_mapped);
+              raw_fat_count, raw_mbr_count);
     lcd_putsf(0, 1, "boot%d fat%d root%d bad%d", boot_ok, fat_ok,
               root_ok, root_bad);
-    lcd_putsf(0, 2, "m%d%d%d B%d V%d K%d",
+    lcd_putsf(0, 2, "raw F%d M%d", raw_fat_psec, raw_mbr_psec);
+    lcd_putsf(0, 3, "y%d h%d d%d n%d", c4pro_ftl_diag_synth_sectors,
+              c4pro_ftl_diag_hash_mapped, c4pro_ftl_diag_hash_best_delta,
+              c4pro_ftl_diag_hash_best_delta_count);
+    lcd_putsf(0, 4, "m%d%d%d B%d V%d K%d",
               c4pro_ftl_diag_hash_bootbin_psec >= 0,
               c4pro_ftl_diag_hash_version_psec >= 0,
               c4pro_ftl_diag_hash_rk28_psec >= 0,
               c4pro_ftl_diag_hash_bootbin_psec,
               c4pro_ftl_diag_hash_version_psec,
               c4pro_ftl_diag_hash_rk28_psec);
-    lcd_putsf(0, 3, "d%d n%d x%d/%d/%d",
-              c4pro_ftl_diag_hash_best_delta,
-              c4pro_ftl_diag_hash_best_delta_count,
-              c4pro_ftl_diag_hash_raw, c4pro_ftl_diag_hash_secdec,
+    lcd_putsf(0, 5, "x%d/%d/%d", c4pro_ftl_diag_hash_raw,
+              c4pro_ftl_diag_hash_secdec,
               c4pro_ftl_diag_hash_pagedec);
     lcd_puts(0, 7, "15s then key");
     lcd_update();
