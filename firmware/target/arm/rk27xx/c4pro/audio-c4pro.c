@@ -228,6 +228,7 @@ void audiohw_init(void)
 
 void audiohw_postinit(void)
 {
+    SCU_IOMUXB_CON &= ~(1u << 14);
     GPIO_PDDR |= 1u << 7;
     GPIO_PDCON |= 1u << 7;
     c4pro_amp_enable(false);
