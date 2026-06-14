@@ -46,6 +46,11 @@
 #include "serial.h"
 #endif
 #include "audio.h"
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_PCM_TONE_TEST)
+#include "pcm.h"
+#include "pcm-internal.h"
+#include "pcm_sw_volume.h"
+#endif
 #include "settings.h"
 #include "backlight.h"
 #include "status.h"
@@ -607,6 +612,670 @@ static void c4pro_show_storage_verdict(void)
     lcd_update();
 
     sleep(15 * HZ);
+    button_clear_queue();
+    while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
+        ;
+    button_clear_queue();
+}
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_PCM_TONE_TEST)
+static int16_t c4pro_pcm_tone[4096] __attribute__((aligned(4)));
+static int c4pro_pcm_tone_chunks;
+static int c4pro_pcm_tone_status;
+static int c4pro_pcm_tone_callbacks;
+static unsigned char c4pro_pcm_tone_dac_addr;
+static unsigned char c4pro_pcm_tone_src_addr;
+static unsigned char c4pro_pcm_tone_dac_id;
+static unsigned char c4pro_pcm_tone_src_id;
+static int c4pro_pcm_tone_i2c_errors;
+static unsigned char c4pro_cs8422_status_13;
+static unsigned char c4pro_cs8422_status_14;
+static unsigned char c4pro_cs8422_status_15;
+static unsigned char c4pro_cs8422_status_16;
+static unsigned long c4pro_gpio_base_dr[6];
+static unsigned long c4pro_gpio_base_con[6];
+static unsigned long c4pro_gpio_base_iomuxb;
+
+extern int rk27xx_i2c_write(unsigned char slave, int address, int len,
+                            const unsigned char *data);
+extern int rk27xx_i2c_read(unsigned char slave, int address, int len,
+                           unsigned char *data);
+
+#define C4PRO_CS4398_REG_CHIPID  0x01
+#define C4PRO_CS4398_REG_MODECTL 0x02
+#define C4PRO_CS4398_REG_VOLMIX  0x03
+#define C4PRO_CS4398_REG_MUTE    0x04
+#define C4PRO_CS4398_REG_VOL_A   0x05
+#define C4PRO_CS4398_REG_VOL_B   0x06
+#define C4PRO_CS4398_REG_RAMP    0x07
+#define C4PRO_CS4398_REG_MISC    0x08
+
+static int c4pro_i2c_write8(unsigned char addr, unsigned char reg,
+                            unsigned char val)
+{
+    int rc = rk27xx_i2c_write(addr, reg, 1, &val);
+    if (rc != 0)
+        c4pro_pcm_tone_i2c_errors++;
+    return rc;
+}
+
+static unsigned char c4pro_i2c_read8(unsigned char addr, unsigned char reg)
+{
+    unsigned char val = 0xff;
+    int rc = rk27xx_i2c_read(addr, reg, 1, &val);
+    if (rc != 0)
+        c4pro_pcm_tone_i2c_errors++;
+    return val;
+}
+
+static void c4pro_cs4398_basic_init(unsigned char addr, unsigned char modectl,
+                                    unsigned char volmix, bool mute_pin_high)
+{
+    (void)mute_pin_high;
+    c4pro_i2c_write8(addr, C4PRO_CS4398_REG_MISC, 0xc0); /* CPEN | PDN */
+    c4pro_i2c_write8(addr, C4PRO_CS4398_REG_MODECTL, modectl);
+    c4pro_i2c_write8(addr, C4PRO_CS4398_REG_VOLMIX, volmix);
+    c4pro_i2c_write8(addr, C4PRO_CS4398_REG_MUTE, 0x80);
+    c4pro_i2c_write8(addr, C4PRO_CS4398_REG_VOL_A, 0x00);
+    c4pro_i2c_write8(addr, C4PRO_CS4398_REG_VOL_B, 0x00);
+    c4pro_i2c_write8(addr, C4PRO_CS4398_REG_RAMP, 0xb4);
+    c4pro_i2c_write8(addr, C4PRO_CS4398_REG_MISC, 0x40); /* CPEN, power up */
+}
+
+struct c4pro_cs8422_mode
+{
+    const char *label;
+    unsigned char muxb_low;
+    unsigned char dac_modectl;
+    unsigned char dac_volmix;
+    unsigned char clock_ctl;
+    unsigned char rx_control;
+    unsigned char data_flow;
+    unsigned char sai_clock;
+    unsigned char sao_clock;
+    unsigned char rmck_misc;
+    unsigned char route;
+    unsigned char sai_format;
+    unsigned char sao1_format;
+    unsigned char sao2_format;
+    unsigned char src_policy;
+};
+
+static void c4pro_cs8422_init(unsigned char addr,
+                              const struct c4pro_cs8422_mode *mode)
+{
+    if (mode->src_policy == 0)
+        return;
+
+    c4pro_i2c_write8(addr, 0x02, 0x80); /* configure while powered down */
+    c4pro_i2c_write8(addr, 0x03, mode->rx_control);
+    c4pro_i2c_write8(addr, 0x04, mode->data_flow);
+    c4pro_i2c_write8(addr, 0x07, mode->sai_clock);
+    c4pro_i2c_write8(addr, 0x08, mode->sao_clock);
+
+    if (mode->src_policy == 1)
+        return;
+
+    c4pro_i2c_write8(addr, 0x09, mode->rmck_misc);
+    c4pro_i2c_write8(addr, 0x0a, mode->route);
+    c4pro_i2c_write8(addr, 0x0b, mode->sai_format);
+    c4pro_i2c_write8(addr, 0x0c, mode->sao1_format);
+    c4pro_i2c_write8(addr, 0x0d, mode->sao2_format);
+    c4pro_i2c_write8(addr, 0x02, mode->clock_ctl);
+}
+
+static void c4pro_cs8422_read_status(unsigned char addr)
+{
+    c4pro_cs8422_status_13 = c4pro_i2c_read8(addr, 0x13);
+    c4pro_cs8422_status_14 = c4pro_i2c_read8(addr, 0x14);
+    c4pro_cs8422_status_15 = c4pro_i2c_read8(addr, 0x15);
+    c4pro_cs8422_status_16 = c4pro_i2c_read8(addr, 0x16);
+}
+
+static void c4pro_audio_hw_probe(void)
+{
+    c4pro_pcm_tone_dac_addr = 0;
+    c4pro_pcm_tone_src_addr = 0;
+    c4pro_pcm_tone_dac_id = 0xff;
+    c4pro_pcm_tone_src_id = 0xff;
+    c4pro_pcm_tone_i2c_errors = 0;
+
+    for (unsigned int addr7 = 0x4c; addr7 <= 0x4f; addr7++)
+    {
+        unsigned char addr = addr7 << 1;
+        unsigned char id = c4pro_i2c_read8(addr, C4PRO_CS4398_REG_CHIPID);
+
+        if ((id & 0xf8) == 0x70)
+        {
+            c4pro_pcm_tone_dac_addr = addr;
+            c4pro_pcm_tone_dac_id = id;
+            break;
+        }
+    }
+
+    for (unsigned int addr7 = 0x10; addr7 <= 0x17; addr7++)
+    {
+        unsigned char addr = addr7 << 1;
+        unsigned char id = c4pro_i2c_read8(addr, 0x01);
+
+        if ((id & 0xf8) == 0x10)
+        {
+            c4pro_pcm_tone_src_addr = addr;
+            c4pro_pcm_tone_src_id = id;
+            break;
+        }
+    }
+}
+
+static void c4pro_audio_hw_config(const struct c4pro_cs8422_mode *mode,
+                                  bool mute_pin_high)
+{
+    if (c4pro_pcm_tone_src_addr != 0)
+        c4pro_cs8422_init(c4pro_pcm_tone_src_addr, mode);
+
+    if (c4pro_pcm_tone_dac_addr != 0)
+        c4pro_cs4398_basic_init(c4pro_pcm_tone_dac_addr, mode->dac_modectl,
+                                mode->dac_volmix, mute_pin_high);
+
+    sleep(HZ / 10);
+}
+
+static unsigned long c4pro_gpio_dr(int port)
+{
+    switch (port)
+    {
+    case 0: return GPIO_PADR;
+    case 1: return GPIO_PBDR;
+    case 2: return GPIO_PCDR;
+    case 3: return GPIO_PDDR;
+    case 4: return GPIO_PEDR;
+    default: return GPIO_PFDR;
+    }
+}
+
+static unsigned long c4pro_gpio_con(int port)
+{
+    switch (port)
+    {
+    case 0: return GPIO_PACON;
+    case 1: return GPIO_PBCON;
+    case 2: return GPIO_PCCON;
+    case 3: return GPIO_PDCON;
+    case 4: return GPIO_PECON;
+    default: return GPIO_PFCON;
+    }
+}
+
+static void c4pro_gpio_set_dr(int port, unsigned long value)
+{
+    switch (port)
+    {
+    case 0: GPIO_PADR = value; break;
+    case 1: GPIO_PBDR = value; break;
+    case 2: GPIO_PCDR = value; break;
+    case 3: GPIO_PDDR = value; break;
+    case 4: GPIO_PEDR = value; break;
+    default: GPIO_PFDR = value; break;
+    }
+}
+
+static void c4pro_gpio_set_con(int port, unsigned long value)
+{
+    switch (port)
+    {
+    case 0: GPIO_PACON = value; break;
+    case 1: GPIO_PBCON = value; break;
+    case 2: GPIO_PCCON = value; break;
+    case 3: GPIO_PDCON = value; break;
+    case 4: GPIO_PECON = value; break;
+    default: GPIO_PFCON = value; break;
+    }
+}
+
+struct c4pro_gpio_candidate
+{
+    int port;
+    int bit;
+    unsigned long iomuxb_clear;
+};
+
+static const struct c4pro_gpio_candidate c4pro_gpio_candidates[] =
+{
+    { 2, 1, 0 },
+    { 2, 4, 1u << 2 },
+    { 2, 6, 1u << 4 },
+    { 2, 7, 1u << 5 },
+    { 3, 0, 3u << 6 },
+    { 3, 1, 3u << 8 },
+    { 3, 2, 1u << 10 },
+    { 3, 3, 1u << 21 },
+    { 3, 5, 1u << 12 },
+    { 3, 6, 1u << 13 },
+    { 3, 7, 1u << 14 },
+    { 5, 0, 1u << 16 },
+    { 5, 3, 1u << 19 },
+    { 5, 4, 1u << 20 },
+};
+
+static int c4pro_gpio_candidate_count(void)
+{
+    return (int)(sizeof(c4pro_gpio_candidates) /
+                 sizeof(c4pro_gpio_candidates[0]));
+}
+
+static void c4pro_gpio_apply_candidate_mux(const struct c4pro_gpio_candidate *c)
+{
+    SCU_IOMUXB_CON &= ~c->iomuxb_clear;
+}
+
+static void c4pro_gpio_make_output(int port, int bit)
+{
+    c4pro_gpio_set_con(port, c4pro_gpio_con(port) | (1u << bit));
+}
+
+static void c4pro_gpio_restore(void)
+{
+    SCU_IOMUXB_CON = c4pro_gpio_base_iomuxb;
+
+    for (int port = 0; port < 6; port++)
+    {
+        c4pro_gpio_set_dr(port, c4pro_gpio_base_dr[port]);
+        c4pro_gpio_set_con(port, c4pro_gpio_base_con[port]);
+    }
+}
+
+static void c4pro_gpio_set_one(int port, int bit, bool high)
+{
+    unsigned long dr = c4pro_gpio_dr(port);
+
+    if (high)
+        dr |= 1u << bit;
+    else
+        dr &= ~(1u << bit);
+
+    c4pro_gpio_set_dr(port, dr);
+}
+
+static void c4pro_gpio_snapshot(void)
+{
+    c4pro_gpio_base_iomuxb = SCU_IOMUXB_CON;
+
+    for (int port = 0; port < 6; port++)
+    {
+        c4pro_gpio_base_dr[port] = c4pro_gpio_dr(port);
+        c4pro_gpio_base_con[port] = c4pro_gpio_con(port);
+    }
+}
+
+static void c4pro_gpio_prepare_one(int port, int bit)
+{
+    for (int i = 0; i < c4pro_gpio_candidate_count(); i++)
+    {
+        if (c4pro_gpio_candidates[i].port == port &&
+            c4pro_gpio_candidates[i].bit == bit)
+        {
+            c4pro_gpio_apply_candidate_mux(&c4pro_gpio_candidates[i]);
+            c4pro_gpio_make_output(port, bit);
+            return;
+        }
+    }
+}
+
+static void c4pro_clockgen_program_44100(void)
+{
+    const unsigned int word = 0x0001;
+
+    c4pro_gpio_prepare_one(2, 1);
+    c4pro_gpio_prepare_one(2, 4);
+    c4pro_gpio_prepare_one(2, 6);
+
+    c4pro_gpio_set_one(2, 6, false);
+    c4pro_gpio_set_one(2, 4, true);
+
+    for (int bit = 15; bit >= 0; bit--)
+    {
+        c4pro_gpio_set_one(2, 1, (word & (1u << bit)) != 0);
+        udelay(2000);
+        c4pro_gpio_set_one(2, 6, true);
+        udelay(2000);
+        c4pro_gpio_set_one(2, 6, false);
+    }
+
+    c4pro_gpio_set_one(2, 4, false);
+    sleep(HZ / 50);
+    c4pro_gpio_set_one(2, 4, true);
+    sleep(HZ / 50);
+    c4pro_gpio_set_one(2, 4, false);
+}
+
+static void c4pro_pcm_tone_more(const void **start, size_t *size)
+{
+    if (c4pro_pcm_tone_chunks <= 0)
+    {
+        *start = NULL;
+        *size = 0;
+        return;
+    }
+
+    c4pro_pcm_tone_chunks--;
+    *start = c4pro_pcm_tone;
+    *size = sizeof(c4pro_pcm_tone);
+}
+
+static enum pcm_dma_status c4pro_pcm_tone_status_cb(enum pcm_dma_status status)
+{
+    c4pro_pcm_tone_callbacks++;
+    c4pro_pcm_tone_status = status;
+    return status;
+}
+
+#ifdef C4PRO_I2S_WIRE_PROBE
+static void c4pro_i2s_wire_probe(void)
+{
+    static const struct
+    {
+        int bit;
+        const char *name;
+        const char *target;
+    } probes[] =
+    {
+        { 6, "PC6 MCLK", "CS8422 XTI/RMCK?" },
+        { 3, "PC3 LRCK", "CS8422 pin13 ILRCK" },
+        { 2, "PC2 SCLK", "CS8422 pin14 ISCLK" },
+        { 5, "PC5 SDO",  "CS8422 pin15 SDIN" },
+    };
+    unsigned long base_iomuxb = SCU_IOMUXB_CON;
+    unsigned long base_pccon = GPIO_PCCON;
+    unsigned long base_pcdr = GPIO_PCDR;
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 I2S WIRE");
+    lcd_puts(0, 1, "DC meter");
+    lcd_update();
+    sleep(HZ);
+
+    for (unsigned int i = 0; i < sizeof(probes) / sizeof(probes[0]); i++)
+    {
+        int bit = probes[i].bit;
+        unsigned long mask = 1u << bit;
+
+        SCU_IOMUXB_CON &= ~(1u << (bit - 2));
+        GPIO_PCCON |= mask;
+
+        GPIO_PCDR |= mask;
+        lcd_clear_display();
+        lcd_puts(0, 0, probes[i].name);
+        lcd_puts(0, 1, probes[i].target);
+        lcd_puts(0, 2, "HIGH");
+        lcd_puts(0, 3, "measure, press key");
+        lcd_update();
+        button_clear_queue();
+        while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
+            ;
+        button_clear_queue();
+
+        GPIO_PCDR &= ~mask;
+        lcd_clear_display();
+        lcd_puts(0, 0, probes[i].name);
+        lcd_puts(0, 1, probes[i].target);
+        lcd_puts(0, 2, "LOW");
+        lcd_puts(0, 3, "measure, press key");
+        lcd_update();
+        button_clear_queue();
+        while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
+            ;
+        button_clear_queue();
+    }
+
+    SCU_IOMUXB_CON = base_iomuxb;
+    GPIO_PCDR = base_pcdr;
+    GPIO_PCCON = base_pccon;
+
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 WIRE DONE");
+    lcd_puts(0, 1, "press key");
+    lcd_update();
+    button_clear_queue();
+    while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
+        ;
+    button_clear_queue();
+}
+#endif
+
+static void c4pro_pcm_tone_test(void)
+{
+#ifdef C4PRO_I2S_WIRE_PROBE
+    c4pro_i2s_wire_probe();
+    return;
+#endif
+
+    static const struct c4pro_cs8422_mode modes[] =
+    {
+#ifdef C4PRO_CS8422_RX_SWEEP
+        {
+            "R0 diff rx0",
+            0x0b, 0x10, 0x89, 0x08, 0x00, 0x84, 0x40, 0x40,
+            0x00, 0x54, 0x08, 0x84, 0x84, 2
+        },
+        {
+            "R1 dig rx0",
+            0x0b, 0x10, 0x89, 0x08, 0x84, 0x84, 0x40, 0x40,
+            0x00, 0x54, 0x08, 0x84, 0x84, 2
+        },
+        {
+            "R2 dig rx1",
+            0x0b, 0x10, 0x89, 0x08, 0xac, 0x84, 0x40, 0x40,
+            0x00, 0x54, 0x08, 0x84, 0x84, 2
+        },
+        {
+            "R3 diff rx2",
+            0x0b, 0x10, 0x89, 0x08, 0x50, 0x84, 0x40, 0x40,
+            0x00, 0x54, 0x08, 0x84, 0x84, 2
+        },
+        {
+            "R4 dig rx3",
+            0x0b, 0x10, 0x89, 0x08, 0xfc, 0x84, 0x40, 0x40,
+            0x00, 0x54, 0x08, 0x84, 0x84, 2
+        },
+#elif defined(C4PRO_VENDOR_AUDIO_TEST)
+        {
+            "M0 stock0b",
+            0x0b, 0x10, 0x86, 0x00, 0x80, 0x84, 0x40, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 1
+        },
+        {
+            "M1 stock1f",
+            0x1f, 0x10, 0x86, 0x00, 0x80, 0x84, 0x40, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 1
+        },
+        {
+            "M2 nosrc0b",
+            0x0b, 0x10, 0x86, 0x00, 0x80, 0x84, 0x40, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0
+        },
+        {
+            "M3 full10",
+            0x0b, 0x10, 0x86, 0x00, 0x80, 0x84, 0x40, 0x20,
+            0x40, 0x10, 0x08, 0x84, 0x84, 2
+        },
+        {
+            "M4 full12",
+            0x0b, 0x10, 0x89, 0x00, 0x80, 0x84, 0x40, 0x20,
+            0x40, 0x12, 0x08, 0x84, 0x84, 2
+        },
+#elif defined(C4PRO_RK_I2S_SLAVE_TEST)
+        {
+            "T0 saiM dir i2s",
+            0x0b, 0x10, 0x89, 0x08, 0x08, 0x84, 0x40, 0x40,
+            0x40, 0xa0, 0x88, 0x84, 0x84, 2
+        },
+        {
+            "T1 saiM src i2s",
+            0x0b, 0x10, 0x89, 0x08, 0x08, 0x84, 0x40, 0x40,
+            0x00, 0x00, 0x88, 0x84, 0x84, 2
+        },
+        {
+            "T2 saiM dir lj",
+            0x0b, 0x00, 0x86, 0x08, 0x08, 0x84, 0x40, 0x40,
+            0x40, 0xa0, 0x80, 0x80, 0x80, 2
+        },
+        {
+            "T3 saiM src lj",
+            0x0b, 0x00, 0x86, 0x08, 0x08, 0x84, 0x40, 0x40,
+            0x00, 0x00, 0x80, 0x80, 0x80, 2
+        },
+        {
+            "T4 saiM src 512",
+            0x0b, 0x10, 0x89, 0x08, 0x08, 0x84, 0x60, 0x60,
+            0x00, 0x00, 0x88, 0x84, 0x84, 2
+        },
+#else
+        {
+            "T0 dir slv i2s",
+            0x0b, 0x10, 0x89, 0x00, 0x08, 0x84, 0x40, 0x60,
+            0x08, 0xa0, 0x08, 0x04, 0x04, 2
+        },
+        {
+            "T1 dir mst i2s",
+            0x0b, 0x10, 0x89, 0x08, 0x08, 0x84, 0x48, 0x60,
+            0x40, 0xa0, 0x08, 0x84, 0x84, 2
+        },
+        {
+            "T2 src mst i2s",
+            0x0b, 0x10, 0x89, 0x08, 0x08, 0x84, 0x48, 0x48,
+            0x00, 0x00, 0x08, 0x84, 0x84, 2
+        },
+        {
+            "T3 dir mst lj",
+            0x0b, 0x00, 0x86, 0x08, 0x08, 0x84, 0x48, 0x60,
+            0x40, 0xa0, 0x00, 0x80, 0x80, 2
+        },
+        {
+            "T4 src mst lj",
+            0x0b, 0x00, 0x86, 0x08, 0x08, 0x84, 0x48, 0x48,
+            0x00, 0x00, 0x00, 0x80, 0x80, 2
+        },
+#endif
+    };
+    const int samples = (int)(sizeof(c4pro_pcm_tone) / (2 * sizeof(int16_t)));
+    const int mode_count = (int)(sizeof(modes) / sizeof(modes[0]));
+    int playing = 0;
+    int callbacks = 0;
+    int status = 0;
+    int chunks = 0;
+    unsigned long hdma_con0 = 0;
+    unsigned long hdma_isr = 0;
+    unsigned long hdma_dsr = 0;
+    unsigned char mode_s15[5] = { 0 };
+    unsigned char mode_s16[5] = { 0 };
+
+    for (int i = 0; i < samples; i++)
+    {
+        int16_t sample = (i & 16) ? 18000 : -18000;
+        c4pro_pcm_tone[i * 2] = sample;
+        c4pro_pcm_tone[i * 2 + 1] = sample;
+    }
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 PCM TONE");
+    lcd_puts(0, 1, "probing audio");
+    lcd_update();
+
+#ifdef HAVE_SW_VOLUME_CONTROL
+    pcm_set_master_volume(0, 0);
+#endif
+    pcm_postinit();
+    pcm_set_frequency(44100);
+    pcm_apply_settings();
+    sleep(HZ / 20);
+    c4pro_audio_hw_probe();
+    c4pro_gpio_snapshot();
+
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 CLOCKGEN");
+    lcd_puts(0, 1, "w0001");
+    lcd_update();
+    c4pro_clockgen_program_44100();
+    sleep(HZ / 5);
+
+    lcd_clear_display();
+    lcd_puts(0, 0, "PD7 HIGH");
+    lcd_puts(0, 1, "amp/mute enable");
+    lcd_update();
+    c4pro_gpio_prepare_one(3, 7);
+    c4pro_gpio_set_one(3, 7, true);
+    sleep(HZ / 5);
+
+    for (int m = 0; m < mode_count; m++)
+    {
+        const void *start = c4pro_pcm_tone;
+        size_t size = sizeof(c4pro_pcm_tone);
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "C4 AUDIO SWEEP");
+        lcd_puts(0, 1, modes[m].label);
+        lcd_putsf(0, 2, "A d%02x s%02x R d%02x s%02x", c4pro_pcm_tone_dac_addr,
+                  c4pro_pcm_tone_src_addr, c4pro_pcm_tone_dac_id,
+                  c4pro_pcm_tone_src_id);
+        lcd_puts(0, 3, "listen for tone");
+        lcd_update();
+
+        SCU_IOMUXA_CON |= (1 << 19);
+        SCU_IOMUXB_CON = (SCU_IOMUXB_CON & ~0x1f) | modes[m].muxb_low;
+        c4pro_audio_hw_config(&modes[m], false);
+        c4pro_pcm_tone_chunks = 700;
+        c4pro_pcm_tone_status = 0;
+        c4pro_pcm_tone_callbacks = 0;
+        pcm_play_data(c4pro_pcm_tone_more, c4pro_pcm_tone_status_cb,
+                      start, size);
+
+        sleep(6 * HZ);
+        playing = pcm_is_playing();
+        callbacks = c4pro_pcm_tone_callbacks;
+        status = c4pro_pcm_tone_status;
+        chunks = c4pro_pcm_tone_chunks;
+        hdma_con0 = HDMA_CON0;
+        hdma_isr = HDMA_ISR;
+        hdma_dsr = HDMA_DSR;
+        if (c4pro_pcm_tone_src_addr != 0)
+            c4pro_cs8422_read_status(c4pro_pcm_tone_src_addr);
+        mode_s15[m] = c4pro_cs8422_status_15;
+        mode_s16[m] = c4pro_cs8422_status_16;
+        pcm_play_stop();
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "C4 AUDIO SWEEP");
+        lcd_puts(0, 1, modes[m].label);
+        lcd_puts(0, 2, "next in 2s");
+        lcd_puts(0, 3, "hear? note T#");
+        lcd_putsf(0, 4, "S13 %02x S15 %02x S16 %02x",
+                  c4pro_cs8422_status_13, c4pro_cs8422_status_15,
+                  c4pro_cs8422_status_16);
+        lcd_update();
+        sleep(2 * HZ);
+    }
+
+    c4pro_gpio_restore();
+
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 SWEEP DONE");
+    lcd_puts(0, 1, "report heard T?");
+    lcd_putsf(0, 2, "p%d cb%d st%d ch%d", playing,
+              callbacks, status, chunks);
+    lcd_putsf(0, 3, "I %04lx %04lx %04lx", I2S_OPR & 0xffff,
+              I2S_FIFOSTS & 0xffff, I2S_ISR & 0xffff);
+    lcd_putsf(0, 4, "H %04lx %04lx %04lx", hdma_con0 & 0xffff,
+              hdma_isr & 0xffff, hdma_dsr & 0xffff);
+    lcd_putsf(0, 5, "C %02x %02x %02x", c4pro_cs8422_status_13,
+              c4pro_cs8422_status_14, c4pro_cs8422_status_15);
+    lcd_putsf(0, 6, "T15 %02x %02x %02x %02x %02x", mode_s15[0],
+              mode_s15[1], mode_s15[2], mode_s15[3], mode_s15[4]);
+    lcd_putsf(0, 7, "T16 %02x %02x %02x %02x %02x", mode_s16[0],
+              mode_s16[1], mode_s16[2], mode_s16[3], mode_s16[4]);
+    lcd_update();
     button_clear_queue();
     while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
         ;
@@ -1364,6 +2033,12 @@ static void init(void)
     piezo_init();
 #endif
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_PCM_TONE_TEST)
+    pcm_init();
+    C4PRO_BOOT_STEP("pcm ok");
+    c4pro_pcm_tone_test();
+#endif
+
     /* Keep the order of this 3 (viewportmanager handles statusbars)
      * Must be done before any code uses the multi-screen API */
     CHART(">gui_syncstatusbar_init");
@@ -1608,8 +2283,10 @@ static void init(void)
     c4pro_show_ftl_probe();
 #endif
 #endif
+#if !defined(COLORFLY_C4_PRO) || !defined(C4PRO_PCM_TONE_TEST)
     pcm_init();
     C4PRO_BOOT_STEP("pcm ok");
+#endif
     dsp_init();
     C4PRO_BOOT_STEP("dsp ok");
 
@@ -1693,7 +2370,6 @@ static void init(void)
     shortcuts_init();
     C4PRO_BOOT_STEP("shortcuts ok");
 
-#if !defined(COLORFLY_C4_PRO) || defined(C4PRO_AUDIO_TEST)
     CHART(">audio_init");
     C4PRO_BOOT_STEP("audio_init");
     audio_init();
@@ -1701,9 +2377,6 @@ static void init(void)
     C4PRO_BOOT_STEP("audio ok");
     talk_announce_voice_invalid(); /* notify user w/ voice prompt if voice file invalid */
     C4PRO_BOOT_STEP("talk ok");
-#else
-    C4PRO_BOOT_STEP("audio skipped");
-#endif
     C4PRO_POST_CORE_INIT_HALT();
 
 #ifdef HAVE_WIFI
