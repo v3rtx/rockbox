@@ -615,6 +615,14 @@ uint32_t nand_read_page(uint32_t bank, uint32_t page, void* databuffer,
 }
 
 #ifdef COLORFLY_C4_PRO
+uint32_t c4pro_nand_read_id(uint32_t bank, unsigned char id[5])
+{
+    if (bank > 3 || !id)
+        return 1;
+
+    return nand_read_id(bank, id) ? 0 : 1;
+}
+
 uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
                                 uint32_t sector, void* databuffer,
                                 void* sparebuffer)
