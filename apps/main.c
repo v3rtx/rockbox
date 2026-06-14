@@ -351,7 +351,6 @@ static void c4pro_show_storage_verdict(void)
     unsigned first_data = 0;
     unsigned fat1 = 0xffff;
     unsigned fat2 = 0xffff;
-    unsigned root_sig = 0;
     unsigned bootbin_sig = 0;
     unsigned version_sig = 0;
     unsigned rk28_sig = 0;
@@ -359,15 +358,14 @@ static void c4pro_show_storage_verdict(void)
     int read1_rc = -1;
     int read43_rc = -1;
     int root_rc = -1;
-    int bootbin_rc = -1;
-    int version_rc = -1;
-    int rk28_rc = -1;
     int root_bad = C4PRO_ROOT_EXPECTED_COUNT;
     int content_ok = 0;
     bool boot_ok = false;
     bool fat_ok = false;
     bool root_ok = false;
     bool verdict_ok = false;
+    bool generic_fat = false;
+    const char *vol_kind = "BAD";
 
     read0_rc = storage_read_sectors(IF_MD(0,) 0, 1, sector);
     if (read0_rc == 0)
@@ -388,6 +386,9 @@ static void c4pro_show_storage_verdict(void)
                   fatsz == 42 && root_lba == 85 && first_data == 117 &&
                   !memcmp(sector + 3, "MSDOS5.0", 8) &&
                   !memcmp(sector + 54, "FAT16   ", 8);
+        generic_fat = sig == 0xaa55 && bps == SECTOR_SIZE &&
+                      spc > 0 && nfats > 0 && root_entries > 0 &&
+                      fatsz > 0 && root_lba > 0 && first_data > root_lba;
     }
 
     if (boot_ok)
@@ -406,21 +407,17 @@ static void c4pro_show_storage_verdict(void)
         root_rc = storage_read_sectors(IF_MD(0,) root_lba, 1, sector);
         if (root_rc == 0)
         {
-            root_sig = c4pro_probe_u32le(sector);
             root_bad = c4pro_check_expected_root_sector(sector);
             root_ok = root_bad < 0;
         }
 
-        bootbin_rc = storage_read_sectors(IF_MD(0,) 26985, 1, sector);
-        if (bootbin_rc == 0)
+        if (storage_read_sectors(IF_MD(0,) 26985, 1, sector) == 0)
             bootbin_sig = c4pro_probe_u32le(sector);
 
-        version_rc = storage_read_sectors(IF_MD(0,) 37117, 1, sector);
-        if (version_rc == 0)
+        if (storage_read_sectors(IF_MD(0,) 37117, 1, sector) == 0)
             version_sig = c4pro_probe_u32le(sector);
 
-        rk28_rc = storage_read_sectors(IF_MD(0,) 37121, 1, sector);
-        if (rk28_rc == 0)
+        if (storage_read_sectors(IF_MD(0,) 37121, 1, sector) == 0)
             rk28_sig = c4pro_probe_u32le(sector);
 
         content_ok = bootbin_sig == 0x73726f50 &&
@@ -429,44 +426,37 @@ static void c4pro_show_storage_verdict(void)
     }
 
     verdict_ok = boot_ok && fat_ok && root_ok;
+    if (verdict_ok)
+        vol_kind = "SYS";
+    else if (generic_fat)
+        vol_kind = "FAT";
 
-    lcd_setfont(FONT_UI);
+    lcd_setfont(FONT_SYSFIXED);
     lcd_clear_display();
-    lcd_putsf(0, 0, "C4 c%d m%d%d%d h%d",
-              content_ok,
+    lcd_putsf(0, 0, "C4VOL %s u%d c%d y%d h%d", vol_kind,
+              verdict_ok ? 0 : (generic_fat ? 1 : -1), content_ok,
+              c4pro_ftl_diag_synth_sectors, c4pro_ftl_diag_hash_mapped);
+    lcd_putsf(0, 1, "boot%d fat%d root%d bad%d", boot_ok, fat_ok,
+              root_ok, root_bad);
+    lcd_putsf(0, 2, "m%d%d%d B%d V%d K%d",
               c4pro_ftl_diag_hash_bootbin_psec >= 0,
               c4pro_ftl_diag_hash_version_psec >= 0,
               c4pro_ftl_diag_hash_rk28_psec >= 0,
-              c4pro_ftl_diag_hash_mapped);
-    lcd_putsf(0, 1, "b%d/%08x",
-              bootbin_rc, bootbin_sig);
-    lcd_putsf(0, 2, "v%d/%08x k%d/%08x",
-              version_rc, version_sig, rk28_rc, rk28_sig);
-    lcd_putsf(0, 3, "r%d f%d/%04x %d/%04x rr%d",
-              read0_rc, read1_rc, fat1, read43_rc, fat2, root_rc);
-    lcd_putsf(0, 4, "s%04x n%u z%d q%08x", sig, root_entries,
-              root_bad, root_sig);
-    lcd_putsf(0, 5, "h%d u%d x%d/%d/%d",
-              c4pro_ftl_diag_hash_mapped, c4pro_ftl_diag_hash_dupes,
+              c4pro_ftl_diag_hash_bootbin_psec,
+              c4pro_ftl_diag_hash_version_psec,
+              c4pro_ftl_diag_hash_rk28_psec);
+    lcd_putsf(0, 3, "d%d n%d x%d/%d/%d",
+              c4pro_ftl_diag_hash_best_delta,
+              c4pro_ftl_diag_hash_best_delta_count,
               c4pro_ftl_diag_hash_raw, c4pro_ftl_diag_hash_secdec,
               c4pro_ftl_diag_hash_pagedec);
-    lcd_putsf(0, 6, "d%d n%d",
-              c4pro_ftl_diag_hash_best_delta,
-              c4pro_ftl_diag_hash_best_delta_count);
-    lcd_putsf(0, 7, "B%d/%d V%d/%d K%d/%d",
-              c4pro_ftl_diag_hash_bootbin_psec,
-              c4pro_ftl_diag_hash_bootbin_mode,
-              c4pro_ftl_diag_hash_version_psec,
-              c4pro_ftl_diag_hash_version_mode,
-              c4pro_ftl_diag_hash_rk28_psec,
-              c4pro_ftl_diag_hash_rk28_mode);
+    lcd_puts(0, 7, "press key");
     lcd_update();
 
-    if (verdict_ok)
-        sleep(20 * HZ);
-    else
-        while (1)
-            sleep(HZ);
+    button_clear_queue();
+    while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
+        ;
+    button_clear_queue();
 }
 
 #ifdef C4PRO_FTL_PROBE
