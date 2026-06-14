@@ -4,7 +4,7 @@
  * SoC:        Rockchip RK27xx (ARM7EJ-S @ 200 MHz, 16 MiB DRAM @ 0x60000000)
  * LCD:        ILI9341 320x240 landscape (16-bit parallel MCU bus via LCDIF)
  * NAND:       2x Micron 9WA18 BGA (32 GiB total, accessed via rk27xx NAND/FTL)
- * DAC:        Cirrus CS4398 + CS8422 SRC (modelled as dummy codec for now)
+ * DAC:        Cirrus CS4398 + CS8422 SRC
  * Buttons:    placeholder mapping until on-device probing identifies wiring
  */
 
@@ -30,7 +30,7 @@
                          SAMPR_CAP_32 | SAMPR_CAP_24 | SAMPR_CAP_22 | \
                          SAMPR_CAP_16 | SAMPR_CAP_12 | SAMPR_CAP_11 | SAMPR_CAP_8)
 
-#define HAVE_DUMMY_CODEC
+#define HAVE_CS4398
 #define CODEC_SLAVE
 
 /* define this if you have a colour LCD */

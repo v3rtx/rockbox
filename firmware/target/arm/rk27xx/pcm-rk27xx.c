@@ -32,6 +32,10 @@
 
 static int locked = 0;
 
+#if defined(CODEC_SLAVE) && !defined(C4PRO_RK_I2S_SLAVE_TEST)
+#define RK27XX_I2S_MASTER
+#endif
+
 /* Mask the DMA interrupt */
 static void sink_lock(void)
 {
@@ -137,6 +141,9 @@ static void i2s_init(void)
 
     /* enable i2s clocks */
     SCU_CLKCFG &= ~(CLKCFG_PCLK_I2S | CLKCFG_I2S);
+#if defined(COLORFLY_C4_PRO) && defined(C4PRO_VENDOR_AUDIO_CLOCK_TEST)
+    SCU_DIVCON1 |= (1<<9);
+#endif
     
     /* configure I2S module */
     I2S_IER = 0; /* disable all i2s interrupts */
@@ -146,7 +153,7 @@ static void i2s_init(void)
                 (1<<4)  |  /* 16bit samples */
                 (0<<3)  |  /* stereo */
                 (0<<1)  |  /* I2S IF */
-#ifdef CODEC_SLAVE
+#ifdef RK27XX_I2S_MASTER
                 (1<<0);    /* master mode */
 #else
                 (0<<0);    /* slave mode */
@@ -165,7 +172,7 @@ static void i2s_init(void)
               (0<<4)  |  /* Req1 for Tx fifo */
               (1<<3)  |  /* Req2 for Rx fifo */
               (0<<2)  |  /* normal operation */
-#ifdef CODEC_SLAVE
+#ifdef RK27XX_I2S_MASTER
               (1<<1)  |  /* start Tx (master mode) */
               (0<<0);    /* do not start Rx (master mode) */
                          /* setting Rx bit to 1 result in choppy audio */
@@ -175,7 +182,7 @@ static void i2s_init(void)
 #endif
 }
 
-#ifdef CODEC_SLAVE
+#ifdef RK27XX_I2S_MASTER
 /* When codec is slave we need to setup i2s MCLK clock using codec pll.
  * The MCLK frequency is 256*codec frequency as i2s setup is:
  * LRCK/SCLK = 64 and MCLK/SCLK = 4 (see i2s_init() for reference)
@@ -239,7 +246,7 @@ static void sink_dma_init(void)
 
 static void sink_set_freq(uint16_t freq)
 {
-#ifdef CODEC_SLAVE
+#ifdef RK27XX_I2S_MASTER
     set_codec_freq(freq);
 #endif
 

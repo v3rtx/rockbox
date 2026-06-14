@@ -115,6 +115,10 @@ static void i2c_iomux(unsigned char slave)
 {
     unsigned long muxa = SCU_IOMUXA_CON & ~(0x1f<<14);
 
+#ifdef COLORFLY_C4_PRO
+    (void)slave;
+    SCU_IOMUXA_CON = (muxa | (1<<18));
+#else
     if ((slave & 0xfe) == (0x27<<1))
     {
         /* internal codec */
@@ -125,6 +129,7 @@ static void i2c_iomux(unsigned char slave)
         /* external I2C bus */
         SCU_IOMUXA_CON = (muxa | (1<<18));
     }
+#endif
 }
 
 void i2c_init(void)
@@ -216,6 +221,12 @@ end:
     return ret;
 }
 
+int rk27xx_i2c_write(unsigned char slave, int address, int len,
+                     const unsigned char *data)
+{
+    return i2c_write(slave, address, len, data);
+}
+
 int i2c_read(unsigned char slave, int address, int len, unsigned char *data)
 {
     int ret = 0;
@@ -285,4 +296,10 @@ end:
     SCU_CLKCFG |= CLKCFG_I2C;
 
     return ret;
+}
+
+int rk27xx_i2c_read(unsigned char slave, int address, int len,
+                    unsigned char *data)
+{
+    return i2c_read(slave, address, len, data);
 }

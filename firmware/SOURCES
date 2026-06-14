@@ -1913,6 +1913,7 @@ target/arm/rk27xx/hm801/power-hm801.c
 target/arm/rk27xx/c4pro/button-c4pro.c
 target/arm/rk27xx/c4pro/powermgmt-c4pro.c
 target/arm/rk27xx/c4pro/power-c4pro.c
+target/arm/rk27xx/c4pro/audio-c4pro.c
 #endif
 
 #if defined(MA9) || defined(MA9C) || defined(MA8) || defined(MA8C)

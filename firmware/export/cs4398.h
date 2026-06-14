@@ -31,7 +31,11 @@ AUDIOHW_SETTING(FILTER_ROLL_OFF, "", 0, 1, 0, 1, 0)
 void cs4398_write_reg(uint8_t reg, uint8_t val);
 uint8_t cs4398_read_reg(uint8_t reg);
 
+#ifdef COLORFLY_C4_PRO
+#define CS4398_I2C_ADDR		0x4c /* AD0..2 low on the C4 board */
+#else
 #define CS4398_I2C_ADDR		0x4f /* 1001111 */
+#endif
 
 #define CS4398_REG_CHIPID       0x01
 #define CS4398_REG_MODECTL      0x02

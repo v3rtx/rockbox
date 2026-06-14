@@ -26,16 +26,33 @@
 #include "audiohw.h"
 #include "i2c.h"
 
+#ifdef COLORFLY_C4_PRO
+extern int rk27xx_i2c_write(unsigned char slave, int address, int len,
+                            const unsigned char *data);
+extern int rk27xx_i2c_read(unsigned char slave, int address, int len,
+                           unsigned char *data);
+#endif
+
 void cs4398_write_reg(uint8_t reg, uint8_t val)
 {
+#ifdef COLORFLY_C4_PRO
+    rk27xx_i2c_write(CS4398_I2C_ADDR << 1, reg, 1, &val);
+#else
     unsigned char buf[2] = {reg, val};
     i2c_write(CS4398_I2C_ADDR, (unsigned char *)&buf, 2);
+#endif
 }
 
 uint8_t cs4398_read_reg(uint8_t reg)
 {
+#ifdef COLORFLY_C4_PRO
+    unsigned char val = 0xff;
+    rk27xx_i2c_read(CS4398_I2C_ADDR << 1, reg, 1, &val);
+    return val;
+#else
     unsigned char buf[2] = {reg, 0xff};
     i2c_write(CS4398_I2C_ADDR, (unsigned char *)&buf[0], 1);
     i2c_read(CS4398_I2C_ADDR, (unsigned char *)&buf[1], 1);
     return buf[1];
+#endif
 }

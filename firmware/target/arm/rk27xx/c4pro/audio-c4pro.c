@@ -21,6 +21,10 @@ extern int rk27xx_i2c_write(unsigned char slave, int address, int len,
 extern int rk27xx_i2c_read(unsigned char slave, int address, int len,
                            unsigned char *data);
 
+static unsigned char c4pro_cs4398_addr = CS4398_I2C_ADDR << 1;
+static unsigned char c4pro_cs8422_addr = CS8422_I2C_ADDR << 1;
+static bool c4pro_codecs_detected;
+
 static void c4pro_gpio_out_pc(int bit)
 {
     switch (bit)
@@ -114,7 +118,7 @@ static unsigned int c4pro_clockgen_word(int fsel)
 static int cs4398_read_reg8(unsigned char reg)
 {
     unsigned char val = 0xff;
-    rk27xx_i2c_read(CS4398_I2C_ADDR << 1, reg, 1, &val);
+    rk27xx_i2c_read(c4pro_cs4398_addr, reg, 1, &val);
     return val;
 }
 
@@ -130,7 +134,41 @@ static void c4pro_amp_enable(bool enable)
 
 static void cs8422_write_reg(unsigned char reg, unsigned char val)
 {
-    rk27xx_i2c_write(CS8422_I2C_ADDR << 1, reg, 1, &val);
+    rk27xx_i2c_write(c4pro_cs8422_addr, reg, 1, &val);
+}
+
+static void c4pro_detect_audio_codecs(void)
+{
+    unsigned char chipid = 0xff;
+    c4pro_codecs_detected = true;
+
+    for (unsigned char addr7 = 0x4c; addr7 <= 0x4f; addr7++)
+    {
+        unsigned char addr = addr7 << 1;
+
+        if (rk27xx_i2c_read(addr, CS4398_REG_CHIPID, 1, &chipid) == 0 &&
+            (chipid & CS4398_PART_MASK) == CS4398_PART_CS4398)
+        {
+            c4pro_cs4398_addr = addr;
+            break;
+        }
+        else
+            c4pro_cs4398_addr = CS4398_I2C_ADDR << 1;
+    }
+
+    for (unsigned char addr7 = 0x10; addr7 <= 0x17; addr7++)
+    {
+        unsigned char addr = addr7 << 1;
+
+        if (rk27xx_i2c_read(addr, 0x01, 1, &chipid) == 0 &&
+            (chipid & 0xf8) == 0x10)
+        {
+            c4pro_cs8422_addr = addr;
+            break;
+        }
+        else
+            c4pro_cs8422_addr = CS8422_I2C_ADDR << 1;
+    }
 }
 
 static void cs8422_init(void)
@@ -163,33 +201,40 @@ static int vol_tenthdb2hw(int tdb)
 
 void audiohw_preinit(void)
 {
+    c4pro_detect_audio_codecs();
     c4pro_clockgen_write(0x0001);
 }
 
 void audiohw_init(void)
 {
+    if (!c4pro_codecs_detected)
+        c4pro_detect_audio_codecs();
+
     cs8422_init();
 
     cs4398_write_reg(CS4398_REG_MISC, CS4398_CPEN | CS4398_PDN);
-    cs4398_write_reg(CS4398_REG_MODECTL, CS4398_FM_SINGLE | CS4398_DIF_I2S);
+    cs4398_write_reg(CS4398_REG_MODECTL, CS4398_FM_SINGLE |
+                     CS4398_DIF_I2S);
     cs4398_write_reg(CS4398_REG_VOLMIX, CS4398_VOL_B_EQ_A |
                      CS4398_ATAPI_A_R | CS4398_ATAPI_B_L);
     cs4398_write_reg(CS4398_REG_MUTE, CS4398_PAMUTE);
     cs4398_write_reg(CS4398_REG_VOL_A, 0x00);
     cs4398_write_reg(CS4398_REG_VOL_B, 0x00);
     cs4398_write_reg(CS4398_REG_RAMPFILT, CS4398_SOFT_RAMP |
-                     CS4398_RMP_UP | CS4398_RMP_DN | CS4398_FILT_SEL);
+                     CS4398_RMP_UP | CS4398_RMP_DN |
+                     CS4398_FILT_SEL);
     cs4398_write_reg(CS4398_REG_MISC, CS4398_CPEN);
 }
 
 void audiohw_postinit(void)
 {
-    SCU_IOMUXB_CON &= ~(1u << 14);
     GPIO_PDDR |= 1u << 7;
     GPIO_PDCON |= 1u << 7;
     c4pro_amp_enable(false);
     audiohw_init();
+
     c4pro_cs4398_unmute();
+
     sleep(HZ / 5);
     c4pro_amp_enable(true);
 }
