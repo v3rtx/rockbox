@@ -1429,6 +1429,16 @@ static int add_track_to_playlist_unlocked(struct playlist_info* playlist,
             return result;
     }
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    /*
+     * The C4 hash-FTL prototype can surface bogus high bits from playlist
+     * control-file seeks. Keep dynamic playlist offsets in Rockbox's
+     * documented 28-bit field so bit 28 is not misread as PLAYLIST_SKIPPED.
+     */
+    if (seek_pos >= 0)
+        seek_pos &= PLAYLIST_SEEK_MASK;
+#endif
+
     playlist->indices[insert_position] = flags | seek_pos;
     dc_init_filerefs(playlist, insert_position, 1);
 
@@ -1676,7 +1686,12 @@ static int calculate_step_count(const struct playlist_info *playlist, int steps)
             index -= playlist->amount;
 
         /* Check if we found a bad entry. */
-        if (playlist->indices[index] & PLAYLIST_SKIPPED)
+        if (playlist->indices[index] & PLAYLIST_SKIPPED
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
+            && false
+#endif
+            )
         {
             steps += direction;
             /* Are all entries bad? */
@@ -1770,8 +1785,13 @@ static int get_next_index(const struct playlist_info* playlist, int steps,
     }
 
     /* No luck if the whole playlist was bad. */
-    if (next_index < 0 || next_index >= playlist->amount ||
-        playlist->indices[next_index] & PLAYLIST_SKIPPED)
+    if (next_index < 0 || next_index >= playlist->amount
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
+        )
+#else
+        || playlist->indices[next_index] & PLAYLIST_SKIPPED)
+#endif
         return -1;
 
     return next_index;

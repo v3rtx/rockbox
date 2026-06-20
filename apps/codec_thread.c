@@ -35,6 +35,12 @@
 #include "metadata.h"
 #include "settings.h"
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+volatile int c4pro_codec_diag_pcm_count;
+volatile int c4pro_codec_diag_run_state;
+#endif
+
 /* Define LOGF_ENABLE to enable logf output in this file */
 /*#define LOGF_ENABLE*/
 #include "logf.h"
@@ -227,6 +233,11 @@ void codec_thread_do_callback(void (*fn)(void), unsigned int *id)
 static void codec_pcmbuf_insert_callback(
         const void *ch1, const void *ch2, int count)
 {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_codec_diag_pcm_count++;
+#endif
+
     struct dsp_buffer src;
     src.remcount  = count;
     src.pin[0]    = ch1;
@@ -535,7 +546,18 @@ static void run_codec(void)
         buf_pin_handle(ci.audio_hid, true);
     }
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_codec_diag_pcm_count = 0;
+    c4pro_codec_diag_run_state = 1;
+#endif
+
     status = codec_run_proc();
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_codec_diag_run_state = status;
+#endif
 
     if (!encoder)
     {

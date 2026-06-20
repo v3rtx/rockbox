@@ -55,6 +55,11 @@
 #define LOGF_ENABLE
 #include "logf.h"
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
+#include "c4pro_wav_codec_blob.h"
+#endif
+
 #if (CONFIG_PLATFORM & PLATFORM_SDL)
 #define PREFIX(_x_) sim_ ## _x_
 #else
@@ -252,6 +257,18 @@ int codec_load_file(const char *plugin, struct codec_api *api)
 {
     char path[MAX_PATH];
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
+    if (!strcmp(plugin, "wav") && c4pro_wav_codec_blob_len <= CODEC_SIZE)
+    {
+        memcpy(codecbuf, c4pro_wav_codec_blob, c4pro_wav_codec_blob_len);
+        curr_handle = lc_open_from_mem(codecbuf, c4pro_wav_codec_blob_len);
+
+        if (curr_handle != NULL)
+            return codec_load_ram(api);
+    }
+#endif
+
     codec_get_full_path(path, plugin);
 
     curr_handle = lc_open(path, codecbuf, CODEC_SIZE);
@@ -270,6 +287,17 @@ int codec_run_proc(void)
         logf("Codec: no codec to run");
         return CODEC_ERROR;
     }
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    if (c_hdr == NULL)
+        return -100;
+
+    if ((uintptr_t)c_hdr->run_proc == (uintptr_t)0xdeadbeef ||
+        (uintptr_t)c_hdr->run_proc < (uintptr_t)codecbuf ||
+        (uintptr_t)c_hdr->run_proc >= (uintptr_t)(codecbuf + CODEC_SIZE))
+        return -101;
+#endif
 
     logf("Codec: entering run state");
     return c_hdr->run_proc();

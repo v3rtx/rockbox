@@ -32,6 +32,43 @@
 
 static int locked = 0;
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+volatile int c4pro_pcm_diag_starts;
+volatile int c4pro_pcm_diag_irqs;
+volatile int c4pro_pcm_diag_stops;
+volatile int c4pro_pcm_diag_last_size;
+volatile int c4pro_pcm_diag_hdma_con0;
+volatile int c4pro_pcm_diag_hdma_isr;
+volatile int c4pro_pcm_diag_i2s_opr;
+volatile int c4pro_pcm_diag_i2s_fifosts;
+volatile int c4pro_pcm_diag_peak;
+volatile int c4pro_pcm_diag_peak_max;
+volatile int c4pro_pcm_diag_first_l;
+volatile int c4pro_pcm_diag_first_r;
+
+#if defined(C4PRO_PCM_DMA_TONE_SUBST)
+static int16_t c4pro_pcm_diag_tone[4096] __attribute__((aligned(4)));
+static bool c4pro_pcm_diag_tone_ready;
+
+static void c4pro_pcm_diag_tone_init(void)
+{
+    if (c4pro_pcm_diag_tone_ready)
+        return;
+
+    for (int i = 0; i < (int)(sizeof(c4pro_pcm_diag_tone) /
+                              (2 * sizeof(c4pro_pcm_diag_tone[0]))); i++)
+    {
+        int16_t sample = (i & 16) ? 18000 : -18000;
+        c4pro_pcm_diag_tone[i * 2] = sample;
+        c4pro_pcm_diag_tone[i * 2 + 1] = sample;
+    }
+
+    c4pro_pcm_diag_tone_ready = true;
+}
+#endif
+#endif
+
 #if defined(CODEC_SLAVE) && !defined(C4PRO_RK_I2S_SLAVE_TEST)
 #define RK27XX_I2S_MASTER
 #endif
@@ -60,6 +97,11 @@ static void sink_unlock(void)
 
 static void sink_dma_stop(void)
 {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_pcm_diag_stops++;
+#endif
+
     HDMA_CON0 = 0x00;
     HDMA_ISR = 0x00;
 
@@ -68,6 +110,43 @@ static void sink_dma_stop(void)
 
 static void hdma_i2s_transfer(const void *addr, size_t size)
 {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    const int16_t *samples = addr;
+    int count = (int)(size / sizeof(int16_t));
+    int peak = 0;
+
+    c4pro_pcm_diag_first_l = count > 0 ? samples[0] : 0;
+    c4pro_pcm_diag_first_r = count > 1 ? samples[1] : 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        int sample = samples[i];
+        int abs_sample = sample < 0 ? -sample : sample;
+
+        if (abs_sample > peak)
+            peak = abs_sample;
+    }
+
+    c4pro_pcm_diag_peak = peak;
+
+    if (peak > c4pro_pcm_diag_peak_max)
+        c4pro_pcm_diag_peak_max = peak;
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG) && defined(C4PRO_PCM_DMA_TONE_SUBST)
+    c4pro_pcm_diag_tone_init();
+    addr = c4pro_pcm_diag_tone;
+    size = sizeof(c4pro_pcm_diag_tone);
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_pcm_diag_starts++;
+    c4pro_pcm_diag_last_size = (int)size;
+#endif
+
     SCU_CLKCFG &= ~CLKCFG_HDMA; /* enable HDMA clock */
 
     commit_discard_dcache_range(addr, size);
@@ -108,6 +187,14 @@ static void hdma_i2s_transfer(const void *addr, size_t size)
                   (2<<3) |   /* transfer size = 32bits word */
                   (0<<1) |   /* command of software DMA (not relevant) */
                   (1<<0));   /* hardware trigger DMA mode */
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_pcm_diag_hdma_con0 = HDMA_CON0;
+    c4pro_pcm_diag_hdma_isr = HDMA_ISR;
+    c4pro_pcm_diag_i2s_opr = I2S_OPR;
+    c4pro_pcm_diag_i2s_fifosts = I2S_FIFOSTS;
+#endif
 }
 
 static void sink_dma_start(const void *addr, size_t size)
@@ -132,11 +219,15 @@ static void i2s_init(void)
 #else
     /* iomux I2S external */
     SCU_IOMUXA_CON |= (1<<19);   /* i2s external bit */
+#if defined(COLORFLY_C4_PRO)
+    SCU_IOMUXB_CON = (SCU_IOMUXB_CON & ~0x1f) | 0x0b;
+#else
     SCU_IOMUXB_CON |= ((1<<4) |  /* i2s_mclk */
                        (1<<3) |  /* i2s_sdo */
                        (1<<2) |  /* i2s_sdi */
                        (1<<1) |  /* i2s_lrck */
                        (1<<0));  /* i2s_bck */
+#endif
 #endif
 
     /* enable i2s clocks */
@@ -258,6 +349,15 @@ void INT_HDMA(void)
 {
     const void *start;
     size_t size;
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_pcm_diag_irqs++;
+    c4pro_pcm_diag_hdma_con0 = HDMA_CON0;
+    c4pro_pcm_diag_hdma_isr = HDMA_ISR;
+    c4pro_pcm_diag_i2s_opr = I2S_OPR;
+    c4pro_pcm_diag_i2s_fifosts = I2S_FIFOSTS;
+#endif
 
     if (pcm_play_dma_complete_callback(PCM_DMAST_OK, &start, &size))
     {

@@ -76,6 +76,32 @@ static struct mixer_channel * active_channels[PCM_MIXER_NUM_CHANNELS+1] IBSS_ATT
 /* Number of silence frames to play after all data has played */
 static unsigned int idle_counter = 0;
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+volatile int c4pro_mix_diag_src_peak;
+volatile int c4pro_mix_diag_out_peak;
+volatile int c4pro_mix_diag_amp;
+volatile int c4pro_mix_diag_status;
+
+static int c4pro_mix_peak16(const void *buf, size_t size)
+{
+    const int16_t *samples = buf;
+    int count = (int)(size / sizeof(int16_t));
+    int peak = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        int sample = samples[i];
+        int abs_sample = sample < 0 ? -sample : sample;
+
+        if (abs_sample > peak)
+            peak = abs_sample;
+    }
+
+    return peak;
+}
+#endif
+
 #ifdef CONFIG_SAMPR_TYPES
 #define SAMPR_NUM(sampr) (sampr & ~SAMPR_TYPE_MASK)
 #else
@@ -198,7 +224,17 @@ fill_frame:
 
         if (LIKELY(!*chan_p))
         {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+            c4pro_mix_diag_src_peak = c4pro_mix_peak16(chan->start, mixsize);
+            c4pro_mix_diag_amp = (int)chan->amplitude;
+            c4pro_mix_diag_status = chan->status;
+#endif
             write_samples(mixptr, chan->start, chan->amplitude, mixsize);
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+            c4pro_mix_diag_out_peak = c4pro_mix_peak16(mixptr, mixsize);
+#endif
         }
         else
         {

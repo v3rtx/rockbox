@@ -13,6 +13,9 @@
 #include "audiohw.h"
 #include "cs4398.h"
 #include "pcm_sampr.h"
+#ifdef HAVE_SW_VOLUME_CONTROL
+#include "pcm_sw_volume.h"
+#endif
 
 #define CS8422_I2C_ADDR     0x10
 
@@ -173,11 +176,18 @@ static void c4pro_detect_audio_codecs(void)
 
 static void cs8422_init(void)
 {
+    /* Matches the clean T1 RK I2S slave test path: SAI master, SRC I2S. */
     cs8422_write_reg(0x02, 0x80);
-    cs8422_write_reg(0x03, 0x80);
-    cs8422_write_reg(0x04, 0x84);
+    cs8422_write_reg(0x03, 0x84);
+    cs8422_write_reg(0x04, 0x40);
     cs8422_write_reg(0x07, 0x40);
-    cs8422_write_reg(0x08, 0x10);
+    cs8422_write_reg(0x08, 0x40);
+    cs8422_write_reg(0x09, 0x00);
+    cs8422_write_reg(0x0a, 0x00);
+    cs8422_write_reg(0x0b, 0x88);
+    cs8422_write_reg(0x0c, 0x84);
+    cs8422_write_reg(0x0d, 0x84);
+    cs8422_write_reg(0x02, 0x08);
 }
 
 static void c4pro_cs4398_unmute(void)
@@ -234,6 +244,10 @@ void audiohw_postinit(void)
     c4pro_amp_enable(false);
     audiohw_init();
 
+#ifdef HAVE_SW_VOLUME_CONTROL
+    pcm_set_master_volume(0, 0);
+#endif
+
     c4pro_cs4398_unmute();
 
     sleep(HZ / 5);
@@ -252,6 +266,10 @@ void audiohw_set_frequency(int fsel)
 
 void audiohw_set_volume(int vol_l, int vol_r)
 {
+#ifdef HAVE_SW_VOLUME_CONTROL
+    pcm_set_master_volume(0, 0);
+#endif
+
     cs4398_write_reg(CS4398_REG_VOL_A, vol_tenthdb2hw(vol_l));
     cs4398_write_reg(CS4398_REG_VOL_B, vol_tenthdb2hw(vol_r));
 }

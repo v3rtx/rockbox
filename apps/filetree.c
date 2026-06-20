@@ -1427,6 +1427,22 @@ int ft_enter(struct tree_context* c)
                 }
                 else
                 {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
+                    if (playlist_create(c->currdir, NULL) != -1 &&
+                        playlist_insert_track(NULL, buf,
+                                              PLAYLIST_INSERT_LAST,
+                                              false, true) >= 0)
+                    {
+                        struct playlist_info *playlist = playlist_get_current();
+                        playlist->index = 0;
+                        playlist->first_index = 0;
+                        if (playlist->amount > 0)
+                            playlist->indices[0] &= ~0x10000000u;
+                        playlist_start(0, 0, 0);
+                        play = true;
+                    }
+#else
                     /* use the assembled path sans filename */
                     char * fp = strrchr(buf, PATH_SEPCH);
                     if (fp)
@@ -1446,6 +1462,7 @@ int ft_enter(struct tree_context* c)
                         playlist_start(start_index, 0, 0);
                         play = true;
                     }
+#endif
                 }
                 break;
             }

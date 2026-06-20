@@ -73,6 +73,103 @@
 #include "lang.h"
 #endif
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG) && !defined(USB_ENABLE_AUDIO)
+#include "lcd.h"
+#include "font.h"
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+#define C4PRO_PLAYBACK_DIAG_HOLD (2 * HZ)
+extern volatile int c4pro_codec_diag_pcm_count;
+extern volatile int c4pro_codec_diag_run_state;
+extern volatile int c4pro_pcm_diag_starts;
+extern volatile int c4pro_pcm_diag_irqs;
+extern volatile int c4pro_pcm_diag_stops;
+extern volatile int c4pro_pcm_diag_last_size;
+extern volatile int c4pro_pcm_diag_hdma_con0;
+extern volatile int c4pro_pcm_diag_hdma_isr;
+extern volatile int c4pro_pcm_diag_i2s_opr;
+extern volatile int c4pro_pcm_diag_i2s_fifosts;
+extern volatile int c4pro_pcm_diag_peak;
+extern volatile int c4pro_pcm_diag_peak_max;
+extern volatile int c4pro_pcm_diag_first_l;
+extern volatile int c4pro_pcm_diag_first_r;
+extern volatile int c4pro_mix_diag_src_peak;
+extern volatile int c4pro_mix_diag_out_peak;
+extern volatile int c4pro_mix_diag_amp;
+extern volatile int c4pro_mix_diag_status;
+
+static void c4pro_playback_diag(const char *where, int a, int b)
+{
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 PLAYBACK DIAG");
+    lcd_puts(0, 1, where);
+    lcd_putsf(0, 2, "a %d", a);
+    lcd_putsf(0, 3, "b %d", b);
+    lcd_puts(0, 6, "2s");
+    lcd_update();
+    sleep(C4PRO_PLAYBACK_DIAG_HOLD);
+}
+
+static void c4pro_playback_diag_path(const char *where, const char *path,
+                                     int a, int b)
+{
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 PLAYBACK DIAG");
+    lcd_puts(0, 1, where);
+    lcd_putsf(0, 2, "a %d b %d", a, b);
+    lcd_puts(0, 3, path ? path : "<null>");
+    lcd_puts(0, 4, path && path[20] ? path + 20 : "");
+    lcd_puts(0, 5, path && path[40] ? path + 40 : "");
+    lcd_puts(0, 7, "2s");
+    lcd_update();
+    sleep(C4PRO_PLAYBACK_DIAG_HOLD);
+}
+
+static void c4pro_playback_diag_pcm_summary(void)
+{
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 PCM DIAG");
+    lcd_putsf(0, 1, "start %d irq %d", c4pro_pcm_diag_starts,
+              c4pro_pcm_diag_irqs);
+    lcd_putsf(0, 2, "stop %d size %d", c4pro_pcm_diag_stops,
+              c4pro_pcm_diag_last_size);
+    lcd_putsf(0, 3, "opr %04x fifo %04x",
+              c4pro_pcm_diag_i2s_opr & 0xffff,
+              c4pro_pcm_diag_i2s_fifosts & 0xffff);
+    lcd_putsf(0, 4, "hdma %04x isr %04x",
+              c4pro_pcm_diag_hdma_con0 & 0xffff,
+              c4pro_pcm_diag_hdma_isr & 0xffff);
+    lcd_putsf(0, 5, "peak %d max %d", c4pro_pcm_diag_peak,
+              c4pro_pcm_diag_peak_max);
+    lcd_putsf(0, 6, "s0 %d %d", c4pro_pcm_diag_first_l,
+              c4pro_pcm_diag_first_r);
+    lcd_puts(0, 7, "10s");
+    lcd_update();
+    sleep(10 * HZ);
+}
+
+static void c4pro_playback_diag_mix_summary(void)
+{
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 MIX DIAG");
+    lcd_putsf(0, 1, "src peak %d", c4pro_mix_diag_src_peak);
+    lcd_putsf(0, 2, "out peak %d", c4pro_mix_diag_out_peak);
+    lcd_putsf(0, 3, "amp %d", c4pro_mix_diag_amp);
+    lcd_putsf(0, 4, "status %d", c4pro_mix_diag_status);
+    lcd_puts(0, 7, "10s");
+    lcd_update();
+    sleep(10 * HZ);
+}
+
+#endif
+
 /* TODO: The audio thread really is doing multitasking of acting like a
          consumer and producer of tracks. It may be advantageous to better
          logically separate the two functions. I won't go that far just yet. */
@@ -1225,6 +1322,39 @@ static void audio_clear_track_notifications(void)
 /* Takes actions based upon track load status codes */
 static void audio_handle_track_load_status(int trackstat)
 {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    if (trackstat < LOAD_TRACK_OK &&
+        !(trackstat == LOAD_TRACK_ERR_NO_MORE && track_list_count() > 0))
+    {
+        const char *name = "load ?";
+
+        switch (trackstat)
+        {
+        case LOAD_TRACK_ERR_START_CODEC:
+            name = "load start codec";
+            break;
+        case LOAD_TRACK_ERR_FINISH_FAILED:
+            name = "load finish fail";
+            break;
+        case LOAD_TRACK_ERR_FINISH_FULL:
+            name = "load finish full";
+            break;
+        case LOAD_TRACK_ERR_BUSY:
+            name = "load busy";
+            break;
+        case LOAD_TRACK_ERR_NO_MORE:
+            name = "load no more";
+            break;
+        case LOAD_TRACK_ERR_FAILED:
+            name = "load failed";
+            break;
+        }
+
+        c4pro_playback_diag(name, trackstat, track_list_count());
+    }
+#endif
+
     switch (trackstat)
     {
     case LOAD_TRACK_ERR_NO_MORE:
@@ -1750,18 +1880,38 @@ static bool audio_start_codec(bool auto_skip)
     struct track_info info;
     track_list_current(0, &info);
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_playback_diag("codec start", auto_skip, info.id3_hid);
+#endif
+
     struct mp3entry *cur_id3 = valid_mp3entry(bufgetid3(info.id3_hid));
 
     if (!cur_id3)
+    {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+        c4pro_playback_diag("no id3", info.id3_hid, 0);
+#endif
         return false;
+    }
 
     buf_pin_handle(info.id3_hid, true);
 
     if (!audio_init_codec(&info, cur_id3))
     {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+        c4pro_playback_diag("init fail", info.id3_hid, 0);
+#endif
         buf_pin_handle(info.id3_hid, false);
         return false;
     }
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_playback_diag("init ok", info.id3_hid, cur_id3->codectype);
+#endif
 
     #ifdef HAVE_TAGCACHE
     bool autoresume_enable = !cur_id3->skip_resume_adjustments && global_settings.autoresume_enable;
@@ -2133,6 +2283,10 @@ static int audio_load_track(void)
     int fd = -1;
     char path_buf[MAX_PATH + 1];
     const char *path;
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    bool shown_open_fail = false;
+#endif
 
     while (1)
     {
@@ -2152,6 +2306,21 @@ static int audio_load_track(void)
         }
         logf("Open failed %s", path);
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+        if (!shown_open_fail)
+        {
+            int exists = file_exists(path) ? 1 : 0;
+            int test_fd = open(path, O_RDONLY);
+
+            if (test_fd >= 0)
+                close(test_fd);
+
+            c4pro_playback_diag_path("open fail", path, exists, test_fd);
+            shown_open_fail = true;
+        }
+#endif
+
         /* only skip if failed track has a successor in playlist */
         if (!playlist_peek(playlist_peek_offset + 1, NULL, 0))
             break;
@@ -2166,6 +2335,26 @@ static int audio_load_track(void)
 
     if (!path)
     {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+        struct playlist_info *playlist = playlist_get_current();
+        struct playlist_track_info track;
+        if (playlist_get_track_info(playlist, playlist->index, &track) == 0)
+        {
+            c4pro_playback_diag_path("peek no path",
+                                     track.filename,
+                                     track.attr,
+                                     playlist->index);
+        }
+        else
+        {
+            c4pro_playback_diag_path("peek no path",
+                                     playlist->filename,
+                                     playlist->amount,
+                                     playlist->index);
+        }
+#endif
+
         /* No track - exhausted the playlist entries */
         logf("End-of-playlist");
         id3_write_locked(UNBUFFERED_ID3, NULL);
@@ -2262,6 +2451,10 @@ static int audio_finish_load_track(struct track_info *infop)
 
     if (!track_id3)
     {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+        c4pro_playback_diag("finish no meta", infop->id3_hid, infop->self_hid);
+#endif
         /* This is an error condition. Track cannot be played without valid
            metadata; skip the track. */
         logf("No metadata");
@@ -2387,6 +2580,10 @@ static int audio_finish_load_track(struct track_info *infop)
 
     if (hid >= 0)
     {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+        c4pro_playback_diag("audio hid ok", hid, track_id3->codectype);
+#endif
         infop->audio_hid = hid;
 
         /*
@@ -2418,6 +2615,10 @@ static int audio_finish_load_track(struct track_info *infop)
         }
         else
         {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+            c4pro_playback_diag("audio hid fail", hid, audio_track_count());
+#endif
             /* Nothing to play if no audio handle - skip this */
             logf("Could not add audio data handle");
             trackstat = LOAD_TRACK_ERR_FINISH_FAILED;
@@ -2427,6 +2628,10 @@ static int audio_finish_load_track(struct track_info *infop)
 audio_finish_load_track_exit:
     if (trackstat >= LOAD_TRACK_OK && !track_info_sync(infop))
     {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+        c4pro_playback_diag("info sync fail", infop->self_hid, trackstat);
+#endif
         logf("Track info sync failed");
         trackstat = LOAD_TRACK_ERR_FINISH_FAILED;
     }
@@ -2583,7 +2788,18 @@ static void audio_on_finish_load_track(int id3_hid)
     struct track_info info, user_cur;
 
     if (!buf_is_handle(id3_hid) || !track_list_last(0, &info))
+    {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+        c4pro_playback_diag("finish bad hid", id3_hid, track_list_count());
+#endif
         return;
+    }
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_playback_diag("finish id3", id3_hid, info.self_hid);
+#endif
 
     track_list_user_current(1, &user_cur);
     if (info.self_hid == user_cur.self_hid)
@@ -2592,7 +2808,14 @@ static void audio_on_finish_load_track(int id3_hid)
         audio_update_and_announce_next_track(bufgetid3(info.id3_hid));
     }
 
-    if (audio_finish_load_track(&info) != LOAD_TRACK_READY)
+    int finish_status = audio_finish_load_track(&info);
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_playback_diag("finish status", finish_status, info.audio_hid);
+#endif
+
+    if (finish_status != LOAD_TRACK_READY)
         return; /* Not current track */
 
     track_list_user_current(0, &user_cur);
@@ -2912,6 +3135,13 @@ static bool audio_can_change_track(int *trackstat, enum pcm_track_change_type *t
 static void audio_on_codec_complete(int status)
 {
     logf("%s(%d)", __func__, status);
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+    c4pro_playback_diag("codec complete", status, c4pro_codec_diag_pcm_count);
+    c4pro_playback_diag_mix_summary();
+    c4pro_playback_diag_pcm_summary();
+#endif
 
     if (play_status == PLAY_STOPPED)
         return;
@@ -3766,6 +3996,10 @@ static void buffer_event_finished_callback(unsigned short id, void *ev_data)
     case TYPE_ID3:
         /* The metadata handle for the last loaded track has been buffered.
            We can ask the audio thread to load the rest of the track's data. */
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+        c4pro_playback_diag("buf id3 done", hid, htype);
+#endif
         LOGFQUEUE("buffering > audio Q_AUDIO_FINISH_LOAD_TRACK: %d", hid);
         audio_queue_post(Q_AUDIO_FINISH_LOAD_TRACK, hid);
         break;
@@ -4267,6 +4501,13 @@ static unsigned long audio_guess_frequency(struct mp3entry *id3)
 
 static bool audio_auto_change_frequency(struct mp3entry *id3, bool play)
 {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
+    (void)id3;
+    (void)play;
+    return false;
+#endif
+
     if (!valid_mp3entry(id3))
         return false;
     unsigned long guessed_frequency = global_settings.play_frequency == 0 ? audio_guess_frequency(id3) : 0;
