@@ -96,6 +96,46 @@ static uint16_t c4pro_ftl_delta_counts
 #define C4PRO_FTL_PSEC_INVALID 0xffffffffu
 #endif
 
+#if defined(C4PRO_FTL_RAM_WRITE_TEST)
+#ifndef C4PRO_FTL_RAM_WRITE_SECTORS
+#define C4PRO_FTL_RAM_WRITE_SECTORS 512
+#endif
+static uint32_t c4pro_ftl_ram_write_lba[C4PRO_FTL_RAM_WRITE_SECTORS];
+static unsigned char c4pro_ftl_ram_write_valid[C4PRO_FTL_RAM_WRITE_SECTORS];
+static unsigned char c4pro_ftl_ram_write_data[C4PRO_FTL_RAM_WRITE_SECTORS][512];
+
+static int c4pro_ftl_ram_write_lookup(uint32_t sector)
+{
+    for (int i = 0; i < C4PRO_FTL_RAM_WRITE_SECTORS; i++)
+    {
+        if (c4pro_ftl_ram_write_valid[i] &&
+            c4pro_ftl_ram_write_lba[i] == sector)
+            return i;
+    }
+
+    return -1;
+}
+
+static int c4pro_ftl_ram_write_slot(uint32_t sector)
+{
+    int slot = c4pro_ftl_ram_write_lookup(sector);
+    if (slot >= 0)
+        return slot;
+
+    for (int i = 0; i < C4PRO_FTL_RAM_WRITE_SECTORS; i++)
+    {
+        if (!c4pro_ftl_ram_write_valid[i])
+        {
+            c4pro_ftl_ram_write_valid[i] = 1;
+            c4pro_ftl_ram_write_lba[i] = sector;
+            return i;
+        }
+    }
+
+    return -1;
+}
+#endif
+
 static unsigned char page_data[4096];
 static unsigned char page_spare[128];
 int c4pro_ftl_diag_hash_mapped;
@@ -541,6 +581,19 @@ uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
         uint32_t page;
         uint32_t sector_in_page;
         unsigned char mode = C4PRO_FTL_MODE_RAW;
+#ifdef C4PRO_FTL_RAM_WRITE_TEST
+        int ram_offset;
+
+        ram_offset = c4pro_ftl_ram_write_lookup(sector);
+        if (ram_offset >= 0)
+        {
+            memcpy(out, c4pro_ftl_ram_write_data[ram_offset], 512);
+            out += 512;
+            sector++;
+            count--;
+            continue;
+        }
+#endif
 #ifdef C4PRO_FTL_SYNTH_SECTOR_COUNT
         int synth_offset;
 
@@ -608,10 +661,32 @@ uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
 
 uint32_t ftl_write(uint32_t sector, uint32_t count, const void* buffer)
 {
+#if defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_RAM_WRITE_TEST)
+    const unsigned char *in = buffer;
+
+    if (sector > C4PRO_SYSTEM_SECTORS ||
+        count > C4PRO_SYSTEM_SECTORS - sector)
+        return (uint32_t)-1;
+
+    while (count > 0)
+    {
+        int slot = c4pro_ftl_ram_write_slot(sector);
+        if (slot < 0)
+            return (uint32_t)-1;
+
+        memcpy(c4pro_ftl_ram_write_data[slot], in, 512);
+        in += 512;
+        sector++;
+        count--;
+    }
+
+    return 0;
+#else
     (void)sector;
     (void)count;
     (void)buffer;
-    return 1;
+    return (uint32_t)-1;
+#endif
 }
 
 uint32_t ftl_sync(void)
