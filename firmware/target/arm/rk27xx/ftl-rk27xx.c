@@ -401,8 +401,9 @@ static uint32_t c4pro_ftl_lba_to_psec(uint32_t lba)
 
     inferred_psec = (int)lba + c4pro_ftl_diag_hash_best_delta;
     if (c4pro_ftl_diag_hash_best_delta_count >= 16 &&
-        inferred_psec >= 0 &&
-        inferred_psec < (int)C4PRO_STORAGE_SECTORS)
+        inferred_psec >= (int)C4PRO_FTL_HASH_SCAN_START &&
+        inferred_psec < (int)(C4PRO_FTL_HASH_SCAN_START +
+                              C4PRO_FTL_HASH_SCAN_SECTORS))
         return (uint32_t)inferred_psec;
 
     return C4PRO_SYSTEM_PSEC_BASE + lba;
