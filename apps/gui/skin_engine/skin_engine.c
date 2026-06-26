@@ -275,6 +275,10 @@ static char* get_skin_filename(char *buf, size_t buf_size,
                 setting = global_settings.wps_file;
                 ext = "wps";
             }
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_FORCE_BUILTIN_WPS)
+            setting = "-";
+#endif
             break;
 #if CONFIG_TUNER
         case FM_SCREEN:
