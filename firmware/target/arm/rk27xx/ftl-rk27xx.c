@@ -1025,6 +1025,9 @@ static unsigned char c4own_used[C4PRO_OWNED_PBLK_COUNT];
 static unsigned char c4own_retired[C4PRO_OWNED_PBLK_COUNT];
 static unsigned char c4own_page_data[4096];
 static unsigned char c4own_page_spare[128];
+static unsigned char c4own_read_page_data[4096];
+static uint32_t c4own_read_page;
+static bool c4own_read_page_valid;
 #ifndef C4OWN_CACHE_SLOTS
 #define C4OWN_CACHE_SLOTS 4u
 #endif
@@ -1099,14 +1102,25 @@ static bool c4own_pblk_valid(uint32_t pblk)
 
 static int c4own_read_phys_sector(uint32_t pblk, uint32_t sector, void *buf)
 {
+    uint32_t page;
+
     if (!c4own_pblk_valid(pblk) || sector >= C4OWN_SECTORS_PER_BLOCK)
         return 1;
 
-    return c4pro_nand_read_linear_sector(
-        0,
-        c4own_pblk_page(pblk) + sector / C4OWN_SECTORS_PER_PAGE,
-        sector & (C4OWN_SECTORS_PER_PAGE - 1u),
-        buf);
+    page = c4own_pblk_page(pblk) + sector / C4OWN_SECTORS_PER_PAGE;
+    if (!c4own_read_page_valid || c4own_read_page != page)
+    {
+        if (c4pro_nand_read_linear_page(0, page, c4own_read_page_data))
+            return 1;
+
+        c4own_read_page = page;
+        c4own_read_page_valid = true;
+    }
+
+    memcpy(buf, c4own_read_page_data +
+                (sector & (C4OWN_SECTORS_PER_PAGE - 1u)) * 512u,
+           512);
+    return 0;
 }
 
 static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
@@ -1114,6 +1128,7 @@ static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
     if (!c4own_pblk_valid(pblk) || page_in_block >= C4OWN_PAGES_PER_BLOCK)
         return 1;
 
+    c4own_read_page_valid = false;
     memset(c4own_page_spare, 0xff, sizeof(c4own_page_spare));
     return c4pro_nand_write_page(0, c4own_pblk_page(pblk) + page_in_block,
                                  c4own_page_data, c4own_page_spare);
@@ -1124,6 +1139,7 @@ static int c4own_erase_pblk(uint32_t pblk)
     if (!c4own_pblk_valid(pblk))
         return 1;
 
+    c4own_read_page_valid = false;
     return c4pro_nand_erase_block(0, c4own_pblk_page(pblk));
 }
 
@@ -1194,6 +1210,7 @@ static void c4own_reset_maps(void)
         c4own_cache_age[slot] = 0;
     }
     c4own_cache_tick = 0;
+    c4own_read_page_valid = false;
     c4own_diag_cache_logical = -1;
 }
 
@@ -1259,12 +1276,18 @@ static int c4own_mount_scan(void)
         if (gen >= c4own_gen[logical])
         {
             if (c4own_map[logical] != 0xffffu)
+            {
                 c4own_used[c4own_map[logical]] = 0;
+                c4own_retired[c4own_map[logical]] = 1;
+            }
             c4own_map[logical] = pblk;
             c4own_gen[logical] = gen;
         }
         else
+        {
             c4own_used[pblk] = 0;
+            c4own_retired[pblk] = 1;
+        }
     }
 
     return 0;
@@ -1472,7 +1495,10 @@ static int c4own_write_logical_block(uint32_t logical, uint32_t first,
     c4own_map[logical] = new_pblk;
     c4own_gen[logical] = gen;
     if (old_pblk != 0xffffu)
+    {
         c4own_used[old_pblk] = 0;
+        c4own_retired[old_pblk] = 1;
+    }
 
     return 0;
 

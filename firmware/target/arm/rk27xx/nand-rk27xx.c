@@ -746,6 +746,50 @@ uint32_t c4pro_nand_read_linear_sector(uint32_t bank, uint32_t page,
     return 0;
 }
 
+uint32_t c4pro_nand_read_linear_page(uint32_t bank, uint32_t page,
+                                     void* databuffer)
+{
+    unsigned i;
+    unsigned char *data = databuffer;
+
+    if (bank > 3 || !data)
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+    FLASH_CMD(bank) = 0x30;
+
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    for (i = 0; i < 4096; i++)
+        data[i] = FLASH_DATA(bank);
+
+    nand_deselect();
+    last_activity = current_tick;
+    return 0;
+}
+
 uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
                                const void* databuffer,
                                const void* sparebuffer)
