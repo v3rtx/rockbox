@@ -107,6 +107,72 @@ uint8_t usb_drv_ep_specs_flags = 0;
 static volatile bool set_address = false;
 static volatile bool set_configuration = false;
 
+#ifdef C4PRO_USB_DIAG_EXPORT
+static void udc_phy_reset(void);
+static void udc_soft_connect(void);
+#endif
+
+#ifdef C4PRO_USB_DIAG_EXPORT
+volatile unsigned c4pro_usb_diag_irq_count;
+volatile unsigned c4pro_usb_diag_reset_count;
+volatile unsigned c4pro_usb_diag_conn_count;
+volatile unsigned c4pro_usb_diag_setup_count;
+volatile unsigned c4pro_usb_diag_in0_count;
+volatile unsigned c4pro_usb_diag_out0_count;
+volatile unsigned c4pro_usb_diag_last_intsrc;
+volatile unsigned c4pro_usb_diag_last_dev_info;
+volatile unsigned c4pro_usb_diag_last_setup0;
+volatile unsigned c4pro_usb_diag_last_setup1;
+volatile unsigned c4pro_usb_diag_last_tx0stat;
+volatile unsigned c4pro_usb_diag_last_rx0stat;
+volatile unsigned c4pro_usb_diag_last_tx0con;
+volatile unsigned c4pro_usb_diag_last_rx0con;
+volatile unsigned c4pro_usb_diag_outn_count;
+volatile unsigned c4pro_usb_diag_last_outn;
+volatile unsigned c4pro_usb_diag_last_outn_stat;
+volatile unsigned c4pro_usb_diag_last_outn_con;
+volatile unsigned c4pro_usb_diag_live_dev_ctl;
+volatile unsigned c4pro_usb_diag_live_dev_info;
+volatile unsigned c4pro_usb_diag_live_en_int;
+volatile unsigned c4pro_usb_diag_live_intcon;
+volatile unsigned c4pro_usb_diag_live_int2flag;
+volatile unsigned c4pro_usb_diag_live_tx0stat;
+volatile unsigned c4pro_usb_diag_live_rx0stat;
+volatile unsigned c4pro_usb_diag_live_tx0con;
+volatile unsigned c4pro_usb_diag_live_rx0con;
+volatile unsigned c4pro_usb_diag_live_scu_clkcfg;
+volatile unsigned c4pro_usb_diag_live_scu_rstcfg;
+volatile unsigned c4pro_usb_diag_live_scu_iomuxa;
+volatile unsigned c4pro_usb_diag_live_scu_iomuxb;
+static bool c4pro_usb_diag_did_soft_connect;
+
+void c4pro_usb_diag_sample(void)
+{
+    c4pro_usb_diag_live_dev_ctl = DEV_CTL;
+    c4pro_usb_diag_live_dev_info = DEV_INFO;
+    c4pro_usb_diag_live_en_int = EN_INT;
+    c4pro_usb_diag_live_intcon = INTCON;
+    c4pro_usb_diag_live_int2flag = INT2FLAG & 0x7fffff;
+    c4pro_usb_diag_live_tx0stat = TX0STAT;
+    c4pro_usb_diag_live_rx0stat = RX0STAT;
+    c4pro_usb_diag_live_tx0con = TX0CON;
+    c4pro_usb_diag_live_rx0con = RX0CON;
+    c4pro_usb_diag_live_scu_clkcfg = SCU_CLKCFG;
+    c4pro_usb_diag_live_scu_rstcfg = SCU_RSTCFG;
+    c4pro_usb_diag_live_scu_iomuxa = SCU_IOMUXA_CON;
+    c4pro_usb_diag_live_scu_iomuxb = SCU_IOMUXB_CON;
+}
+
+void c4pro_usb_diag_force_reattach(void)
+{
+    DEV_CTL = DEV_SELF_PWR | DEV_PHY16BIT;
+    udelay(500000);
+    udc_phy_reset();
+    udelay(10000);
+    udc_soft_connect();
+}
+#endif
+
 #undef ENDPOINT
 
 static void setup_received(void)
@@ -117,6 +183,13 @@ static void setup_received(void)
     /* copy setup data from packet */
     setup_data[0] = SETUP1;
     setup_data[1] = SETUP2;
+#ifdef C4PRO_USB_DIAG_EXPORT
+    c4pro_usb_diag_setup_count++;
+    c4pro_usb_diag_last_setup0 = setup_data[0];
+    c4pro_usb_diag_last_setup1 = setup_data[1];
+    if(setup_data[0] == 0 && setup_data[1] == 0)
+        return;
+#endif
 
     /* pass setup data to the upper layer */
     usb_core_setup_received((struct usb_ctrlrequest*)setup_data);
@@ -163,7 +236,10 @@ static void ep_write(struct endpoint_t *endp)
 
 static void ep_read(struct endpoint_t *endp)
 {
+    int xfer_size = MIN(max_pkt_size(endp), endp->cnt);
+
     /* setup DMA */
+    RXSTAT(endp) = xfer_size;
     DMAOUTLMADDR(endp) = (uint32_t)endp->buf; /* local buffer address */
     DMAOUTCTL(endp) = DMA_START;
     /* clear NAK */
@@ -173,6 +249,14 @@ static void ep_read(struct endpoint_t *endp)
 static void in_intr(struct endpoint_t *endp)
 {
     uint32_t txstat = TXSTAT(endp);
+#ifdef C4PRO_USB_DIAG_EXPORT
+    if(endp->ep_num == 0)
+    {
+        c4pro_usb_diag_in0_count++;
+        c4pro_usb_diag_last_tx0stat = txstat;
+        c4pro_usb_diag_last_tx0con = TXCON(endp);
+    }
+#endif
     /* check if clear feature was sent by host */
     if(txstat & TXCFINT)
     {
@@ -199,6 +283,21 @@ static void in_intr(struct endpoint_t *endp)
 static void out_intr(struct endpoint_t *endp)
 {
     uint32_t rxstat = RXSTAT(endp);
+#ifdef C4PRO_USB_DIAG_EXPORT
+    if(endp->ep_num == 0)
+    {
+        c4pro_usb_diag_out0_count++;
+        c4pro_usb_diag_last_rx0stat = rxstat;
+        c4pro_usb_diag_last_rx0con = RXCON(endp);
+    }
+    else
+    {
+        c4pro_usb_diag_outn_count++;
+        c4pro_usb_diag_last_outn = endp->ep_num;
+        c4pro_usb_diag_last_outn_stat = rxstat;
+        c4pro_usb_diag_last_outn_con = RXCON(endp);
+    }
+#endif
     logf("udc: out intr(%d)", endp->ep_num);
     /* check if clear feature was sent by host */
     if(rxstat & RXCFINT)
@@ -215,7 +314,8 @@ static void out_intr(struct endpoint_t *endp)
         logf("udc: ack(%d) -> %d/%d", endp->ep_num, xfer_size, endp->cnt);
         /* finished ? */
         if(endp->cnt <= 0 || xfer_size < max_pkt_size(endp))
-            usb_core_transfer_complete(endp->ep_num, endp->dir, 0, endp->len);
+            usb_core_transfer_complete(endp->ep_num, endp->dir, 0,
+                                       endp->len - endp->cnt);
         else
             ep_read(endp);
     }
@@ -267,7 +367,7 @@ void usb_drv_startup(void) {
     usb_drv_ep_specs[0].type[DIR_OUT] = USB_ENDPOINT_XFER_CONTROL;
     usb_drv_ep_specs[0].type[DIR_IN] = USB_ENDPOINT_XFER_CONTROL;
     for(int ep_num = 1; ep_num < 16; ep_num++) {
-        int dir = endpoints[ep_num].dir;
+        int dir = endpoints[ep_num].dir == USB_DIR_IN ? DIR_IN : DIR_OUT;
         int type = endpoints[ep_num].type;
         usb_drv_ep_specs[ep_num].type[dir] = type;
         usb_drv_ep_specs[ep_num].type[!dir] = USB_ENDPOINT_TYPE_NONE;
@@ -427,12 +527,26 @@ void usb_drv_stall(int endpoint, bool stall, bool in)
 /* one time init (once per connection) - basicaly enable usb core */
 void usb_drv_init(void)
 {
+    usb_drv_startup();
+
     /* init semaphore of ep0 */
     semaphore_init(&ctrlep[DIR_OUT].complete, 1, 0);
     semaphore_init(&ctrlep[DIR_IN].complete, 1, 0);
 
     for(int ep_num = 1; ep_num < USB_NUM_ENDPOINTS; ep_num++)
         semaphore_init(&endpoints[ep_num].complete, 1, 0);
+
+#ifdef C4PRO_USB_DIAG_EXPORT
+    if(!c4pro_usb_diag_did_soft_connect)
+    {
+        c4pro_usb_diag_did_soft_connect = true;
+        DEV_CTL = DEV_SELF_PWR | DEV_PHY16BIT;
+        udelay(250000);
+        udc_phy_reset();
+        udelay(10000);
+        udc_soft_connect();
+    }
+#endif
 }
 
 /* turn off usb core */
@@ -462,9 +576,19 @@ void INT_UDC(void)
 {
     /* read what caused UDC irq */
     uint32_t intsrc = INT2FLAG & 0x7fffff;
+    if(intsrc == 0)
+        return;
+#ifdef C4PRO_USB_DIAG_EXPORT
+    c4pro_usb_diag_irq_count++;
+    c4pro_usb_diag_last_intsrc = intsrc;
+    c4pro_usb_diag_last_dev_info = DEV_INFO;
+#endif
 
     if(intsrc & USBRST_INTR) /* usb reset */
     {
+#ifdef C4PRO_USB_DIAG_EXPORT
+        c4pro_usb_diag_reset_count++;
+#endif
         logf("udc_int: reset, %ld", current_tick);
 
         EN_INT = EN_SUSP_INTR   |  /* Enable Suspend Irq */
@@ -481,13 +605,15 @@ void INT_UDC(void)
                  TXNAK;            /* Set as one to response NAK handshake */
 
         RX0CON = RXACKINTEN |
-                 RXEPEN     |      /* Endpoint 0 Enable. When cleared the
-                                    * endpoint does not respond to an SETUP
-                                    * or OUT token */
-                 RXNAK;            /* Set as one to response NAK handshake */
+                 RXEPEN;           /* Keep EP0 OUT/SETUP receptive after reset. */
+#ifdef C4PRO_USB_DIAG_EXPORT
+        c4pro_usb_diag_last_tx0con = TX0CON;
+        c4pro_usb_diag_last_rx0con = RX0CON;
+#endif
 
         set_address = false;
         set_configuration = false;
+        usb_core_bus_reset();
     }
     /* This needs to be processed AFTER usb reset */
     udc_helper();
@@ -525,6 +651,9 @@ void INT_UDC(void)
     }
     if(intsrc & CONN_INTR)
     {
+#ifdef C4PRO_USB_DIAG_EXPORT
+        c4pro_usb_diag_conn_count++;
+#endif
         /* usb connect */
         udc_phy_reset();
         udelay(10000);         /* wait at least 10ms */
@@ -541,4 +670,6 @@ void INT_UDC(void)
         else
             out_intr(endp);
     }
+
+    INT2FLAG = intsrc;
 }

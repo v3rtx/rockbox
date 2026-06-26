@@ -698,24 +698,170 @@ uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
     last_activity = current_tick;
     return 0;
 }
+
+uint32_t c4pro_nand_read_linear_sector(uint32_t bank, uint32_t page,
+                                       uint32_t sector, void* databuffer)
+{
+    unsigned i;
+    unsigned char *data = databuffer;
+    uint32_t column;
+
+    if (bank > 3 || sector >= 8 || !data)
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    column = sector * 512;
+
+    FLASH_CMD(bank) = 0x00;
+    FLASH_ADDR(bank) = column & 0xff;
+    FLASH_ADDR(bank) = (column >> 8) & 0xff;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+    FLASH_CMD(bank) = 0x30;
+
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    for (i = 0; i < 512; i++)
+        data[i] = FLASH_DATA(bank);
+
+    nand_deselect();
+    last_activity = current_tick;
+    return 0;
+}
+
+uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
+                               const void* databuffer,
+                               const void* sparebuffer)
+{
+    unsigned i;
+    const unsigned char *data = databuffer;
+    const unsigned char *spare = sparebuffer;
+
+    if (bank > 3 || !data || !spare)
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x80;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+
+    for (i = 0; i < 4096; i++)
+        FLASH_DATA(bank) = data[i];
+
+    for (i = 0; i < 128; i++)
+        FLASH_DATA(bank) = spare[i];
+
+    FLASH_CMD(bank) = 0x10;
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x70;
+    i = FLASH_DATA(bank);
+    nand_deselect();
+    last_activity = current_tick;
+
+    return (i & 1) ? 1 : 0;
+}
+
+uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page)
+{
+    unsigned status;
+
+    if (bank > 3)
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x60;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+    FLASH_CMD(bank) = 0xd0;
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x70;
+    status = FLASH_DATA(bank);
+    nand_deselect();
+    last_activity = current_tick;
+
+    return (status & 1) ? 1 : 0;
+}
 #endif
 
 uint32_t nand_write_page(uint32_t bank, uint32_t page, void* databuffer,
                          void* sparebuffer, uint32_t doecc)
 {
+    (void)doecc;
+#ifdef COLORFLY_C4_PRO
+    return c4pro_nand_write_page(bank, page, databuffer, sparebuffer);
+#else
     (void)bank;
     (void)page;
     (void)databuffer;
     (void)sparebuffer;
-    (void)doecc;
     return 1;
+#endif
 }
 
 uint32_t nand_block_erase(uint32_t bank, uint32_t page)
 {
+#ifdef COLORFLY_C4_PRO
+    return c4pro_nand_erase_block(bank, page);
+#else
     (void)bank;
     (void)page;
     return 1;
+#endif
 }
 
 uint32_t nand_reset(uint32_t bank)

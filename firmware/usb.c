@@ -272,6 +272,11 @@ static inline void usb_slave_mode(bool on)
     {
         /* Entered exclusive mode */
         rc = disk_mount_all();
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_DIAG_EXPORT)
+        if(rc == 0)
+            return;
+#endif
         if(rc <= 0) /* no partition */
             panicf("mount: %d",rc);
     }
@@ -807,6 +812,19 @@ bool usb_exclusive_storage(void)
     /* Storage isn't actually exclusive until slave mode has been entered */
     return exclusive_storage_enabled;
 }
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_DIAG_EXPORT)
+void c4pro_usb_diag_enter_storage_mode(void)
+{
+    if(!exclusive_storage_enabled)
+    {
+        exclusive_storage_requested = true;
+        usb_slave_mode(true);
+        exclusive_storage_enabled = true;
+    }
+}
+#endif
 
 /* exclusive storage mode transision
  * HAVE_USBSTACK:

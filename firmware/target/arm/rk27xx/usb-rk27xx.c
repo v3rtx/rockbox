@@ -32,6 +32,12 @@ int usb_status = USB_EXTRACTED;
 
 void usb_init_device(void)
 {
+    SCU_CLKCFG &= ~CLKCFG_UDC;
+    SCU_RSTCFG |= RSTCFG_UDC;
+    udelay(10000);
+    SCU_RSTCFG &= ~RSTCFG_UDC;
+    udelay(10000);
+
     /* enable UDC interrupt */
     INTC_IMR |= (1<<16);
     INTC_IECR |= (1<<16);

@@ -162,8 +162,10 @@ static int c4pro_ftl_ram_write_slot(uint32_t sector)
 }
 #endif
 
+#ifndef C4PRO_FTL_ROCKBOX_OWNED_RW
 static unsigned char page_data[4096];
 static unsigned char page_spare[128];
+#endif
 int c4pro_ftl_diag_hash_mapped;
 int c4pro_ftl_diag_hash_dupes;
 int c4pro_ftl_diag_hash_raw;
@@ -988,6 +990,641 @@ static void c4pro_ftl_build_hash_map(void)
 #endif
 #endif
 
+#if defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_ROCKBOX_OWNED_RW)
+
+#define C4OWN_MAGIC_SB 0x31465443u /* CTF1 */
+#define C4OWN_MAGIC_HDR 0x31484b52u /* RKH1 */
+#define C4OWN_MAGIC_COMMIT 0x31434b52u /* RKC1 */
+#define C4OWN_VERSION 3u
+#define C4OWN_SECTORS_PER_PAGE 8u
+#define C4OWN_PAGES_PER_BLOCK 128u
+#define C4OWN_SECTORS_PER_BLOCK 1024u
+#define C4OWN_PAYLOAD_SECTORS_PER_BLOCK \
+    ((C4OWN_PAGES_PER_BLOCK - 2u) * C4OWN_SECTORS_PER_PAGE)
+#define C4OWN_VOLUME_SECTORS 131072u
+#define C4OWN_LOGICAL_BLOCKS \
+    ((C4OWN_VOLUME_SECTORS + C4OWN_PAYLOAD_SECTORS_PER_BLOCK - 1u) / \
+     C4OWN_PAYLOAD_SECTORS_PER_BLOCK)
+#define C4OWN_FIRST_DATA_PBLK 2u
+
+#ifndef C4PRO_OWNED_PBLK_START
+#define C4PRO_OWNED_PBLK_START 288u
+#endif
+
+#ifndef C4PRO_OWNED_PBLK_COUNT
+#define C4PRO_OWNED_PBLK_COUNT 160u
+#endif
+
+#if C4OWN_LOGICAL_BLOCKS + C4OWN_FIRST_DATA_PBLK + 2u > C4PRO_OWNED_PBLK_COUNT
+#error "C4PRO_OWNED_PBLK_COUNT is too small for the 64 MiB owned FTL"
+#endif
+
+static uint16_t c4own_map[C4OWN_LOGICAL_BLOCKS];
+static uint32_t c4own_gen[C4OWN_LOGICAL_BLOCKS];
+static unsigned char c4own_used[C4PRO_OWNED_PBLK_COUNT];
+static unsigned char c4own_retired[C4PRO_OWNED_PBLK_COUNT];
+static unsigned char c4own_page_data[4096];
+static unsigned char c4own_page_spare[128];
+#ifndef C4OWN_CACHE_SLOTS
+#define C4OWN_CACHE_SLOTS 4u
+#endif
+
+static unsigned char c4own_cache_data[C4OWN_CACHE_SLOTS][C4OWN_PAYLOAD_SECTORS_PER_BLOCK * 512u];
+static uint32_t c4own_cache_logical[C4OWN_CACHE_SLOTS];
+static uint32_t c4own_cache_age[C4OWN_CACHE_SLOTS];
+static uint32_t c4own_cache_tick;
+static bool c4own_cache_valid[C4OWN_CACHE_SLOTS];
+static bool c4own_cache_dirty[C4OWN_CACHE_SLOTS];
+static bool c4own_ready;
+static bool c4own_formatting;
+int c4own_diag_format_count;
+int c4own_diag_write_count;
+int c4own_diag_read_count;
+int c4own_diag_last_write_sector = -1;
+int c4own_diag_last_write_count;
+int c4own_diag_last_read_sector = -1;
+int c4own_diag_map0 = -1;
+int c4own_diag_map2 = -1;
+int c4own_diag_lba0_sig = -1;
+int c4own_diag_lba2048_sig = -1;
+int c4own_diag_last_write_result;
+int c4own_diag_last_writeback_sig = -1;
+int c4own_diag_cache_flush_count;
+int c4own_diag_cache_logical = -1;
+
+static uint32_t c4own_get32(const unsigned char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void c4own_put16(unsigned char *p, uint32_t v)
+{
+    p[0] = v & 0xff;
+    p[1] = (v >> 8) & 0xff;
+}
+
+static void c4own_put32(unsigned char *p, uint32_t v)
+{
+    p[0] = v & 0xff;
+    p[1] = (v >> 8) & 0xff;
+    p[2] = (v >> 16) & 0xff;
+    p[3] = (v >> 24) & 0xff;
+}
+
+static uint32_t c4own_crc32(const void *buf, uint32_t len)
+{
+    const unsigned char *p = buf;
+    uint32_t crc = 0xffffffffu;
+
+    while (len--)
+    {
+        crc ^= *p++;
+        for (int i = 0; i < 8; i++)
+            crc = (crc >> 1) ^ (0xedb88320u & -(crc & 1u));
+    }
+
+    return crc ^ 0xffffffffu;
+}
+
+static uint32_t c4own_pblk_page(uint32_t pblk)
+{
+    return (C4PRO_OWNED_PBLK_START + pblk) * C4OWN_PAGES_PER_BLOCK;
+}
+
+static bool c4own_pblk_valid(uint32_t pblk)
+{
+    return pblk < C4PRO_OWNED_PBLK_COUNT;
+}
+
+static int c4own_read_phys_sector(uint32_t pblk, uint32_t sector, void *buf)
+{
+    if (!c4own_pblk_valid(pblk) || sector >= C4OWN_SECTORS_PER_BLOCK)
+        return 1;
+
+    return c4pro_nand_read_linear_sector(
+        0,
+        c4own_pblk_page(pblk) + sector / C4OWN_SECTORS_PER_PAGE,
+        sector & (C4OWN_SECTORS_PER_PAGE - 1u),
+        buf);
+}
+
+static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
+{
+    if (!c4own_pblk_valid(pblk) || page_in_block >= C4OWN_PAGES_PER_BLOCK)
+        return 1;
+
+    memset(c4own_page_spare, 0xff, sizeof(c4own_page_spare));
+    return c4pro_nand_write_page(0, c4own_pblk_page(pblk) + page_in_block,
+                                 c4own_page_data, c4own_page_spare);
+}
+
+static int c4own_erase_pblk(uint32_t pblk)
+{
+    if (!c4own_pblk_valid(pblk))
+        return 1;
+
+    return c4pro_nand_erase_block(0, c4own_pblk_page(pblk));
+}
+
+static void c4own_make_header(uint32_t logical, uint32_t gen)
+{
+    memset(c4own_page_data, 0xff, sizeof(c4own_page_data));
+    c4own_put32(c4own_page_data + 0, C4OWN_MAGIC_HDR);
+    c4own_put32(c4own_page_data + 4, C4OWN_VERSION);
+    c4own_put32(c4own_page_data + 8, logical);
+    c4own_put32(c4own_page_data + 12, gen);
+    c4own_put32(c4own_page_data + 16,
+                c4own_crc32(c4own_page_data, 16));
+}
+
+static bool c4own_parse_header(const unsigned char *sector, uint32_t *logical,
+                               uint32_t *gen)
+{
+    if (c4own_get32(sector) != C4OWN_MAGIC_HDR ||
+        c4own_get32(sector + 4) != C4OWN_VERSION ||
+        c4own_get32(sector + 16) != c4own_crc32(sector, 16))
+        return false;
+
+    *logical = c4own_get32(sector + 8);
+    *gen = c4own_get32(sector + 12);
+    return *logical < C4OWN_LOGICAL_BLOCKS;
+}
+
+static void c4own_make_commit(uint32_t logical, uint32_t gen)
+{
+    unsigned char *commit;
+
+    memset(c4own_page_data, 0xff, sizeof(c4own_page_data));
+    commit = c4own_page_data + 7u * 512u;
+    c4own_put32(commit + 0, C4OWN_MAGIC_COMMIT);
+    c4own_put32(commit + 4, C4OWN_VERSION);
+    c4own_put32(commit + 8, logical);
+    c4own_put32(commit + 12, gen);
+    c4own_put32(commit + 16, c4own_crc32(commit, 16));
+}
+
+static bool c4own_parse_commit(const unsigned char *sector, uint32_t logical,
+                               uint32_t gen)
+{
+    return c4own_get32(sector) == C4OWN_MAGIC_COMMIT &&
+           c4own_get32(sector + 4) == C4OWN_VERSION &&
+           c4own_get32(sector + 8) == logical &&
+           c4own_get32(sector + 12) == gen &&
+           c4own_get32(sector + 16) == c4own_crc32(sector, 16);
+}
+
+static void c4own_reset_maps(void)
+{
+    for (uint32_t i = 0; i < C4OWN_LOGICAL_BLOCKS; i++)
+    {
+        c4own_map[i] = 0xffffu;
+        c4own_gen[i] = 0;
+    }
+
+    memset(c4own_used, 0, sizeof(c4own_used));
+    memset(c4own_retired, 0, sizeof(c4own_retired));
+    c4own_used[0] = 1;
+    c4own_used[1] = 1;
+    for (uint32_t slot = 0; slot < C4OWN_CACHE_SLOTS; slot++)
+    {
+        c4own_cache_valid[slot] = false;
+        c4own_cache_dirty[slot] = false;
+        c4own_cache_logical[slot] = 0;
+        c4own_cache_age[slot] = 0;
+    }
+    c4own_cache_tick = 0;
+    c4own_diag_cache_logical = -1;
+}
+
+static bool c4own_superblock_valid(uint32_t pblk)
+{
+    unsigned char sector[512];
+
+    if (c4own_read_phys_sector(pblk, 0, sector))
+        return false;
+
+    return c4own_get32(sector) == C4OWN_MAGIC_SB &&
+           c4own_get32(sector + 4) == C4OWN_VERSION &&
+           c4own_get32(sector + 8) == C4OWN_VOLUME_SECTORS &&
+           c4own_get32(sector + 12) == C4PRO_OWNED_PBLK_START &&
+           c4own_get32(sector + 16) == C4PRO_OWNED_PBLK_COUNT &&
+           c4own_get32(sector + 20) == C4OWN_PAYLOAD_SECTORS_PER_BLOCK &&
+           c4own_get32(sector + 28) == c4own_crc32(sector, 28);
+}
+
+static int c4own_write_superblock(uint32_t pblk)
+{
+    if (c4own_erase_pblk(pblk))
+        return 1;
+
+    memset(c4own_page_data, 0xff, sizeof(c4own_page_data));
+    c4own_put32(c4own_page_data + 0, C4OWN_MAGIC_SB);
+    c4own_put32(c4own_page_data + 4, C4OWN_VERSION);
+    c4own_put32(c4own_page_data + 8, C4OWN_VOLUME_SECTORS);
+    c4own_put32(c4own_page_data + 12, C4PRO_OWNED_PBLK_START);
+    c4own_put32(c4own_page_data + 16, C4PRO_OWNED_PBLK_COUNT);
+    c4own_put32(c4own_page_data + 20, C4OWN_PAYLOAD_SECTORS_PER_BLOCK);
+    c4own_put32(c4own_page_data + 24, C4OWN_LOGICAL_BLOCKS);
+    c4own_put32(c4own_page_data + 28, c4own_crc32(c4own_page_data, 28));
+    return c4own_write_page(pblk, 0);
+}
+
+static int c4own_mount_scan(void)
+{
+    unsigned char header[512];
+    unsigned char commit[512];
+
+    c4own_reset_maps();
+
+    if (!c4own_superblock_valid(0) && !c4own_superblock_valid(1))
+        return 1;
+
+    for (uint32_t pblk = C4OWN_FIRST_DATA_PBLK;
+         pblk < C4PRO_OWNED_PBLK_COUNT; pblk++)
+    {
+        uint32_t logical;
+        uint32_t gen;
+
+        if (c4own_read_phys_sector(pblk, 0, header) ||
+            !c4own_parse_header(header, &logical, &gen))
+            continue;
+
+        if (c4own_read_phys_sector(pblk, C4OWN_SECTORS_PER_BLOCK - 1u,
+                                   commit) ||
+            !c4own_parse_commit(commit, logical, gen))
+            continue;
+
+        c4own_used[pblk] = 1;
+        if (gen >= c4own_gen[logical])
+        {
+            if (c4own_map[logical] != 0xffffu)
+                c4own_used[c4own_map[logical]] = 0;
+            c4own_map[logical] = pblk;
+            c4own_gen[logical] = gen;
+        }
+        else
+            c4own_used[pblk] = 0;
+    }
+
+    return 0;
+}
+
+static int c4own_alloc_pblk(void)
+{
+    for (uint32_t pblk = C4OWN_FIRST_DATA_PBLK;
+         pblk < C4PRO_OWNED_PBLK_COUNT; pblk++)
+    {
+        if (!c4own_used[pblk] && !c4own_retired[pblk])
+        {
+            c4own_used[pblk] = 1;
+            if (c4own_erase_pblk(pblk))
+            {
+                c4own_retired[pblk] = 1;
+                continue;
+            }
+            return pblk;
+        }
+    }
+
+    return -1;
+}
+
+static void c4own_blank_sector(unsigned char *sector)
+{
+    memset(sector, 0, 512);
+}
+
+static int c4own_write_logical_block(uint32_t logical, uint32_t first,
+                                     uint32_t count,
+                                     const unsigned char *data);
+
+static int c4own_flush_cache_slot(uint32_t slot)
+{
+    if (slot >= C4OWN_CACHE_SLOTS ||
+        !c4own_cache_valid[slot] || !c4own_cache_dirty[slot])
+        return 0;
+
+    c4own_diag_cache_flush_count++;
+    if (c4own_write_logical_block(c4own_cache_logical[slot], 0,
+                                  C4OWN_PAYLOAD_SECTORS_PER_BLOCK,
+                                  c4own_cache_data[slot]))
+    {
+        c4own_diag_last_write_result = 3;
+        return 1;
+    }
+
+    c4own_cache_dirty[slot] = false;
+    c4own_diag_map0 = c4own_map[0] == 0xffffu ? -1 : (int)c4own_map[0];
+    c4own_diag_map2 = c4own_map[2] == 0xffffu ? -1 : (int)c4own_map[2];
+    return 0;
+}
+
+static int c4own_flush_cache(void)
+{
+    for (uint32_t slot = 0; slot < C4OWN_CACHE_SLOTS; slot++)
+    {
+        if (c4own_flush_cache_slot(slot))
+            return 1;
+    }
+
+    return 0;
+}
+
+static int c4own_find_cache_slot(uint32_t logical)
+{
+    for (uint32_t slot = 0; slot < C4OWN_CACHE_SLOTS; slot++)
+    {
+        if (c4own_cache_valid[slot] && c4own_cache_logical[slot] == logical)
+        {
+            c4own_cache_age[slot] = ++c4own_cache_tick;
+            return (int)slot;
+        }
+    }
+
+    return -1;
+}
+
+static int c4own_load_cache(uint32_t logical)
+{
+    uint16_t old_pblk;
+    uint32_t victim = 0;
+
+    if (logical >= C4OWN_LOGICAL_BLOCKS)
+        return -1;
+
+    for (uint32_t slot = 0; slot < C4OWN_CACHE_SLOTS; slot++)
+    {
+        if (!c4own_cache_valid[slot])
+        {
+            victim = slot;
+            goto load;
+        }
+
+        if (c4own_cache_age[slot] < c4own_cache_age[victim])
+            victim = slot;
+    }
+
+    if (c4own_flush_cache_slot(victim))
+        return -1;
+
+load:
+    old_pblk = c4own_map[logical];
+    for (uint32_t payload = 0; payload < C4OWN_PAYLOAD_SECTORS_PER_BLOCK;
+         payload++)
+    {
+        unsigned char *dst = c4own_cache_data[victim] + payload * 512u;
+
+        if (old_pblk != 0xffffu)
+        {
+            if (c4own_read_phys_sector(old_pblk,
+                                       C4OWN_SECTORS_PER_PAGE + payload,
+                                       dst))
+                c4own_blank_sector(dst);
+        }
+        else
+            c4own_blank_sector(dst);
+    }
+
+    c4own_cache_logical[victim] = logical;
+    c4own_cache_age[victim] = ++c4own_cache_tick;
+    c4own_cache_valid[victim] = true;
+    c4own_cache_dirty[victim] = false;
+    c4own_diag_cache_logical = (int)logical;
+    return (int)victim;
+}
+
+static int c4own_read_sector_internal(uint32_t sector, void *buffer)
+{
+    uint32_t logical = sector / C4OWN_PAYLOAD_SECTORS_PER_BLOCK;
+    uint32_t offset = sector % C4OWN_PAYLOAD_SECTORS_PER_BLOCK;
+
+    if (sector >= C4OWN_VOLUME_SECTORS)
+        return 1;
+
+    int slot = c4own_find_cache_slot(logical);
+
+    if (slot >= 0 && c4own_cache_dirty[slot])
+    {
+        memcpy(buffer, c4own_cache_data[slot] + offset * 512u, 512);
+        return 0;
+    }
+
+    if (c4own_map[logical] == 0xffffu)
+    {
+        c4own_blank_sector(buffer);
+        return 0;
+    }
+
+    return c4own_read_phys_sector(c4own_map[logical],
+                                  C4OWN_SECTORS_PER_PAGE + offset,
+                                  buffer);
+}
+
+static int c4own_write_logical_block(uint32_t logical, uint32_t first,
+                                     uint32_t count,
+                                     const unsigned char *data)
+{
+    int new_pblk = c4own_alloc_pblk();
+    uint16_t old_pblk;
+    uint32_t gen;
+
+    if (new_pblk < 0)
+        return 1;
+
+    old_pblk = c4own_map[logical];
+    gen = c4own_gen[logical] + 1u;
+
+    c4own_make_header(logical, gen);
+    if (c4own_write_page(new_pblk, 0))
+        goto fail;
+
+    for (uint32_t page = 1; page < C4OWN_PAGES_PER_BLOCK - 1u; page++)
+    {
+        for (uint32_t sec = 0; sec < C4OWN_SECTORS_PER_PAGE; sec++)
+        {
+            uint32_t payload = (page - 1u) * C4OWN_SECTORS_PER_PAGE + sec;
+            unsigned char *dst = c4own_page_data + sec * 512u;
+
+            if (payload >= C4OWN_PAYLOAD_SECTORS_PER_BLOCK)
+                memset(dst, 0xff, 512);
+            else if (payload >= first && payload < first + count)
+                memcpy(dst, data + (payload - first) * 512u, 512);
+            else if (old_pblk != 0xffffu)
+            {
+                if (c4own_read_phys_sector(old_pblk,
+                                           C4OWN_SECTORS_PER_PAGE + payload,
+                                           dst))
+                    c4own_blank_sector(dst);
+            }
+            else
+                c4own_blank_sector(dst);
+        }
+
+        if (c4own_write_page(new_pblk, page))
+            goto fail;
+    }
+
+    c4own_make_commit(logical, gen);
+    if (c4own_write_page(new_pblk, C4OWN_PAGES_PER_BLOCK - 1u))
+        goto fail;
+
+    c4own_map[logical] = new_pblk;
+    c4own_gen[logical] = gen;
+    if (old_pblk != 0xffffu)
+        c4own_used[old_pblk] = 0;
+
+    return 0;
+
+fail:
+    c4own_retired[new_pblk] = 1;
+    return 1;
+}
+
+static int c4own_write_internal(uint32_t sector, uint32_t count,
+                                const void *buffer)
+{
+    const unsigned char *in = buffer;
+    uint32_t first_sector = sector;
+    uint32_t first_count = count;
+    unsigned char verify[512];
+
+    c4own_diag_write_count++;
+    c4own_diag_last_write_sector = (int)sector;
+    c4own_diag_last_write_count = (int)count;
+    c4own_diag_last_write_result = -1;
+    c4own_diag_last_writeback_sig = -1;
+
+    if (sector > C4OWN_VOLUME_SECTORS ||
+        count > C4OWN_VOLUME_SECTORS - sector)
+    {
+        c4own_diag_last_write_result = 1;
+        return 1;
+    }
+
+    while (count > 0)
+    {
+        uint32_t logical = sector / C4OWN_PAYLOAD_SECTORS_PER_BLOCK;
+        uint32_t offset = sector % C4OWN_PAYLOAD_SECTORS_PER_BLOCK;
+        uint32_t n = C4OWN_PAYLOAD_SECTORS_PER_BLOCK - offset;
+
+        if (n > count)
+            n = count;
+
+        int slot = c4own_find_cache_slot(logical);
+
+        if (slot < 0)
+        {
+            slot = c4own_load_cache(logical);
+            if (slot < 0)
+            {
+                c4own_diag_last_write_result = 2;
+                return 1;
+            }
+        }
+
+        memcpy(c4own_cache_data[slot] + offset * 512u, in, n * 512u);
+        c4own_cache_dirty[slot] = true;
+        sector += n;
+        count -= n;
+        in += n * 512u;
+    }
+
+    if (first_count > 0 &&
+        c4own_read_sector_internal(first_sector, verify) == 0)
+        c4own_diag_last_writeback_sig = (int)c4own_get32(verify);
+
+    c4own_diag_last_write_result = 0;
+    return 0;
+}
+
+static void c4own_make_mbr(unsigned char *s)
+{
+    c4own_blank_sector(s);
+    s[446] = 0x80;
+    s[450] = 0x06;
+    c4own_put32(s + 454, 2048u);
+    c4own_put32(s + 458, C4OWN_VOLUME_SECTORS - 2048u);
+    s[510] = 0x55;
+    s[511] = 0xaa;
+}
+
+static void c4own_make_boot(unsigned char *s)
+{
+    static const unsigned char jmp[3] = { 0xeb, 0x3c, 0x90 };
+
+    c4own_blank_sector(s);
+    memcpy(s, jmp, sizeof(jmp));
+    memcpy(s + 3, "MSDOS5.0", 8);
+    c4own_put16(s + 11, 512);
+    s[13] = 4;
+    c4own_put16(s + 14, 1);
+    s[16] = 2;
+    c4own_put16(s + 17, 512);
+    c4own_put16(s + 19, 0);
+    s[21] = 0xf8;
+    c4own_put16(s + 22, 128);
+    c4own_put16(s + 24, 63);
+    c4own_put16(s + 26, 255);
+    c4own_put32(s + 28, 2048u);
+    c4own_put32(s + 32, C4OWN_VOLUME_SECTORS - 2048u);
+    s[36] = 0x80;
+    s[38] = 0x29;
+    c4own_put32(s + 39, 0xc4000001u);
+    memcpy(s + 43, "C4 ROCKBOX ", 11);
+    memcpy(s + 54, "FAT16   ", 8);
+    s[510] = 0x55;
+    s[511] = 0xaa;
+}
+
+static void c4own_make_fat0(unsigned char *s)
+{
+    c4own_blank_sector(s);
+    s[0] = 0xf8;
+    s[1] = 0xff;
+    s[2] = 0xff;
+    s[3] = 0xff;
+}
+
+static int c4own_format(void)
+{
+    unsigned char sector[512];
+
+    c4own_diag_format_count++;
+    c4own_formatting = true;
+    c4own_reset_maps();
+
+    for (uint32_t pblk = 0; pblk < C4PRO_OWNED_PBLK_COUNT; pblk++)
+    {
+        if (c4own_erase_pblk(pblk))
+            c4own_retired[pblk] = 1;
+    }
+
+    if (c4own_write_superblock(0) || c4own_write_superblock(1))
+        return 1;
+
+    c4own_make_mbr(sector);
+    if (c4own_write_internal(0, 1, sector))
+        return 1;
+
+    c4own_make_boot(sector);
+    if (c4own_write_internal(2048u, 1, sector))
+        return 1;
+
+    c4own_make_fat0(sector);
+    if (c4own_write_internal(2049u, 1, sector) ||
+        c4own_write_internal(2177u, 1, sector))
+        return 1;
+
+    if (c4own_flush_cache())
+        return 1;
+
+    c4own_formatting = false;
+    return 0;
+}
+
+#endif
+
 uint32_t ftl_init(void)
 {
     if (nand_device_init())
@@ -999,8 +1636,27 @@ uint32_t ftl_init(void)
 
     ftl_banks = 1;
 #ifdef COLORFLY_C4_PRO
+#ifdef C4PRO_FTL_ROCKBOX_OWNED_RW
+    if (c4own_mount_scan())
+    {
+        if (c4own_format() || c4own_mount_scan())
+            return 1;
+    }
+    c4own_ready = true;
+    {
+        unsigned char diag_sector[512];
+
+        c4own_diag_map0 = c4own_map[0] == 0xffffu ? -1 : (int)c4own_map[0];
+        c4own_diag_map2 = c4own_map[2] == 0xffffu ? -1 : (int)c4own_map[2];
+        if (c4own_read_sector_internal(0, diag_sector) == 0)
+            c4own_diag_lba0_sig = (int)c4own_get32(diag_sector);
+        if (c4own_read_sector_internal(2048u, diag_sector) == 0)
+            c4own_diag_lba2048_sig = (int)c4own_get32(diag_sector);
+    }
+#else
 #ifdef C4PRO_FTL_HASH_ORACLE
     c4pro_ftl_build_hash_map();
+#endif
 #endif
 #endif
     return 0;
@@ -1008,12 +1664,43 @@ uint32_t ftl_init(void)
 
 uint32_t ftl_total_sectors(void)
 {
+#if defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_ROCKBOX_OWNED_RW)
+    return C4OWN_VOLUME_SECTORS;
+#else
     return C4PRO_STORAGE_SECTORS;
+#endif
 }
 
 uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
 {
-#ifdef COLORFLY_C4_PRO
+#if defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_ROCKBOX_OWNED_RW)
+    unsigned char *out = buffer;
+    uint32_t first_sector = sector;
+
+    if (!c4own_ready ||
+        sector > C4OWN_VOLUME_SECTORS ||
+        count > C4OWN_VOLUME_SECTORS - sector)
+        return 1;
+
+    c4own_diag_read_count++;
+    c4own_diag_last_read_sector = (int)sector;
+    c4own_diag_map0 = c4own_map[0] == 0xffffu ? -1 : (int)c4own_map[0];
+    c4own_diag_map2 = c4own_map[2] == 0xffffu ? -1 : (int)c4own_map[2];
+
+    while (count--)
+    {
+        if (c4own_read_sector_internal(sector++, out))
+            return 1;
+        if (first_sector == 0)
+            c4own_diag_lba0_sig = (int)c4own_get32(out);
+        if (first_sector == 2048u)
+            c4own_diag_lba2048_sig = (int)c4own_get32(out);
+        out += 512;
+        first_sector++;
+    }
+
+    return 0;
+#elif defined(COLORFLY_C4_PRO)
     unsigned char *out = buffer;
 
     if (sector > C4PRO_SYSTEM_SECTORS ||
@@ -1127,7 +1814,13 @@ uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
 
 uint32_t ftl_write(uint32_t sector, uint32_t count, const void* buffer)
 {
-#if defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_RAM_WRITE_TEST)
+#if defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_ROCKBOX_OWNED_RW)
+    if (!c4own_ready && !c4own_formatting)
+        return (uint32_t)-1;
+
+    return c4own_write_internal(sector, count, buffer) ?
+           (uint32_t)-1 : 0;
+#elif defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_RAM_WRITE_TEST)
     const unsigned char *in = buffer;
 
     if (sector > C4PRO_SYSTEM_SECTORS ||
@@ -1157,5 +1850,9 @@ uint32_t ftl_write(uint32_t sector, uint32_t count, const void* buffer)
 
 uint32_t ftl_sync(void)
 {
+#if defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_ROCKBOX_OWNED_RW)
+    return c4own_flush_cache() ? (uint32_t)-1 : 0;
+#else
     return 0;
+#endif
 }

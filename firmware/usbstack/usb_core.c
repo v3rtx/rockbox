@@ -227,15 +227,34 @@ enum {
 };
 static volatile int ep0_state;
 
+#ifdef C4PRO_USB_DIAG_EXPORT
+volatile int c4pro_usb_diag_ep0_state;
+volatile unsigned c4pro_usb_diag_xfer_count;
+volatile unsigned c4pro_usb_diag_response_count;
+volatile unsigned c4pro_usb_diag_last_xfer;
+volatile unsigned c4pro_usb_diag_last_response;
+volatile unsigned c4pro_usb_diag_core_state;
+volatile unsigned c4pro_usb_diag_core_config;
+volatile unsigned c4pro_usb_diag_core_storage;
+volatile unsigned c4pro_usb_diag_core_interfaces;
+#endif
+
 #define TRACE_EP0_STATE 0
 #if TRACE_EP0_STATE == 1
 #define set_ep0_state(new) \
     { \
         logf("usb_core:%d ep0_state %d -> %d", __LINE__, ep0_state, new); \
         ep0_state = new; \
+        IF_C4PRO_USB_DIAG_STATE(new); \
     }
 #else
-#define set_ep0_state(new) {ep0_state = new;}
+#define set_ep0_state(new) {ep0_state = new; IF_C4PRO_USB_DIAG_STATE(new);}
+#endif
+
+#ifdef C4PRO_USB_DIAG_EXPORT
+#define IF_C4PRO_USB_DIAG_STATE(new) do { c4pro_usb_diag_ep0_state = (new); } while (0)
+#else
+#define IF_C4PRO_USB_DIAG_STATE(new) do { } while (0)
 #endif
 
 struct usb_transfer_completion_event_data
@@ -295,6 +314,7 @@ static struct usb_class_driver* drivers[USB_NUM_DRIVERS] =
 
 static int usb_core_do_set_config(uint8_t new_config);
 static void usb_core_control_request_handler(struct usb_ctrlrequest* req, uint8_t* reqdata, size_t reqdata_size);
+static void allocate_interfaces_and_endpoints(void);
 
 #define is_active(driver) ((driver)->enabled && !(driver)->error && (driver)->config == usb_config)
 #define has_if(driver, interface) ((interface) >= (driver)->first_interface && (interface) < (driver)->last_interface)
@@ -517,6 +537,48 @@ void usb_core_enable_driver(int driver, bool enabled)
     drivers[driver]->enabled = enabled;
 }
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_DIAG_EXPORT)
+void c4pro_usb_diag_force_storage_config(void)
+{
+    if(!initialized)
+        usb_core_init();
+
+#ifdef USB_ENABLE_STORAGE
+    drivers[USB_DRIVER_MASS_STORAGE]->enabled = true;
+    drivers[USB_DRIVER_MASS_STORAGE]->error = false;
+#endif
+#ifdef USB_ENABLE_HID
+    drivers[USB_DRIVER_HID]->enabled = false;
+    drivers[USB_DRIVER_HID]->error = false;
+#endif
+#ifdef USB_ENABLE_AUDIO
+    drivers[USB_DRIVER_AUDIO]->enabled = false;
+    drivers[USB_DRIVER_AUDIO]->error = false;
+#endif
+#ifdef USB_ENABLE_IAP
+    drivers[USB_DRIVER_IAP]->enabled = false;
+    drivers[USB_DRIVER_IAP]->error = false;
+#endif
+#ifdef USB_ENABLE_CHARGING_ONLY
+    drivers[USB_DRIVER_CHARGING_ONLY]->enabled = false;
+    drivers[USB_DRIVER_CHARGING_ONLY]->error = false;
+#endif
+
+    if(config_states[0].num_interfaces == 0)
+        allocate_interfaces_and_endpoints();
+
+    usb_core_do_set_config(1);
+    c4pro_usb_diag_core_state = usb_state;
+    c4pro_usb_diag_core_config = usb_config;
+    c4pro_usb_diag_core_interfaces = config_states[0].num_interfaces;
+#ifdef USB_ENABLE_STORAGE
+    c4pro_usb_diag_core_storage =
+        drivers[USB_DRIVER_MASS_STORAGE]->enabled ? 1u : 0u;
+#endif
+}
+#endif
+
 bool usb_core_driver_enabled(int driver)
 {
     return drivers[driver]->enabled;
@@ -664,6 +726,27 @@ static bool usb_drv_ep_allocate(struct usb_drv_ep_alloc_ctx* ctx, int ep, int ty
 
 static void allocate_interfaces_and_endpoints(void)
 {
+#if defined(C4PRO_USB_DIAG_EXPORT) && defined(USB_ENABLE_STORAGE)
+    drivers[USB_DRIVER_MASS_STORAGE]->enabled = true;
+    drivers[USB_DRIVER_MASS_STORAGE]->error = false;
+#ifdef USB_ENABLE_HID
+    drivers[USB_DRIVER_HID]->enabled = false;
+    drivers[USB_DRIVER_HID]->error = false;
+#endif
+#ifdef USB_ENABLE_AUDIO
+    drivers[USB_DRIVER_AUDIO]->enabled = false;
+    drivers[USB_DRIVER_AUDIO]->error = false;
+#endif
+#ifdef USB_ENABLE_IAP
+    drivers[USB_DRIVER_IAP]->enabled = false;
+    drivers[USB_DRIVER_IAP]->error = false;
+#endif
+#ifdef USB_ENABLE_CHARGING_ONLY
+    drivers[USB_DRIVER_CHARGING_ONLY]->enabled = false;
+    drivers[USB_DRIVER_CHARGING_ONLY]->error = false;
+#endif
+#endif
+
     if(usb_config != 0) {
         /* deinit currently used endpoints */
         init_deinit_endpoints(usb_config, false);
@@ -722,6 +805,16 @@ retry:
         cstate->num_interfaces = driver->set_first_interface(cstate->num_interfaces);
         driver->last_interface = cstate->num_interfaces;
     }
+
+#ifdef C4PRO_USB_DIAG_EXPORT
+    c4pro_usb_diag_core_interfaces = config_states[0].num_interfaces;
+#ifdef USB_ENABLE_STORAGE
+    c4pro_usb_diag_core_storage =
+        drivers[USB_DRIVER_MASS_STORAGE]->enabled ? 1u : 0u;
+#else
+    c4pro_usb_diag_core_storage = 0u;
+#endif
+#endif
 }
 
 static void control_request_handler_drivers(struct usb_ctrlrequest* req, uint8_t* reqdata, size_t reqdata_size)
@@ -793,6 +886,9 @@ static void request_handler_device_get_descriptor(struct usb_ctrlrequest* req, u
                 break;
             }
             int i, max_packet_size;
+
+            if(config_states[index].num_interfaces == 0)
+                allocate_interfaces_and_endpoints();
 
             if(type == USB_DT_CONFIG) {
                 max_packet_size = (usb_drv_port_speed() ? 512 : 64);
@@ -1149,6 +1245,14 @@ static void usb_core_control_request_handler(struct usb_ctrlrequest* req, uint8_
 
         allocate_interfaces_and_endpoints();
     }
+#ifdef C4PRO_USB_DIAG_EXPORT
+    c4pro_usb_diag_core_state = usb_state;
+    c4pro_usb_diag_core_config = usb_config;
+#ifdef USB_ENABLE_STORAGE
+    c4pro_usb_diag_core_storage =
+        drivers[USB_DRIVER_MASS_STORAGE]->enabled ? 1u : 0u;
+#endif
+#endif
 
     switch(req->bRequestType & USB_RECIP_MASK) {
         case USB_RECIP_DEVICE:
@@ -1236,6 +1340,13 @@ static bool check_for_new_setup(void) {
 
 /* called by usb_drv_transfer_completed() */
 void usb_core_transfer_complete(int endpoint, int dir, int status, int length) {
+#ifdef C4PRO_USB_DIAG_EXPORT
+    c4pro_usb_diag_xfer_count++;
+    c4pro_usb_diag_last_xfer = ((unsigned)endpoint << 24) |
+                               ((unsigned)dir << 16) |
+                               ((unsigned)(status & 0xff) << 8) |
+                               (unsigned)(length & 0xff);
+#endif
 #ifdef USB_BATCH_NON_NATIVE
     /* batch api */
     if(batch_ep != 0 && (endpoint | dir) == batch_ep) {
@@ -1284,6 +1395,16 @@ void usb_core_transfer_complete(int endpoint, int dir, int status, int length) {
         logf("usb_core: control-out done success=%d", status == 0 && length == 0);
         set_ep0_state(EP0_READY);
         break;
+#ifdef C4PRO_USB_DIAG_EXPORT
+    case USB_DIR_IN | EP0_READY:
+        /* RK27xx can report an EP0 IN completion left over from reset or
+         * stale zero setup handling. No control transfer is active yet. */
+        break;
+    case USB_DIR_IN | EP0_HANDLING_RX_CONTROL:
+        /* RK27xx can report a premature EP0 IN completion before the
+         * control-out handler has queued its zero-length status packet. */
+        break;
+#endif
     default:
         panicf("unhandled endpoint xfer completion ep0_state=%d dir=%d", ep0_state, dir);
         break;
@@ -1347,6 +1468,12 @@ void usb_core_setup_received(struct usb_ctrlrequest* req) {
 
 void usb_core_control_response(enum usb_control_response response, const void* data, size_t size) {
     logf("usb_core: response ack=%d size=%u ep0_state=%d tick=%lu", response, size, ep0_state, current_tick);
+#ifdef C4PRO_USB_DIAG_EXPORT
+    c4pro_usb_diag_response_count++;
+    c4pro_usb_diag_last_response = ((unsigned)response << 24) |
+                                   ((unsigned)(size & 0xffff) << 8) |
+                                   (unsigned)(ep0_state & 0xff);
+#endif
 
     if((ep0_state == EP0_HANDLING_TX_CONTROL || ep0_state == EP0_HANDLING_RX_CONTROL) && check_for_new_setup()) {
         return;

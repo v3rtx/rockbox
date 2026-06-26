@@ -112,6 +112,16 @@ extern volatile int c4pro_mix_diag_status;
 
 static void c4pro_playback_diag(const char *where, int a, int b)
 {
+#ifdef C4PRO_PLAYBACK_DIAG_CORE_ONLY
+    if (strcmp(where, "init ok") &&
+        strcmp(where, "audio hid ok") &&
+        strcmp(where, "audio hid fail") &&
+        strcmp(where, "finish status") &&
+        strcmp(where, "codec start") &&
+        strcmp(where, "codec complete") &&
+        strcmp(where, "codec pos"))
+        return;
+#endif
 #ifdef C4PRO_PLAYBACK_DIAG_FINAL_ONLY
     if (strcmp(where, "codec complete") && strcmp(where, "codec pos"))
         return;
@@ -152,8 +162,57 @@ static void c4pro_playback_diag_path(const char *where, const char *path,
     sleep(C4PRO_PLAYBACK_DIAG_HOLD);
 }
 
+static void c4pro_playback_diag_file_probe(const char *path, int fd)
+{
+#ifdef C4PRO_PLAYBACK_DIAG_FINAL_ONLY
+    (void)path;
+    (void)fd;
+    return;
+#endif
+
+    unsigned char head[12];
+    int sz = fd >= 0 ? (int)(filesize(fd) / 1024) : -1;
+    int rd = fd >= 0 ? read(fd, head, sizeof(head)) : -1;
+    unsigned h0 = 0;
+    unsigned h1 = 0;
+    unsigned h2 = 0;
+
+    if (rd >= 4)
+        h0 = (unsigned)head[0] | ((unsigned)head[1] << 8) |
+             ((unsigned)head[2] << 16) | ((unsigned)head[3] << 24);
+    if (rd >= 8)
+        h1 = (unsigned)head[4] | ((unsigned)head[5] << 8) |
+             ((unsigned)head[6] << 16) | ((unsigned)head[7] << 24);
+    if (rd >= 12)
+        h2 = (unsigned)head[8] | ((unsigned)head[9] << 8) |
+             ((unsigned)head[10] << 16) | ((unsigned)head[11] << 24);
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 FILE PROBE");
+    lcd_putsf(0, 1, "fd %d rd %d", fd, rd);
+    lcd_putsf(0, 2, "kb %d", sz);
+    lcd_putsf(0, 3, "%08x", h0);
+    lcd_putsf(0, 4, "%08x", h1);
+    lcd_putsf(0, 5, "%08x", h2);
+    lcd_puts(0, 6, path ? path : "<null>");
+    lcd_puts(0, 7, "5s");
+    lcd_update();
+    sleep(5 * HZ);
+
+    if (fd >= 0)
+        lseek(fd, 0, SEEK_SET);
+}
+
 static void c4pro_playback_diag_pcm_summary(void)
 {
+#ifdef C4PRO_PLAYBACK_DIAG_CORE_ONLY
+    /* Keep the final hardware state page; it is the important one. */
+#endif
+#ifdef C4PRO_PLAYBACK_DIAG_FINAL_ONLY
+    return;
+#endif
+
     lcd_setfont(FONT_SYSFIXED);
     lcd_clear_display();
     lcd_puts(0, 0, "C4 PCM DIAG");
@@ -178,6 +237,13 @@ static void c4pro_playback_diag_pcm_summary(void)
 
 static void c4pro_playback_diag_mix_summary(void)
 {
+#ifdef C4PRO_PLAYBACK_DIAG_CORE_ONLY
+    return;
+#endif
+#ifdef C4PRO_PLAYBACK_DIAG_FINAL_ONLY
+    return;
+#endif
+
     lcd_setfont(FONT_SYSFIXED);
     lcd_clear_display();
     lcd_puts(0, 0, "C4 MIX DIAG");
@@ -2325,7 +2391,13 @@ static int audio_load_track(void)
         {
             fd = open(path, O_RDONLY);
             if (fd >= 0)
+            {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_PLAYBACK_DIAG)
+                c4pro_playback_diag_file_probe(path, fd);
+#endif
                 break;
+            }
         }
         logf("Open failed %s", path);
 

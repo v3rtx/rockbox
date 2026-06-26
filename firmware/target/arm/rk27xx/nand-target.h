@@ -47,6 +47,12 @@ uint32_t c4pro_nand_read_id(uint32_t bank, unsigned char id[5]);
 uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
                                 uint32_t sector, void* databuffer,
                                 void* sparebuffer);
+uint32_t c4pro_nand_read_linear_sector(uint32_t bank, uint32_t page,
+                                       uint32_t sector, void* databuffer);
+uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
+                               const void* databuffer,
+                               const void* sparebuffer);
+uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page);
 #endif
 uint32_t nand_write_page(uint32_t bank, uint32_t page, void* databuffer,
                          void* sparebuffer, uint32_t doecc);

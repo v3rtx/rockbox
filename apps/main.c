@@ -38,6 +38,10 @@
 #include "panic.h"
 #include "menu.h"
 #include "usb.h"
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_DIAG_EXPORT)
+#include "usb_core.h"
+#endif
 #include "wifi.h"
 #include "powermgmt.h"
 #include "adc.h"
@@ -124,6 +128,106 @@
 #endif
 #if (CONFIG_STORAGE & STORAGE_MMC)
 #include "ata_mmc.h"
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_DIAG_EXPORT)
+extern volatile unsigned c4pro_usb_diag_irq_count;
+extern volatile unsigned c4pro_usb_diag_reset_count;
+extern volatile unsigned c4pro_usb_diag_conn_count;
+extern volatile unsigned c4pro_usb_diag_setup_count;
+extern volatile unsigned c4pro_usb_diag_in0_count;
+extern volatile unsigned c4pro_usb_diag_out0_count;
+extern volatile unsigned c4pro_usb_diag_last_intsrc;
+extern volatile unsigned c4pro_usb_diag_last_dev_info;
+extern volatile unsigned c4pro_usb_diag_last_setup0;
+extern volatile unsigned c4pro_usb_diag_last_setup1;
+extern volatile unsigned c4pro_usb_diag_last_tx0stat;
+extern volatile unsigned c4pro_usb_diag_last_rx0stat;
+extern volatile unsigned c4pro_usb_diag_last_tx0con;
+extern volatile unsigned c4pro_usb_diag_last_rx0con;
+extern volatile unsigned c4pro_usb_diag_outn_count;
+extern volatile unsigned c4pro_usb_diag_last_outn;
+extern volatile unsigned c4pro_usb_diag_last_outn_stat;
+extern volatile unsigned c4pro_usb_diag_last_outn_con;
+extern volatile unsigned c4pro_usb_diag_live_dev_ctl;
+extern volatile unsigned c4pro_usb_diag_live_dev_info;
+extern volatile unsigned c4pro_usb_diag_live_en_int;
+extern volatile unsigned c4pro_usb_diag_live_intcon;
+extern volatile unsigned c4pro_usb_diag_live_int2flag;
+extern volatile unsigned c4pro_usb_diag_live_tx0stat;
+extern volatile unsigned c4pro_usb_diag_live_rx0stat;
+extern volatile unsigned c4pro_usb_diag_live_tx0con;
+extern volatile unsigned c4pro_usb_diag_live_rx0con;
+extern volatile unsigned c4pro_usb_diag_live_scu_clkcfg;
+extern volatile unsigned c4pro_usb_diag_live_scu_rstcfg;
+extern volatile unsigned c4pro_usb_diag_live_scu_iomuxa;
+extern volatile unsigned c4pro_usb_diag_live_scu_iomuxb;
+extern volatile int c4pro_usb_diag_ep0_state;
+extern volatile unsigned c4pro_usb_diag_xfer_count;
+extern volatile unsigned c4pro_usb_diag_response_count;
+extern volatile unsigned c4pro_usb_diag_last_xfer;
+extern volatile unsigned c4pro_usb_diag_last_response;
+extern volatile unsigned c4pro_usb_diag_core_state;
+extern volatile unsigned c4pro_usb_diag_core_config;
+extern volatile unsigned c4pro_usb_diag_core_storage;
+extern volatile unsigned c4pro_usb_diag_core_interfaces;
+extern volatile unsigned c4pro_usb_storage_diag_xfer_count;
+extern volatile unsigned c4pro_usb_storage_diag_init_count;
+extern volatile unsigned c4pro_usb_storage_diag_arm_count;
+extern volatile unsigned c4pro_usb_storage_diag_last_xfer;
+extern volatile unsigned c4pro_usb_storage_diag_cbw_count;
+extern volatile unsigned c4pro_usb_storage_diag_bad_sig;
+extern volatile unsigned c4pro_usb_storage_diag_last_cmd;
+extern volatile unsigned c4pro_usb_storage_diag_last_lun;
+extern volatile unsigned c4pro_usb_storage_diag_last_len;
+extern volatile unsigned c4pro_usb_storage_diag_block_size;
+extern volatile unsigned c4pro_usb_storage_diag_block_count;
+extern volatile unsigned c4pro_usb_storage_diag_exclusive;
+extern volatile unsigned c4pro_usb_storage_diag_lun_present;
+extern volatile unsigned c4pro_usb_storage_diag_state;
+extern volatile unsigned c4pro_usb_storage_diag_write_cmd_count;
+extern volatile unsigned c4pro_usb_storage_diag_write_lba;
+extern volatile unsigned c4pro_usb_storage_diag_write_blocks;
+extern volatile unsigned c4pro_usb_storage_diag_write_arm_size;
+extern volatile unsigned c4pro_usb_storage_diag_recv_blocks_count;
+extern volatile unsigned c4pro_usb_storage_diag_recv_length;
+extern volatile unsigned c4pro_usb_storage_diag_recv_status;
+extern volatile unsigned c4pro_usb_storage_diag_unexpected_length;
+extern volatile unsigned c4pro_usb_storage_diag_storage_write_calls;
+extern volatile int c4pro_usb_storage_diag_storage_write_result;
+extern int c4own_diag_format_count;
+extern int c4own_diag_write_count;
+extern int c4own_diag_read_count;
+extern int c4own_diag_last_write_sector;
+extern int c4own_diag_last_write_count;
+extern int c4own_diag_last_read_sector;
+extern int c4own_diag_map0;
+extern int c4own_diag_map2;
+extern int c4own_diag_lba0_sig;
+extern int c4own_diag_lba2048_sig;
+extern int c4own_diag_last_write_result;
+extern int c4own_diag_last_writeback_sig;
+extern int c4own_diag_cache_flush_count;
+extern int c4own_diag_cache_logical;
+extern void c4pro_usb_diag_sample(void);
+extern void c4pro_usb_diag_force_reattach(void);
+extern void c4pro_usb_diag_enter_storage_mode(void);
+extern void c4pro_usb_diag_force_storage_config(void);
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_FTL_SYNTH_AUDIT)
+extern int c4pro_ftl_audit_total;
+extern int c4pro_ftl_audit_ok;
+extern int c4pro_ftl_audit_missing;
+extern int c4pro_ftl_audit_bad;
+extern int c4pro_ftl_audit_first_lba;
+extern int c4pro_ftl_audit_first_psec;
+extern int c4pro_ftl_audit_first_mode;
+extern int c4pro_ftl_audit_first_expected;
+extern int c4pro_ftl_audit_first_actual;
+extern void c4pro_ftl_synth_audit(void);
 #endif
 
 #ifdef HAVE_REMOTE_LCD
@@ -261,6 +365,13 @@ extern int c4pro_ftl_diag_sig_root_psec;
 extern int c4pro_ftl_diag_sig_fat_mode;
 extern int c4pro_ftl_diag_sig_root_mode;
 extern int c4pro_ftl_diag_synth_sectors;
+#ifdef C4PRO_FTL_LBA_DIAG
+extern int c4pro_ftl_diag_probe_lba[4];
+extern int c4pro_ftl_diag_probe_psec[4];
+extern int c4pro_ftl_diag_probe_inferred[4];
+extern int c4pro_ftl_diag_probe_mode[4];
+extern int c4pro_ftl_diag_probe_synth[4];
+#endif
 #endif
 
 #if !defined(SIMULATOR)
@@ -322,6 +433,800 @@ struct c4pro_root_candidate
     unsigned sig;
     unsigned char attr;
 };
+#endif
+
+#ifdef C4PRO_FTL_TARGET_SCAN
+#ifndef C4PRO_FTL_TARGET_SCAN_START
+#define C4PRO_FTL_TARGET_SCAN_START 0u
+#endif
+#ifndef C4PRO_FTL_TARGET_SCAN_SECTORS
+#define C4PRO_FTL_TARGET_SCAN_SECTORS 1048576u
+#endif
+#ifndef C4PRO_FTL_TARGET_SCAN_BANKS
+#define C4PRO_FTL_TARGET_SCAN_BANKS 2
+#endif
+
+struct c4pro_target_scan_hit
+{
+    int bank;
+    int psec;
+    int mode;
+    unsigned meta;
+};
+
+#ifdef C4PRO_FTL_NEXT_SECTOR_SCAN
+#define C4PRO_TARGET_SCAN_COUNT 1
+#else
+#define C4PRO_TARGET_SCAN_COUNT 7
+#endif
+
+static uint32_t c4pro_probe_fnv1a_sector(const unsigned char *data)
+{
+    uint32_t hash = 2166136261u;
+
+    for (int i = 0; i < SECTOR_SIZE; i++)
+    {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+
+    return hash;
+}
+
+static uint32_t c4pro_probe_fnv1a_sector_xor(const unsigned char *data,
+                                             const unsigned char *key)
+{
+    uint32_t hash = 2166136261u;
+
+    for (int i = 0; i < SECTOR_SIZE; i++)
+    {
+        hash ^= data[i] ^ key[i];
+        hash *= 16777619u;
+    }
+
+    return hash;
+}
+
+static void c4pro_probe_make_rk27_key(unsigned char *out, int size)
+{
+    static const unsigned char rk27_key[16] =
+    {
+        0x7c, 0x4e, 0x03, 0x04, 0x55, 0x05, 0x09, 0x07,
+        0x2d, 0x2c, 0x7b, 0x38, 0x17, 0x0d, 0x17, 0x11,
+    };
+    unsigned char key1[256];
+    unsigned char key2[256];
+    int index = 0;
+
+    for (int i = 0; i < 256; i++)
+    {
+        key1[i] = i;
+        key2[i] = rk27_key[i & 0xf];
+    }
+
+    for (int i = 0; i < 256; i++)
+    {
+        unsigned char x = key1[i];
+        index = (key1[i] + index + key2[i]) & 0xff;
+        key1[i] = key1[index];
+        key1[index] = x;
+    }
+
+    index = 0;
+    for (int i = 0; i < size; i++)
+    {
+        unsigned char x = key1[(i + 1) & 0xff];
+        index = (x + index) & 0xff;
+        key1[(i + 1) & 0xff] = key1[index];
+        key1[index] = x;
+        out[i] = key1[(key1[(i + 1) & 0xff] + x) & 0xff];
+    }
+}
+
+static bool c4pro_target_nand_id_present(const unsigned char id[5])
+{
+    bool any_zero = false;
+    bool any_ff = false;
+    bool any_other = false;
+
+    for (int i = 0; i < 5; i++)
+    {
+        if (id[i] == 0x00)
+            any_zero = true;
+        else if (id[i] == 0xff)
+            any_ff = true;
+        else
+            any_other = true;
+    }
+
+    return any_other && !(any_zero && !any_ff && !any_other);
+}
+
+static unsigned c4pro_target_spare_meta(const unsigned char *spare, int sec)
+{
+    const unsigned char *s = spare + sec * 16;
+
+    return ((unsigned)s[0] << 16) | ((unsigned)s[1] << 8) | (unsigned)s[2];
+}
+
+static void c4pro_show_target_scan(void)
+{
+    static unsigned char page_data[C4PRO_FTL_PAGE_SIZE];
+    static unsigned char page_spare[C4PRO_FTL_SPARE_SIZE];
+    static unsigned char page_key[C4PRO_FTL_PAGE_SIZE];
+    static bool scan_ran;
+    static const uint32_t target_hashes[C4PRO_TARGET_SCAN_COUNT] =
+    {
+#ifdef C4PRO_FTL_NEXT_SECTOR_SCAN
+        0xea0263adu, /* LBA 47489 */
+#else
+        0x0c3de6f2u, /* LBA 47488, /PDA Music/YoYo - v2.wav */
+        0xea0263adu, /* LBA 47489 */
+        0xfd2a323du, /* LBA 47490 */
+        0xbf83b252u, /* LBA 47491 */
+        0x88523b6du, /* LBA 47492 */
+        0xe1bee0d3u, /* LBA 47493 */
+        0xec79abe5u, /* LBA 47494 */
+#endif
+    };
+    struct c4pro_target_scan_hit hits[C4PRO_TARGET_SCAN_COUNT] =
+    {
+        { -1, -1, -1, 0xffffff },
+#ifndef C4PRO_FTL_NEXT_SECTOR_SCAN
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+#endif
+    };
+    uint32_t start = C4PRO_FTL_TARGET_SCAN_START;
+    uint32_t end = start + C4PRO_FTL_TARGET_SCAN_SECTORS;
+    int found = 0;
+
+    if (scan_ran)
+        return;
+    scan_ran = true;
+
+    c4pro_probe_make_rk27_key(page_key, sizeof(page_key));
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_putsf(0, 0, "TSCAN %u+%u", start, C4PRO_FTL_TARGET_SCAN_SECTORS);
+    lcd_puts(0, 1, "wait");
+    lcd_update();
+
+    for (int bank = 0; bank < C4PRO_FTL_TARGET_SCAN_BANKS &&
+         found < C4PRO_TARGET_SCAN_COUNT; bank++)
+    {
+        unsigned char id[5];
+
+        if (c4pro_nand_read_id(bank, id) || !c4pro_target_nand_id_present(id))
+            continue;
+
+        for (uint32_t psec = start; psec < end &&
+             found < C4PRO_TARGET_SCAN_COUNT; psec += 8)
+        {
+            uint32_t page = psec / C4PRO_FTL_SECTORS_PER_PAGE;
+
+            if (nand_read_page(bank, page, page_data, page_spare, 1, 0))
+                continue;
+
+            if (((psec - start) & 0x3fffu) == 0)
+            {
+                lcd_putsf(0, 1, "b%d p%lu", bank,
+                          (unsigned long)psec);
+                lcd_putsf(0, 2, "f%d", found);
+                lcd_update();
+            }
+
+            for (int sec = 0; sec < C4PRO_FTL_SECTORS_PER_PAGE; sec++)
+            {
+                const unsigned char *sector = page_data + sec * SECTOR_SIZE;
+                uint32_t hashes[3];
+
+                hashes[0] = c4pro_probe_fnv1a_sector(sector);
+                hashes[1] = c4pro_probe_fnv1a_sector_xor(sector, page_key);
+                hashes[2] = c4pro_probe_fnv1a_sector_xor(
+                    sector, page_key + sec * SECTOR_SIZE);
+
+                for (int target = 0; target < C4PRO_TARGET_SCAN_COUNT; target++)
+                {
+                    if (hits[target].psec >= 0)
+                        continue;
+
+                    for (int mode = 0; mode < 3; mode++)
+                    {
+                        if (hashes[mode] != target_hashes[target])
+                            continue;
+
+                        hits[target].bank = bank;
+                        hits[target].psec = (int)psec + sec;
+                        hits[target].mode = mode;
+                        hits[target].meta =
+                            c4pro_target_spare_meta(page_spare, sec);
+                        found++;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+#ifdef C4PRO_FTL_NEXT_SECTOR_SCAN
+    lcd_clear_display();
+    if (hits[0].psec >= 0)
+    {
+        lcd_puts(0, 0, "NEXT F");
+        lcd_putsf(0, 1, "b%d p%07d", hits[0].bank, hits[0].psec);
+        lcd_putsf(0, 2, "m%d x%06x", hits[0].mode, hits[0].meta);
+    }
+    else
+    {
+        lcd_puts(0, 0, "NEXT N");
+        lcd_putsf(0, 1, "%u+%u", start, C4PRO_FTL_TARGET_SCAN_SECTORS);
+    }
+#else
+    lcd_clear_display();
+    lcd_putsf(0, 0, "TSCAN done f%d", found);
+    for (int i = 0; i < C4PRO_TARGET_SCAN_COUNT; i++)
+    {
+        lcd_putsf(0, i + 1, "%db%d p%07d m%d x%06x", i, hits[i].bank,
+                  hits[i].psec, hits[i].mode, hits[i].meta);
+    }
+#endif
+    lcd_puts(0, 7, "hold");
+    lcd_update();
+
+    button_clear_queue();
+    while (true)
+    {
+        lcd_update();
+        sleep(HZ / 2);
+    }
+}
+
+static void c4pro_show_hit_page_probe(void)
+{
+    static unsigned char page_data[C4PRO_FTL_PAGE_SIZE];
+    static unsigned char page_spare[C4PRO_FTL_SPARE_SIZE];
+    static unsigned char page_key[C4PRO_FTL_PAGE_SIZE];
+    uint32_t page = 297128u / C4PRO_FTL_SECTORS_PER_PAGE;
+    extern int c4pro_ftl_diag_hash_lookup(uint32_t hash);
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "HITPAGE wait");
+    lcd_update();
+    c4pro_probe_make_rk27_key(page_key, sizeof(page_key));
+
+    if (nand_read_page(0, page, page_data, page_spare, 1, 0))
+    {
+        lcd_clear_display();
+        lcd_puts(0, 0, "HITPAGE read fail");
+    }
+    else
+    {
+        lcd_clear_display();
+        lcd_putsf(0, 0, "HITPAGE p%lu", (unsigned long)(page * 8));
+        for (int sec = 0; sec < C4PRO_FTL_SECTORS_PER_PAGE; sec++)
+        {
+            const unsigned char *data = page_data + sec * SECTOR_SIZE;
+            uint32_t hashes[3];
+            int lba = -1;
+            int mode = -1;
+            unsigned meta = c4pro_target_spare_meta(page_spare, sec);
+
+            hashes[0] = c4pro_probe_fnv1a_sector(data);
+            hashes[1] = c4pro_probe_fnv1a_sector_xor(data, page_key);
+            hashes[2] = c4pro_probe_fnv1a_sector_xor(
+                data, page_key + sec * SECTOR_SIZE);
+
+            for (int probe_mode = 0; probe_mode < 3; probe_mode++)
+            {
+                lba = c4pro_ftl_diag_hash_lookup(hashes[probe_mode]);
+                if (lba >= 0)
+                {
+                    mode = probe_mode;
+                    break;
+                }
+            }
+
+            lcd_putsf(0, sec + 1, "%d l%06d m%d x%06x", sec, lba, mode, meta);
+        }
+    }
+    lcd_update();
+
+    while (true)
+    {
+        lcd_update();
+        sleep(HZ / 2);
+    }
+}
+#endif
+
+#ifdef C4PRO_FTL_META_TAG_PROBE
+static void c4pro_meta_put_near(int x, int y, int tag, int hit, int start,
+                                int count)
+{
+    if (hit < 0)
+        lcd_putsf(x, y, "%d ----%02d", tag, count);
+    else
+        lcd_putsf(x, y, "%d %04x%02d", tag, hit - start, count);
+}
+
+static void c4pro_show_meta_tag_probe(void)
+{
+    static unsigned char page_data[C4PRO_FTL_PAGE_SIZE];
+    static unsigned char page_spare[C4PRO_FTL_SPARE_SIZE];
+#ifndef C4PRO_FTL_META_TAG_SCAN_START
+#define C4PRO_FTL_META_TAG_SCAN_START 294912u
+#endif
+#ifndef C4PRO_FTL_META_TAG_SCAN_SECTORS
+#define C4PRO_FTL_META_TAG_SCAN_SECTORS 8192u
+#endif
+    int hits[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+    int best_dist[8] =
+    {
+        0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff,
+        0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff
+    };
+    int counts[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    uint32_t start = C4PRO_FTL_META_TAG_SCAN_START;
+    uint32_t end = start + C4PRO_FTL_META_TAG_SCAN_SECTORS;
+    const int known_psec = 297128;
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_putsf(0, 0, "C4META %lu+%lu", (unsigned long)start,
+              (unsigned long)C4PRO_FTL_META_TAG_SCAN_SECTORS);
+    lcd_puts(0, 1, "wait");
+    lcd_update();
+
+    for (uint32_t psec = start & ~7u; psec < end; psec += 8)
+    {
+        uint32_t page = psec / C4PRO_FTL_SECTORS_PER_PAGE;
+
+        if (nand_read_page(0, page, page_data, page_spare, 1, 0))
+            continue;
+
+        for (int sec = 0; sec < C4PRO_FTL_SECTORS_PER_PAGE; sec++)
+        {
+            unsigned meta = c4pro_target_spare_meta(page_spare, sec);
+
+            for (int target = 0; target < 8; target++)
+            {
+                unsigned want = ((unsigned)target << 16) | 0x00f200u;
+
+                if (meta == want)
+                {
+                    int hit = (int)psec + sec;
+                    int dist = hit > known_psec ? hit - known_psec :
+                        known_psec - hit;
+
+                    if (counts[target] < 99)
+                        counts[target]++;
+
+                    if (dist < best_dist[target])
+                    {
+                        best_dist[target] = dist;
+                        hits[target] = hit;
+                    }
+                }
+            }
+        }
+    }
+
+    lcd_clear_display();
+    lcd_putsf(0, 0, "C4META near %04x", known_psec - (int)start);
+    c4pro_meta_put_near(0, 1, 0, hits[0], (int)start, counts[0]);
+    c4pro_meta_put_near(10, 1, 1, hits[1], (int)start, counts[1]);
+    c4pro_meta_put_near(0, 2, 2, hits[2], (int)start, counts[2]);
+    c4pro_meta_put_near(10, 2, 3, hits[3], (int)start, counts[3]);
+    c4pro_meta_put_near(0, 3, 4, hits[4], (int)start, counts[4]);
+    c4pro_meta_put_near(10, 3, 5, hits[5], (int)start, counts[5]);
+    c4pro_meta_put_near(0, 4, 6, hits[6], (int)start, counts[6]);
+    c4pro_meta_put_near(10, 4, 7, hits[7], (int)start, counts[7]);
+    lcd_puts(0, 6, "tag off count");
+    lcd_update();
+
+    while (true)
+    {
+        lcd_update();
+        sleep(HZ / 2);
+    }
+}
+#endif
+
+#ifdef C4PRO_FTL_NEAR_HASH_PROBE
+struct c4pro_near_hash_hit
+{
+    int psec;
+    int lba;
+    int mode;
+    unsigned meta;
+    int dist;
+};
+
+static void c4pro_near_hash_consider(struct c4pro_near_hash_hit hits[6],
+                                     int psec, int lba, int mode,
+                                     unsigned meta, int center)
+{
+    int dist = psec > center ? psec - center : center - psec;
+    int slot = -1;
+
+    for (int i = 0; i < 6; i++)
+    {
+        if (hits[i].psec < 0 || dist < hits[i].dist)
+        {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0)
+        return;
+
+    for (int i = 5; i > slot; i--)
+        hits[i] = hits[i - 1];
+
+    hits[slot].psec = psec;
+    hits[slot].lba = lba;
+    hits[slot].mode = mode;
+    hits[slot].meta = meta;
+    hits[slot].dist = dist;
+}
+
+static void c4pro_show_near_hash_probe(void)
+{
+    static unsigned char page_data[C4PRO_FTL_PAGE_SIZE];
+    static unsigned char page_spare[C4PRO_FTL_SPARE_SIZE];
+    static unsigned char page_key[C4PRO_FTL_PAGE_SIZE];
+    struct c4pro_near_hash_hit hits[6] =
+    {
+        { -1, -1, -1, 0xffffff, 0x7fffffff },
+        { -1, -1, -1, 0xffffff, 0x7fffffff },
+        { -1, -1, -1, 0xffffff, 0x7fffffff },
+        { -1, -1, -1, 0xffffff, 0x7fffffff },
+        { -1, -1, -1, 0xffffff, 0x7fffffff },
+        { -1, -1, -1, 0xffffff, 0x7fffffff },
+    };
+#ifndef C4PRO_FTL_NEAR_HASH_CENTER
+#define C4PRO_FTL_NEAR_HASH_CENTER 297128u
+#endif
+#ifndef C4PRO_FTL_NEAR_HASH_RADIUS
+#define C4PRO_FTL_NEAR_HASH_RADIUS 4096u
+#endif
+    uint32_t center = C4PRO_FTL_NEAR_HASH_CENTER;
+    uint32_t radius = C4PRO_FTL_NEAR_HASH_RADIUS;
+    uint32_t start = (center > radius) ? center - radius : 0;
+    uint32_t end = center + radius;
+    int found = 0;
+    extern int c4pro_ftl_diag_hash_lookup(uint32_t hash);
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_putsf(0, 0, "NEARHASH %lu", (unsigned long)center);
+    lcd_puts(0, 1, "wait");
+    lcd_update();
+
+    start &= ~7u;
+    c4pro_probe_make_rk27_key(page_key, sizeof(page_key));
+
+    for (uint32_t psec = start; psec < end; psec += 8)
+    {
+        uint32_t page = psec / C4PRO_FTL_SECTORS_PER_PAGE;
+
+        if (nand_read_page(0, page, page_data, page_spare, 1, 0))
+            continue;
+
+        for (int sec = 0; sec < C4PRO_FTL_SECTORS_PER_PAGE; sec++)
+        {
+            const unsigned char *data = page_data + sec * SECTOR_SIZE;
+            uint32_t hashes[3];
+            int lba = -1;
+            int mode = -1;
+
+            hashes[0] = c4pro_probe_fnv1a_sector(data);
+            hashes[1] = c4pro_probe_fnv1a_sector_xor(data, page_key);
+            hashes[2] = c4pro_probe_fnv1a_sector_xor(
+                data, page_key + sec * SECTOR_SIZE);
+
+            for (int probe_mode = 0; probe_mode < 3; probe_mode++)
+            {
+                lba = c4pro_ftl_diag_hash_lookup(hashes[probe_mode]);
+                if (lba >= 0)
+                {
+                    mode = probe_mode;
+                    break;
+                }
+            }
+
+            if (lba < 0)
+                continue;
+
+            if (found < 999)
+                found++;
+
+            c4pro_near_hash_consider(hits, (int)psec + sec, lba, mode,
+                                     c4pro_target_spare_meta(page_spare, sec),
+                                     (int)center);
+        }
+    }
+
+    lcd_clear_display();
+    lcd_putsf(0, 0, "NEARHASH n%d", found);
+    for (int i = 0; i < 6; i++)
+    {
+        int off = hits[i].psec < 0 ? -9999 : hits[i].psec - (int)center;
+        const char *sign = off < 0 ? "-" : "+";
+        int mag = off < 0 ? -off : off;
+
+        lcd_putsf(0, i + 1, "%d p%s%d l%d m%d x%06x", i, sign, mag,
+                  hits[i].lba, hits[i].mode, hits[i].meta);
+    }
+    lcd_update();
+
+    while (true)
+    {
+        lcd_update();
+        sleep(HZ / 2);
+    }
+}
+#endif
+
+#ifdef C4PRO_FTL_LBA_SLOT_PROBE
+struct c4pro_lba_slot_hit
+{
+    int bank;
+    int psec;
+    int mode;
+    unsigned meta;
+};
+
+static void c4pro_show_lba_slot_probe(void)
+{
+    static unsigned char page_data[C4PRO_FTL_PAGE_SIZE];
+    static unsigned char page_spare[C4PRO_FTL_SPARE_SIZE];
+    static unsigned char page_key[C4PRO_FTL_PAGE_SIZE];
+    struct c4pro_lba_slot_hit hits[8] =
+    {
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+        { -1, -1, -1, 0xffffff },
+    };
+#ifndef C4PRO_FTL_LBA_SLOT_BASE
+#define C4PRO_FTL_LBA_SLOT_BASE 47488
+#endif
+#ifndef C4PRO_FTL_LBA_SLOT_CENTER
+#define C4PRO_FTL_LBA_SLOT_CENTER 297128u
+#endif
+#ifndef C4PRO_FTL_LBA_SLOT_RADIUS
+#define C4PRO_FTL_LBA_SLOT_RADIUS 4096u
+#endif
+    int base_lba = C4PRO_FTL_LBA_SLOT_BASE;
+    uint32_t center = C4PRO_FTL_LBA_SLOT_CENTER;
+    uint32_t radius = C4PRO_FTL_LBA_SLOT_RADIUS;
+    uint32_t start = (center > radius) ? center - radius : 0;
+    uint32_t end = center + radius;
+    int found = 0;
+    extern int c4pro_ftl_diag_hash_lookup(uint32_t hash);
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_putsf(0, 0, "SLOT %d wait", base_lba);
+    lcd_update();
+
+    start &= ~7u;
+    c4pro_probe_make_rk27_key(page_key, sizeof(page_key));
+
+    for (int bank = 0; bank < C4PRO_FTL_TARGET_SCAN_BANKS && found < 8; bank++)
+    {
+        unsigned char id[5];
+
+        if (c4pro_nand_read_id(bank, id) || !c4pro_target_nand_id_present(id))
+            continue;
+
+        for (uint32_t psec = start; psec < end && found < 8; psec += 8)
+        {
+            uint32_t page = psec / C4PRO_FTL_SECTORS_PER_PAGE;
+
+            if (nand_read_page(bank, page, page_data, page_spare, 1, 0))
+                continue;
+
+            for (int sec = 0; sec < C4PRO_FTL_SECTORS_PER_PAGE && found < 8; sec++)
+            {
+                const unsigned char *data = page_data + sec * SECTOR_SIZE;
+                uint32_t hashes[3];
+                int lba = -1;
+                int mode = -1;
+
+                hashes[0] = c4pro_probe_fnv1a_sector(data);
+                hashes[1] = c4pro_probe_fnv1a_sector_xor(data, page_key);
+                hashes[2] = c4pro_probe_fnv1a_sector_xor(
+                    data, page_key + sec * SECTOR_SIZE);
+
+                for (int probe_mode = 0; probe_mode < 3; probe_mode++)
+                {
+                    lba = c4pro_ftl_diag_hash_lookup(hashes[probe_mode]);
+                    if (lba >= 0)
+                    {
+                        mode = probe_mode;
+                        break;
+                    }
+                }
+
+                if (lba < base_lba || lba >= base_lba + 8)
+                    continue;
+
+                int slot = lba - base_lba;
+
+                if (hits[slot].psec >= 0)
+                    continue;
+
+                hits[slot].bank = bank;
+                hits[slot].psec = (int)psec + sec;
+                hits[slot].mode = mode;
+                hits[slot].meta = c4pro_target_spare_meta(page_spare, sec);
+                found++;
+            }
+        }
+    }
+
+    lcd_clear_display();
+    lcd_putsf(0, 0, "SLOT f%d", found);
+    for (int i = 0; i < 7; i++)
+    {
+        if (hits[i].psec < 0)
+        {
+            lcd_putsf(0, i + 1, "%d ----", i);
+        }
+        else
+        {
+            int off = hits[i].psec - (int)center;
+            const char *sign = off < 0 ? "-" : "+";
+            int mag = off < 0 ? -off : off;
+
+            lcd_putsf(0, i + 1, "%d b%d p%s%d m%d x%06x", i,
+                      hits[i].bank, sign, mag, hits[i].mode, hits[i].meta);
+        }
+    }
+    lcd_update();
+
+    while (true)
+    {
+        lcd_update();
+        sleep(HZ / 2);
+    }
+}
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_DIAG_EXPORT)
+static void c4pro_show_usb_diag_loop(void)
+{
+    lcd_setfont(FONT_SYSFIXED);
+    usb_start_monitoring();
+#ifdef USB_ENABLE_STORAGE
+    usb_core_enable_driver(USB_DRIVER_MASS_STORAGE, true);
+#endif
+    c4pro_usb_diag_enter_storage_mode();
+    c4pro_usb_diag_force_reattach();
+    sleep(2 * HZ);
+    c4pro_usb_diag_force_storage_config();
+
+    while (true)
+    {
+        c4pro_usb_diag_sample();
+        lcd_clear_display();
+        lcd_puts(0, 0, "C4USB MSC");
+        lcd_putsf(0, 1, "core s%u c%u if%u",
+                  c4pro_usb_diag_core_state,
+                  c4pro_usb_diag_core_config,
+                  c4pro_usb_diag_core_interfaces);
+        lcd_putsf(0, 2, "init%u arm%u out%u",
+                  c4pro_usb_storage_diag_init_count,
+                  c4pro_usb_storage_diag_arm_count,
+                  c4pro_usb_diag_outn_count);
+        lcd_putsf(0, 3, "cbw%u bad%u cmd%02x",
+                  c4pro_usb_storage_diag_cbw_count,
+                  c4pro_usb_storage_diag_bad_sig,
+                  c4pro_usb_storage_diag_last_cmd);
+        lcd_putsf(0, 4, "wc%u l%u n%u",
+                  c4pro_usb_storage_diag_write_cmd_count,
+                  c4pro_usb_storage_diag_write_lba,
+                  c4pro_usb_storage_diag_write_blocks);
+        lcd_putsf(0, 5, "fmt%d fw%d/%d cf%d",
+                  c4own_diag_format_count,
+                  c4own_diag_write_count,
+                  c4own_diag_last_write_result,
+                  c4own_diag_cache_flush_count);
+        lcd_putsf(0, 6, "cl%d m2%d s2%08x",
+                  c4own_diag_cache_logical,
+                  c4own_diag_map2,
+                  c4own_diag_lba2048_sig);
+        lcd_putsf(0, 7, "rs%u sw%u/%d",
+                  c4pro_usb_storage_diag_recv_status,
+                  c4pro_usb_storage_diag_storage_write_calls,
+                  c4pro_usb_storage_diag_storage_write_result);
+        lcd_update();
+        sleep(HZ / 2);
+    }
+}
+
+#ifdef C4PRO_FTL_META_TAG_PROBE
+static void c4pro_show_meta_tag_probe(void)
+{
+    static unsigned char page_data[C4PRO_FTL_PAGE_SIZE];
+    static unsigned char page_spare[C4PRO_FTL_SPARE_SIZE];
+#ifndef C4PRO_FTL_META_TAG_SCAN_START
+#define C4PRO_FTL_META_TAG_SCAN_START 294912u
+#endif
+#ifndef C4PRO_FTL_META_TAG_SCAN_SECTORS
+#define C4PRO_FTL_META_TAG_SCAN_SECTORS 8192u
+#endif
+    int hits[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+    uint32_t start = C4PRO_FTL_META_TAG_SCAN_START;
+    uint32_t end = start + C4PRO_FTL_META_TAG_SCAN_SECTORS;
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_putsf(0, 0, "C4META %lu+%lu", (unsigned long)start,
+              (unsigned long)C4PRO_FTL_META_TAG_SCAN_SECTORS);
+    lcd_puts(0, 1, "wait");
+    lcd_update();
+
+    for (uint32_t psec = start & ~7u; psec < end; psec += 8)
+    {
+        uint32_t page = psec / C4PRO_FTL_SECTORS_PER_PAGE;
+
+        if (nand_read_page(0, page, page_data, page_spare, 1, 0))
+            continue;
+
+        for (int sec = 0; sec < C4PRO_FTL_SECTORS_PER_PAGE; sec++)
+        {
+            unsigned meta = c4pro_target_spare_meta(page_spare, sec);
+
+            for (int target = 0; target < 8; target++)
+            {
+                unsigned want = ((unsigned)target << 16) | 0x00f200u;
+
+                if (hits[target] < 0 && meta == want)
+                    hits[target] = (int)psec + sec;
+            }
+        }
+    }
+
+    lcd_clear_display();
+    lcd_putsf(0, 0, "C4META s%lu", (unsigned long)start);
+    lcd_putsf(0, 1, "0 o%04x 1 o%04x",
+              hits[0] < 0 ? -1 : hits[0] - (int)start,
+              hits[1] < 0 ? -1 : hits[1] - (int)start);
+    lcd_putsf(0, 2, "2 o%04x 3 o%04x",
+              hits[2] < 0 ? -1 : hits[2] - (int)start,
+              hits[3] < 0 ? -1 : hits[3] - (int)start);
+    lcd_putsf(0, 3, "4 o%04x 5 o%04x",
+              hits[4] < 0 ? -1 : hits[4] - (int)start,
+              hits[5] < 0 ? -1 : hits[5] - (int)start);
+    lcd_putsf(0, 4, "6 o%04x 7 o%04x",
+              hits[6] < 0 ? -1 : hits[6] - (int)start,
+              hits[7] < 0 ? -1 : hits[7] - (int)start);
+    lcd_puts(0, 6, "p = start + offset");
+    lcd_update();
+
+    while (true)
+    {
+        lcd_update();
+        sleep(HZ / 2);
+    }
+}
+#endif
 #endif
 
 #if defined(C4PRO_STORAGE_VERDICT) || defined(C4PRO_FTL_PROBE)
@@ -602,16 +1507,74 @@ static void c4pro_show_storage_verdict(void)
     lcd_putsf(0, 4, "F0 %d M0 %d F1 %d M1 %d",
               bank_scan[0].first_fat_psec, bank_scan[0].first_mbr_psec,
               bank_scan[1].first_fat_psec, bank_scan[1].first_mbr_psec);
+#ifdef C4PRO_FTL_LBA_DIAG
+    lcd_putsf(0, 0, "C4LBA h%d d%d n%d", c4pro_ftl_diag_hash_mapped,
+              c4pro_ftl_diag_hash_best_delta,
+              c4pro_ftl_diag_hash_best_delta_count);
+    lcd_putsf(0, 1, "a%d p%d i%d m%d s%d", c4pro_ftl_diag_probe_lba[0],
+              c4pro_ftl_diag_probe_psec[0],
+              c4pro_ftl_diag_probe_inferred[0],
+              c4pro_ftl_diag_probe_mode[0],
+              c4pro_ftl_diag_probe_synth[0]);
+    lcd_putsf(0, 2, "b%d p%d i%d m%d s%d", c4pro_ftl_diag_probe_lba[1],
+              c4pro_ftl_diag_probe_psec[1],
+              c4pro_ftl_diag_probe_inferred[1],
+              c4pro_ftl_diag_probe_mode[1],
+              c4pro_ftl_diag_probe_synth[1]);
+    lcd_putsf(0, 3, "c%d p%d i%d m%d s%d", c4pro_ftl_diag_probe_lba[2],
+              c4pro_ftl_diag_probe_psec[2],
+              c4pro_ftl_diag_probe_inferred[2],
+              c4pro_ftl_diag_probe_mode[2],
+              c4pro_ftl_diag_probe_synth[2]);
+    lcd_putsf(0, 4, "d%d p%d i%d m%d s%d", c4pro_ftl_diag_probe_lba[3],
+              c4pro_ftl_diag_probe_psec[3],
+              c4pro_ftl_diag_probe_inferred[3],
+              c4pro_ftl_diag_probe_mode[3],
+              c4pro_ftl_diag_probe_synth[3]);
+    lcd_putsf(0, 5, "x%d/%d/%d y%d", c4pro_ftl_diag_hash_raw,
+              c4pro_ftl_diag_hash_secdec,
+              c4pro_ftl_diag_hash_pagedec,
+              c4pro_ftl_diag_synth_sectors);
+    lcd_putsf(0, 6, "fat%d root%d", c4pro_ftl_diag_hash_fat_psec,
+              c4pro_ftl_diag_hash_root_psec);
+#else
     lcd_putsf(0, 5, "y%d h%d d%d n%d", c4pro_ftl_diag_synth_sectors,
               c4pro_ftl_diag_hash_mapped, c4pro_ftl_diag_hash_best_delta,
               c4pro_ftl_diag_hash_best_delta_count);
     lcd_putsf(0, 6, "x%d/%d/%d", c4pro_ftl_diag_hash_raw,
               c4pro_ftl_diag_hash_secdec,
               c4pro_ftl_diag_hash_pagedec);
+#endif
     lcd_puts(0, 7, "15s then key");
     lcd_update();
 
     sleep(15 * HZ);
+    button_clear_queue();
+    while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
+        ;
+    button_clear_queue();
+}
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_FTL_SYNTH_AUDIT)
+static void c4pro_show_ftl_synth_audit(void)
+{
+    c4pro_ftl_synth_audit();
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4AUDIT");
+    lcd_putsf(0, 1, "t%d ok%d", c4pro_ftl_audit_total,
+              c4pro_ftl_audit_ok);
+    lcd_putsf(0, 2, "miss%d bad%d", c4pro_ftl_audit_missing,
+              c4pro_ftl_audit_bad);
+    lcd_putsf(0, 3, "l%d", c4pro_ftl_audit_first_lba);
+    lcd_putsf(0, 4, "p%d m%d", c4pro_ftl_audit_first_psec,
+              c4pro_ftl_audit_first_mode);
+    lcd_putsf(0, 5, "e%08x", c4pro_ftl_audit_first_expected);
+    lcd_putsf(0, 6, "a%08x", c4pro_ftl_audit_first_actual);
+    lcd_puts(0, 7, "press key");
+    lcd_update();
     button_clear_queue();
     while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
         ;
@@ -1544,7 +2507,9 @@ static void c4pro_show_ftl_probe(void)
 #endif
 
 #endif /* !defined(SIMULATOR) */
+#endif /* COLORFLY_C4_PRO */
 
+#if 1
 #define C4PRO_BOOT_STEP(step) do { } while (0)
 #define C4PRO_BOOT_HALT(step) do { } while (0)
 #define C4PRO_APP_ENTRY_HALT() do { } while (0)
@@ -1612,7 +2577,8 @@ int main(void)
 #endif
     /* Keep the order of this 3
      * Must be done before any code uses the multi-screen API */
-#if defined(HAVE_USBSTACK) && !defined(COLORFLY_C4_PRO)
+#if defined(HAVE_USBSTACK) && \
+    (!defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_DIAG_EXPORT))
     /* All threads should be created and public queues registered by now */
     usb_start_monitoring();
 #endif
@@ -1672,6 +2638,24 @@ int main(void)
      * see definition of INIT_ATTR in config.h */
     C4PRO_BOOT_STEP("root_menu");
     C4PRO_PRE_ROOT_MENU_HALT("pre root_menu");
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_FTL_SYNTH_AUDIT)
+    c4pro_show_ftl_synth_audit();
+#endif
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_FTL_TARGET_SCAN)
+#ifdef C4PRO_FTL_LBA_SLOT_PROBE
+    c4pro_show_lba_slot_probe();
+#elif defined(C4PRO_FTL_NEAR_HASH_PROBE)
+    c4pro_show_near_hash_probe();
+#elif defined(C4PRO_FTL_HIT_PAGE_PROBE)
+    c4pro_show_hit_page_probe();
+#elif defined(C4PRO_FTL_META_TAG_PROBE)
+    c4pro_show_meta_tag_probe();
+#else
+    c4pro_show_target_scan();
+#endif
+#endif
 #if defined(SIMULATOR)
     if (getenv("SIM_DUMP_DIR"))
     {
@@ -2002,7 +2986,7 @@ static void init(void)
     adc_init();
     C4PRO_BOOT_STEP("adc ok");
 
-#ifndef COLORFLY_C4_PRO
+#if !defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_DIAG_EXPORT)
     usb_init();
 #endif
 #if CONFIG_USBOTG == USBOTG_ISP1362
@@ -2076,6 +3060,11 @@ static void init(void)
         panicf("ata: %d", rc);
     }
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_FTL_SYNTH_AUDIT)
+    c4pro_show_ftl_synth_audit();
+#endif
+
 #if defined(NEED_ATA_POWER_BATT_MEASURE) && \
     (CONFIG_CHARGING <= CHARGING_MONITOR)
     /* After storage_init(), ATA power must be on, so battery voltage
@@ -2124,6 +3113,27 @@ static void init(void)
             int line=0;
             lcd_clear_display();
 #if defined(COLORFLY_C4_PRO)
+#ifdef C4PRO_FTL_SYNTH_AUDIT
+            c4pro_ftl_synth_audit();
+            lcd_setfont(FONT_SYSFIXED);
+            lcd_clear_display();
+            lcd_puts(0, 0, "C4AUDIT mount");
+            lcd_putsf(0, 1, "t%d ok%d", c4pro_ftl_audit_total,
+                      c4pro_ftl_audit_ok);
+            lcd_putsf(0, 2, "miss%d bad%d", c4pro_ftl_audit_missing,
+                      c4pro_ftl_audit_bad);
+            lcd_putsf(0, 3, "l%d p%d", c4pro_ftl_audit_first_lba,
+                      c4pro_ftl_audit_first_psec);
+            lcd_putsf(0, 4, "m%d", c4pro_ftl_audit_first_mode);
+            lcd_putsf(0, 5, "e%08x", c4pro_ftl_audit_first_expected);
+            lcd_putsf(0, 6, "a%08x", c4pro_ftl_audit_first_actual);
+            lcd_puts(0, 7, "press key");
+            lcd_update();
+            button_clear_queue();
+            while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
+                ;
+            button_clear_queue();
+#endif
             static unsigned char sector[SECTOR_SIZE];
             int read_rc;
             int fat_rc = -1;
@@ -2246,6 +3256,14 @@ static void init(void)
 #endif
 
 #if defined(COLORFLY_C4_PRO)
+#ifdef C4PRO_USB_DIAG_EXPORT
+            if (usb_detect() == USB_INSERTED)
+            {
+                lcd_puts(0, line++, "usb diag");
+                lcd_update();
+                c4pro_show_usb_diag_loop();
+            }
+#endif
             while (1)
             {
                 lcd_update();
@@ -2275,9 +3293,29 @@ static void init(void)
 
     C4PRO_MOUNT_READY_HALT();
     C4PRO_BOOT_STEP("mount ok");
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_DIAG_EXPORT)
+    if (usb_detect() == USB_INSERTED)
+    {
+        c4pro_show_usb_diag_loop();
+    }
+#endif
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
 #ifdef C4PRO_STORAGE_VERDICT
     c4pro_show_storage_verdict();
+#endif
+#ifdef C4PRO_FTL_TARGET_SCAN
+#ifdef C4PRO_FTL_LBA_SLOT_PROBE
+    c4pro_show_lba_slot_probe();
+#elif defined(C4PRO_FTL_NEAR_HASH_PROBE)
+    c4pro_show_near_hash_probe();
+#elif defined(C4PRO_FTL_HIT_PAGE_PROBE)
+    c4pro_show_hit_page_probe();
+#elif defined(C4PRO_FTL_META_TAG_PROBE)
+    c4pro_show_meta_tag_probe();
+#else
+    c4pro_show_target_scan();
+#endif
 #endif
 #ifdef C4PRO_FTL_PROBE
     c4pro_show_ftl_probe();
