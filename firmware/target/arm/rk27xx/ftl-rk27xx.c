@@ -23,6 +23,7 @@
 #include "ftl-target.h"
 #include "nand-target.h"
 #include "string.h"
+#include <stdbool.h>
 
 #ifdef COLORFLY_C4_PRO
 struct c4pro_ftl_hash_entry
@@ -37,6 +38,14 @@ struct c4pro_ftl_synth_entry
     uint32_t offset;
 };
 
+struct c4pro_ftl_range_entry
+{
+    uint32_t lba;
+    uint32_t psec;
+    uint32_t count;
+    unsigned char mode;
+};
+
 #ifdef C4PRO_FTL_GENERATED_LOCAL
 #include "c4pro-ftl-generated.h"
 #elif defined(C4PRO_FTL_GENERATED_INCLUDE)
@@ -46,6 +55,23 @@ struct c4pro_ftl_synth_entry
 #ifdef C4PRO_FTL_GENERATED_HEADER
 #ifndef C4PRO_FTL_GENERATED_H
 #error "C4PRO_FTL_GENERATED_HEADER is set but no generated FTL header was included"
+#endif
+#endif
+
+/* Plan-B storage mode for C4 bring-up: serve sectors from a generated
+ * Rockbox-owned image/extent table and never fall back to guessed vendor FTL
+ * placement for missing sectors. This is deliberately still read-only on NAND;
+ * C4PRO_FTL_RAM_WRITE_TEST may be paired with it to absorb volatile FAT writes.
+ */
+#ifdef C4PRO_FTL_ROCKBOX_OWNED
+#ifndef C4PRO_FTL_GENERATED_HEADER
+#error "C4PRO_FTL_ROCKBOX_OWNED requires a generated C4 FTL header"
+#endif
+#ifndef C4PRO_FTL_SKIP_RUNTIME_SCAN
+#define C4PRO_FTL_SKIP_RUNTIME_SCAN 1
+#endif
+#ifndef C4PRO_FTL_STRICT_READ_TEST
+#define C4PRO_FTL_STRICT_READ_TEST 1
 #endif
 #endif
 
@@ -163,11 +189,109 @@ int c4pro_ftl_diag_sig_fat_mode = -1;
 int c4pro_ftl_diag_sig_root_mode = -1;
 int c4pro_ftl_diag_synth_sectors;
 
+#ifdef C4PRO_FTL_SYNTH_AUDIT
+#ifndef C4PRO_FTL_AUDIT_START_LBA
+#define C4PRO_FTL_AUDIT_START_LBA 47488u
+#endif
+#ifndef C4PRO_FTL_AUDIT_SECTORS
+#define C4PRO_FTL_AUDIT_SECTORS 256u
+#endif
+int c4pro_ftl_audit_total;
+int c4pro_ftl_audit_ok;
+int c4pro_ftl_audit_missing;
+int c4pro_ftl_audit_bad;
+int c4pro_ftl_audit_first_lba = -1;
+int c4pro_ftl_audit_first_psec = -1;
+int c4pro_ftl_audit_first_mode = -1;
+int c4pro_ftl_audit_first_expected = -1;
+int c4pro_ftl_audit_first_actual = -1;
+#endif
+
+#ifdef C4PRO_FTL_LBA_DIAG
+#ifndef C4PRO_FTL_LBA_DIAG0
+#define C4PRO_FTL_LBA_DIAG0 47488u
+#endif
+#ifndef C4PRO_FTL_LBA_DIAG1
+#define C4PRO_FTL_LBA_DIAG1 47489u
+#endif
+#ifndef C4PRO_FTL_LBA_DIAG2
+#define C4PRO_FTL_LBA_DIAG2 47490u
+#endif
+#ifndef C4PRO_FTL_LBA_DIAG3
+#define C4PRO_FTL_LBA_DIAG3 104352u
+#endif
+int c4pro_ftl_diag_probe_lba[4];
+int c4pro_ftl_diag_probe_psec[4];
+int c4pro_ftl_diag_probe_inferred[4];
+int c4pro_ftl_diag_probe_mode[4];
+int c4pro_ftl_diag_probe_synth[4];
+#endif
+
 #define C4PRO_FTL_MODE_RAW 0
 #define C4PRO_FTL_MODE_SECDEC 1
 #define C4PRO_FTL_MODE_PAGEDEC 2
 
+#ifdef C4PRO_FTL_DIAG_EXPORT
+#ifndef C4PRO_FTL_DIAG_EXPORT_LBA
+#define C4PRO_FTL_DIAG_EXPORT_LBA (C4PRO_SYSTEM_SECTORS - 1)
+#endif
+#ifndef C4PRO_FTL_DIAG_EXPORT_PSEC
+#define C4PRO_FTL_DIAG_EXPORT_PSEC 297128u
+#endif
+
+static void c4pro_ftl_put32le(unsigned char *buf, int off, uint32_t value)
+{
+    buf[off + 0] = (unsigned char)value;
+    buf[off + 1] = (unsigned char)(value >> 8);
+    buf[off + 2] = (unsigned char)(value >> 16);
+    buf[off + 3] = (unsigned char)(value >> 24);
+}
+
+static uint32_t c4pro_ftl_read_diag_export(unsigned char *out)
+{
+    uint32_t page = C4PRO_FTL_DIAG_EXPORT_PSEC / C4PRO_SECTORS_PER_PAGE;
+    int off = 16;
+
+    memset(out, 0, 512);
+    out[0] = 'C';
+    out[1] = '4';
+    out[2] = 'D';
+    out[3] = 'G';
+    c4pro_ftl_put32le(out, 4, C4PRO_FTL_DIAG_EXPORT_PSEC);
+    c4pro_ftl_put32le(out, 8, page);
+    c4pro_ftl_put32le(out, 12, C4PRO_SECTORS_PER_PAGE);
+
+    if (nand_read_page(0, page, page_data, page_spare, 1, 0))
+    {
+        out[3] = 'E';
+        return 1;
+    }
+
+    for (int sec = 0; sec < C4PRO_SECTORS_PER_PAGE; sec++)
+    {
+        const unsigned char *data = page_data + sec * 512;
+        const unsigned char *spare = page_spare + sec * 16;
+        uint32_t sig = ((uint32_t)data[0] << 24) |
+                       ((uint32_t)data[1] << 16) |
+                       ((uint32_t)data[2] << 8) |
+                       (uint32_t)data[3];
+
+        out[off++] = (unsigned char)sec;
+        out[off++] = 0;
+        out[off++] = 0;
+        out[off++] = 0;
+        c4pro_ftl_put32le(out, off, sig);
+        off += 4;
+        memcpy(out + off, spare, 16);
+        off += 16;
+    }
+
+    return 0;
+}
+#endif
+
 #ifdef C4PRO_FTL_HASH_ORACLE
+#ifndef C4PRO_FTL_SKIP_RUNTIME_SCAN
 static const unsigned char c4pro_root_sfn[7][11] =
 {
     "APPDATA    ",
@@ -185,7 +309,7 @@ static const unsigned char c4pro_root_attr[7] =
 };
 #endif
 
-#ifdef C4PRO_FTL_HASH_ORACLE
+#ifndef C4PRO_FTL_SKIP_RUNTIME_SCAN
 static uint32_t c4pro_ftl_hash_sector(const unsigned char *data)
 {
     uint32_t hash = 2166136261u;
@@ -212,7 +336,9 @@ static uint32_t c4pro_ftl_hash_sector_xor(const unsigned char *data,
 
     return hash;
 }
+#endif
 
+#if !defined(C4PRO_FTL_SKIP_RUNTIME_SCAN) || defined(C4PRO_FTL_SYNTH_AUDIT)
 static unsigned char c4pro_ftl_sector_byte(const unsigned char *data,
                                            uint32_t sector_in_page,
                                            int mode, int offset)
@@ -228,7 +354,9 @@ static unsigned char c4pro_ftl_sector_byte(const unsigned char *data,
 #endif
     return data[offset];
 }
+#endif
 
+#ifndef C4PRO_FTL_SKIP_RUNTIME_SCAN
 static int c4pro_ftl_sector_starts_with(const unsigned char *data,
                                         uint32_t sector_in_page,
                                         int mode,
@@ -278,7 +406,11 @@ static int c4pro_ftl_sector_is_root(const unsigned char *data,
 
     return 1;
 }
+#endif
 
+#if !defined(C4PRO_FTL_SKIP_RUNTIME_SCAN) || \
+    defined(C4PRO_FTL_HIT_PAGE_PROBE) || defined(C4PRO_FTL_NEAR_HASH_PROBE) || \
+    defined(C4PRO_FTL_LBA_SLOT_PROBE)
 static int c4pro_ftl_hash_lookup(uint32_t hash)
 {
     int lo = 0;
@@ -299,6 +431,15 @@ static int c4pro_ftl_hash_lookup(uint32_t hash)
 
     return -1;
 }
+#endif
+
+#if defined(C4PRO_FTL_HIT_PAGE_PROBE) || defined(C4PRO_FTL_NEAR_HASH_PROBE) || \
+    defined(C4PRO_FTL_LBA_SLOT_PROBE)
+int c4pro_ftl_diag_hash_lookup(uint32_t hash)
+{
+    return c4pro_ftl_hash_lookup(hash);
+}
+#endif
 
 static int c4pro_ftl_synth_lookup(uint32_t lba)
 {
@@ -325,6 +466,137 @@ static int c4pro_ftl_synth_lookup(uint32_t lba)
     return -1;
 }
 
+#ifdef C4PRO_FTL_PROC_WAV_TEST
+#ifndef C4PRO_FTL_PROC_WAV_LBA
+#define C4PRO_FTL_PROC_WAV_LBA 47488u
+#endif
+#ifndef C4PRO_FTL_PROC_WAV_BYTES
+#define C4PRO_FTL_PROC_WAV_BYTES 1764044u
+#endif
+#ifndef C4PRO_FTL_PROC_WAV_RATE
+#define C4PRO_FTL_PROC_WAV_RATE 44100u
+#endif
+#ifndef C4PRO_FTL_PROC_WAV_FREQ
+#define C4PRO_FTL_PROC_WAV_FREQ 440u
+#endif
+#ifndef C4PRO_FTL_PROC_WAV_AMP
+#define C4PRO_FTL_PROC_WAV_AMP 18000
+#endif
+
+static void c4pro_ftl_proc_wav_sector(uint32_t lba, unsigned char *out)
+{
+    uint32_t sector_off = (lba - C4PRO_FTL_PROC_WAV_LBA) * 512u;
+    uint32_t data_bytes = C4PRO_FTL_PROC_WAV_BYTES - 44u;
+
+    memset(out, 0, 512);
+
+    if (sector_off == 0)
+    {
+        static const unsigned char hdr_prefix[44] =
+        {
+            'R', 'I', 'F', 'F',
+            0, 0, 0, 0,
+            'W', 'A', 'V', 'E',
+            'f', 'm', 't', ' ',
+            16, 0, 0, 0,
+            1, 0,
+            2, 0,
+            0x44, 0xac, 0x00, 0x00,
+            0x10, 0xb1, 0x02, 0x00,
+            4, 0,
+            16, 0,
+            'd', 'a', 't', 'a',
+            0, 0, 0, 0,
+        };
+
+        memcpy(out, hdr_prefix, sizeof(hdr_prefix));
+        uint32_t riff_size = C4PRO_FTL_PROC_WAV_BYTES - 8u;
+        out[4] = riff_size;
+        out[5] = riff_size >> 8;
+        out[6] = riff_size >> 16;
+        out[7] = riff_size >> 24;
+        out[40] = data_bytes;
+        out[41] = data_bytes >> 8;
+        out[42] = data_bytes >> 16;
+        out[43] = data_bytes >> 24;
+    }
+
+    uint32_t first_byte = sector_off > 44u ? sector_off - 44u : 0u;
+    uint32_t sample = (first_byte + 3u) / 4u;
+
+    while (true)
+    {
+        uint32_t file_byte = 44u + sample * 4u;
+        if (file_byte >= sector_off + 512u ||
+            file_byte >= C4PRO_FTL_PROC_WAV_BYTES)
+            break;
+
+        uint32_t off = file_byte - sector_off;
+        uint32_t phase = (sample * C4PRO_FTL_PROC_WAV_FREQ) %
+                         C4PRO_FTL_PROC_WAV_RATE;
+        int16_t value = phase < (C4PRO_FTL_PROC_WAV_RATE / 2u) ?
+                        C4PRO_FTL_PROC_WAV_AMP : -C4PRO_FTL_PROC_WAV_AMP;
+        unsigned char lo = value & 0xff;
+        unsigned char hi = (uint16_t)value >> 8;
+
+        if (off + 3u < 512u)
+        {
+            out[off + 0u] = lo;
+            out[off + 1u] = hi;
+            out[off + 2u] = lo;
+            out[off + 3u] = hi;
+        }
+
+        sample++;
+    }
+}
+
+static bool c4pro_ftl_proc_wav_lookup(uint32_t lba)
+{
+    uint32_t count = (C4PRO_FTL_PROC_WAV_BYTES + 511u) / 512u;
+    return lba >= C4PRO_FTL_PROC_WAV_LBA &&
+           lba < C4PRO_FTL_PROC_WAV_LBA + count;
+}
+#endif
+
+static int c4pro_ftl_explicit_lookup(uint32_t lba, uint32_t *psec,
+                                     unsigned char *mode)
+{
+#ifdef C4PRO_FTL_EXPLICIT_RANGE_COUNT
+    int lo = 0;
+    int hi = C4PRO_FTL_EXPLICIT_RANGE_COUNT - 1;
+
+    while (lo <= hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        const struct c4pro_ftl_range_entry *entry =
+            &c4pro_ftl_explicit_ranges[mid];
+
+        if (lba < entry->lba)
+        {
+            hi = mid - 1;
+        }
+        else if (lba >= entry->lba + entry->count)
+        {
+            lo = mid + 1;
+        }
+        else
+        {
+            uint32_t offset = lba - entry->lba;
+            *psec = entry->psec + offset;
+            *mode = entry->mode;
+            return 1;
+        }
+    }
+#else
+    (void)lba;
+#endif
+    (void)psec;
+    (void)mode;
+    return 0;
+}
+
+#ifndef C4PRO_FTL_SKIP_RUNTIME_SCAN
 static void c4pro_ftl_record_hash_match(uint32_t psec, int lba, int mode)
 {
     int delta;
@@ -400,7 +672,7 @@ static void c4pro_ftl_record_signature_match(uint32_t psec,
                                              uint32_t sector_in_page,
                                              int mode)
 {
-    const unsigned char *data = page_data + sector_in_page * 512;
+    const unsigned char *data = page_data;
 
     if (c4pro_ftl_runtime_map[1] == C4PRO_FTL_PSEC_INVALID &&
         c4pro_ftl_sector_is_fat1(data, sector_in_page, mode))
@@ -430,14 +702,24 @@ static void c4pro_ftl_record_signature_match(uint32_t psec,
         }
     }
 }
+#endif
 
 static uint32_t c4pro_ftl_lba_to_psec(uint32_t lba)
 {
-    uint32_t psec = c4pro_ftl_runtime_map[lba];
+    unsigned char explicit_mode;
+    uint32_t psec;
     int inferred_psec;
 
+    if (c4pro_ftl_explicit_lookup(lba, &psec, &explicit_mode))
+        return psec;
+
+    psec = c4pro_ftl_runtime_map[lba];
     if (psec != C4PRO_FTL_PSEC_INVALID)
         return psec;
+
+#ifdef C4PRO_FTL_STRICT_READ_TEST
+    return C4PRO_FTL_PSEC_INVALID;
+#endif
 
     inferred_psec = (int)lba + c4pro_ftl_diag_hash_best_delta;
     if (c4pro_ftl_diag_hash_best_delta_count >= 16 &&
@@ -451,17 +733,178 @@ static uint32_t c4pro_ftl_lba_to_psec(uint32_t lba)
 
 static unsigned char c4pro_ftl_lba_mode(uint32_t lba)
 {
+    unsigned char mode;
+    uint32_t psec;
+
+    if (c4pro_ftl_explicit_lookup(lba, &psec, &mode))
+        return mode;
+
     if (c4pro_ftl_runtime_map[lba] != C4PRO_FTL_PSEC_INVALID)
         return c4pro_ftl_runtime_mode[lba];
 
     return C4PRO_FTL_MODE_RAW;
 }
 
+#ifdef C4PRO_FTL_SYNTH_AUDIT
+static uint32_t c4pro_ftl_read32be(const unsigned char *data)
+{
+    return ((uint32_t)data[0] << 24) |
+           ((uint32_t)data[1] << 16) |
+           ((uint32_t)data[2] << 8) |
+           (uint32_t)data[3];
+}
+
+void c4pro_ftl_synth_audit(void)
+{
+    c4pro_ftl_audit_total = 0;
+    c4pro_ftl_audit_ok = 0;
+    c4pro_ftl_audit_missing = 0;
+    c4pro_ftl_audit_bad = 0;
+    c4pro_ftl_audit_first_lba = -1;
+    c4pro_ftl_audit_first_psec = -1;
+    c4pro_ftl_audit_first_mode = -1;
+    c4pro_ftl_audit_first_expected = -1;
+    c4pro_ftl_audit_first_actual = -1;
+
+#ifdef C4PRO_FTL_SYNTH_SECTOR_COUNT
+    for (int i = 0; i < C4PRO_FTL_SYNTH_SECTOR_COUNT; i++)
+    {
+        uint32_t lba = c4pro_ftl_synth_entries[i].lba;
+        const unsigned char *expected;
+        uint32_t psec;
+        uint32_t page;
+        uint32_t sector_in_page;
+        unsigned char mode;
+        unsigned char actual[512];
+        int offset;
+        int same = 1;
+
+        if (lba < C4PRO_FTL_AUDIT_START_LBA ||
+            lba >= C4PRO_FTL_AUDIT_START_LBA + C4PRO_FTL_AUDIT_SECTORS)
+            continue;
+
+        c4pro_ftl_audit_total++;
+        offset = c4pro_ftl_synth_lookup(lba);
+        if (offset < 0)
+            continue;
+        expected = c4pro_ftl_synth_data + offset;
+        psec = c4pro_ftl_lba_to_psec(lba);
+
+        if (psec == C4PRO_FTL_PSEC_INVALID)
+        {
+            c4pro_ftl_audit_missing++;
+            if (c4pro_ftl_audit_first_lba < 0)
+            {
+                c4pro_ftl_audit_first_lba = (int)lba;
+                c4pro_ftl_audit_first_expected =
+                    (int)c4pro_ftl_read32be(expected);
+            }
+            continue;
+        }
+
+        page = psec / C4PRO_SECTORS_PER_PAGE;
+        sector_in_page = psec & (C4PRO_SECTORS_PER_PAGE - 1);
+        if (c4pro_nand_read_sector(0, page, sector_in_page,
+                                   page_data, page_spare))
+        {
+            c4pro_ftl_audit_missing++;
+            if (c4pro_ftl_audit_first_lba < 0)
+            {
+                c4pro_ftl_audit_first_lba = (int)lba;
+                c4pro_ftl_audit_first_psec = (int)psec;
+                c4pro_ftl_audit_first_expected =
+                    (int)c4pro_ftl_read32be(expected);
+            }
+            continue;
+        }
+
+        mode = c4pro_ftl_lba_mode(lba);
+        for (int byte = 0; byte < 512; byte++)
+            actual[byte] = c4pro_ftl_sector_byte(
+                page_data, sector_in_page, mode, byte);
+
+        for (int byte = 0; byte < 512; byte++)
+        {
+            if (actual[byte] != expected[byte])
+            {
+                same = 0;
+                break;
+            }
+        }
+
+        if (same)
+        {
+            c4pro_ftl_audit_ok++;
+        }
+        else
+        {
+            c4pro_ftl_audit_bad++;
+            if (c4pro_ftl_audit_first_lba < 0)
+            {
+                c4pro_ftl_audit_first_lba = (int)lba;
+                c4pro_ftl_audit_first_psec = (int)psec;
+                c4pro_ftl_audit_first_mode = mode;
+                c4pro_ftl_audit_first_expected =
+                    (int)c4pro_ftl_read32be(expected);
+                c4pro_ftl_audit_first_actual =
+                    (int)c4pro_ftl_read32be(actual);
+            }
+        }
+    }
+#endif
+}
+#endif
+
+#ifdef C4PRO_FTL_LBA_DIAG
+static void c4pro_ftl_update_lba_diag(void)
+{
+    static const uint32_t lbas[4] =
+    {
+        C4PRO_FTL_LBA_DIAG0,
+        C4PRO_FTL_LBA_DIAG1,
+        C4PRO_FTL_LBA_DIAG2,
+        C4PRO_FTL_LBA_DIAG3,
+    };
+
+    for (int i = 0; i < 4; i++)
+    {
+        uint32_t lba = lbas[i];
+        uint32_t psec = C4PRO_FTL_PSEC_INVALID;
+        int inferred = -1;
+
+        c4pro_ftl_diag_probe_lba[i] = (int)lba;
+        c4pro_ftl_diag_probe_psec[i] = -1;
+        c4pro_ftl_diag_probe_inferred[i] = -1;
+        c4pro_ftl_diag_probe_mode[i] = -1;
+        c4pro_ftl_diag_probe_synth[i] = 0;
+
+        if (lba >= C4PRO_SYSTEM_SECTORS)
+            continue;
+
+        psec = c4pro_ftl_runtime_map[lba];
+        if (psec != C4PRO_FTL_PSEC_INVALID)
+        {
+            c4pro_ftl_diag_probe_psec[i] = (int)psec;
+            c4pro_ftl_diag_probe_mode[i] = c4pro_ftl_runtime_mode[lba];
+        }
+
+#ifdef C4PRO_FTL_SYNTH_SECTOR_COUNT
+        c4pro_ftl_diag_probe_synth[i] = c4pro_ftl_synth_lookup(lba) >= 0;
+#endif
+        inferred = (int)lba + c4pro_ftl_diag_hash_best_delta;
+        if (c4pro_ftl_diag_hash_best_delta_count >= 16 &&
+            inferred >= (int)C4PRO_FTL_HASH_SCAN_START &&
+            inferred < (int)(C4PRO_FTL_HASH_SCAN_START +
+                             C4PRO_FTL_HASH_SCAN_SECTORS))
+            c4pro_ftl_diag_probe_inferred[i] = inferred;
+    }
+}
+#endif
+
 static void c4pro_ftl_build_hash_map(void)
 {
     uint32_t start = C4PRO_FTL_HASH_SCAN_START;
     uint32_t end = start + C4PRO_FTL_HASH_SCAN_SECTORS;
-    uint32_t cached_page = 0xffffffff;
 
     c4pro_ftl_diag_hash_mapped = 0;
     c4pro_ftl_diag_hash_dupes = 0;
@@ -499,42 +942,45 @@ static void c4pro_ftl_build_hash_map(void)
     }
     memset(c4pro_ftl_delta_counts, 0, sizeof(c4pro_ftl_delta_counts));
 
+#ifndef C4PRO_FTL_SKIP_RUNTIME_SCAN
     for (uint32_t psec = start; psec < end; psec++)
     {
         uint32_t page = psec / C4PRO_SECTORS_PER_PAGE;
         uint32_t sector_in_page = psec & (C4PRO_SECTORS_PER_PAGE - 1);
         int lba;
 
-        if (page != cached_page)
-        {
-            if (nand_read_page(0, page, page_data, page_spare, 1, 0))
-                continue;
-            cached_page = page;
-        }
+        if (c4pro_nand_read_sector(0, page, sector_in_page,
+                                   page_data, page_spare))
+            continue;
 
-        lba = c4pro_ftl_hash_lookup(
-            c4pro_ftl_hash_sector(page_data + sector_in_page * 512));
+        lba = c4pro_ftl_hash_lookup(c4pro_ftl_hash_sector(page_data));
         c4pro_ftl_record_hash_match(psec, lba, C4PRO_FTL_MODE_RAW);
         c4pro_ftl_record_signature_match(psec, sector_in_page,
                                          C4PRO_FTL_MODE_RAW);
 
 #ifdef C4PRO_FTL_HASH_HAS_RK27_KEYS
         lba = c4pro_ftl_hash_lookup(
-            c4pro_ftl_hash_sector_xor(page_data + sector_in_page * 512,
-                                      c4pro_rk27_sector_key));
+            c4pro_ftl_hash_sector_xor(page_data, c4pro_rk27_sector_key));
         c4pro_ftl_record_hash_match(psec, lba, C4PRO_FTL_MODE_SECDEC);
         c4pro_ftl_record_signature_match(psec, sector_in_page,
                                          C4PRO_FTL_MODE_SECDEC);
 
         lba = c4pro_ftl_hash_lookup(
             c4pro_ftl_hash_sector_xor(
-                page_data + sector_in_page * 512,
-                c4pro_rk27_page_key + sector_in_page * 512));
+                page_data, c4pro_rk27_page_key + sector_in_page * 512));
         c4pro_ftl_record_hash_match(psec, lba, C4PRO_FTL_MODE_PAGEDEC);
         c4pro_ftl_record_signature_match(psec, sector_in_page,
                                          C4PRO_FTL_MODE_PAGEDEC);
 #endif
     }
+#else
+    (void)start;
+    (void)end;
+#endif
+
+#ifdef C4PRO_FTL_LBA_DIAG
+    c4pro_ftl_update_lba_diag();
+#endif
 }
 
 #undef C4PRO_FTL_LBA_TO_PSEC
@@ -569,7 +1015,6 @@ uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
 {
 #ifdef COLORFLY_C4_PRO
     unsigned char *out = buffer;
-    uint32_t cached_page = 0xffffffff;
 
     if (sector > C4PRO_SYSTEM_SECTORS ||
         count > C4PRO_SYSTEM_SECTORS - sector)
@@ -577,6 +1022,16 @@ uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
 
     while (count > 0)
     {
+#ifdef C4PRO_FTL_DIAG_EXPORT
+        if (sector == C4PRO_FTL_DIAG_EXPORT_LBA)
+        {
+            c4pro_ftl_read_diag_export(out);
+            out += 512;
+            sector++;
+            count--;
+            continue;
+        }
+#endif
         uint32_t psec = C4PRO_FTL_LBA_TO_PSEC(sector);
         uint32_t page;
         uint32_t sector_in_page;
@@ -594,11 +1049,27 @@ uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
             continue;
         }
 #endif
+#ifdef C4PRO_FTL_PROC_WAV_TEST
+        if (c4pro_ftl_proc_wav_lookup(sector))
+        {
+            c4pro_ftl_proc_wav_sector(sector, out);
+            out += 512;
+            sector++;
+            count--;
+            continue;
+        }
+#endif
 #ifdef C4PRO_FTL_SYNTH_SECTOR_COUNT
         int synth_offset;
 
         synth_offset = c4pro_ftl_synth_lookup(sector);
-        if (synth_offset >= 0)
+        if (synth_offset >= 0
+#if defined(C4PRO_FTL_SYNTH_COMPARE_ONLY) && \
+    defined(C4PRO_FTL_AUDIT_START_LBA) && defined(C4PRO_FTL_AUDIT_SECTORS)
+            && (sector < C4PRO_FTL_AUDIT_START_LBA ||
+                sector >= C4PRO_FTL_AUDIT_START_LBA + C4PRO_FTL_AUDIT_SECTORS)
+#endif
+        )
         {
             memcpy(out, c4pro_ftl_synth_data + synth_offset, 512);
             out += 512;
@@ -614,13 +1085,9 @@ uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
         page = psec / C4PRO_SECTORS_PER_PAGE;
         sector_in_page = psec & (C4PRO_SECTORS_PER_PAGE - 1);
 
-        if (page != cached_page)
-        {
-            if (nand_read_page(0, page, page_data, page_spare, 1, 0))
-                return 1;
-
-            cached_page = page;
-        }
+        if (c4pro_nand_read_sector(0, page, sector_in_page,
+                                   page_data, page_spare))
+            return 1;
 
 #ifdef C4PRO_FTL_HASH_ORACLE
         mode = c4pro_ftl_lba_mode(sector);
@@ -628,22 +1095,21 @@ uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
         if (mode == C4PRO_FTL_MODE_SECDEC)
         {
             for (int i = 0; i < 512; i++)
-                out[i] = page_data[sector_in_page * 512 + i] ^
-                         c4pro_rk27_sector_key[i];
+                out[i] = page_data[i] ^ c4pro_rk27_sector_key[i];
         }
         else if (mode == C4PRO_FTL_MODE_PAGEDEC)
         {
             const unsigned char *key =
                 c4pro_rk27_page_key + sector_in_page * 512;
             for (int i = 0; i < 512; i++)
-                out[i] = page_data[sector_in_page * 512 + i] ^ key[i];
+                out[i] = page_data[i] ^ key[i];
         }
         else
 #endif
 #endif
         {
             (void)mode;
-            memcpy(out, page_data + sector_in_page * 512, 512);
+            memcpy(out, page_data, 512);
         }
         out += 512;
         sector++;

@@ -28,6 +28,10 @@
 #include "core_alloc.h"
 #include "sound.h"
 #include "pcm_sink.h"
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
+#include "pcm-internal.h"
+#endif
 #include "codecs.h"
 #include "codec_thread.h"
 #include "voice_thread.h"
@@ -81,9 +85,14 @@
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_PLAYBACK_DIAG)
-#define C4PRO_PLAYBACK_DIAG_HOLD (2 * HZ)
+#ifndef C4PRO_PLAYBACK_DIAG_HOLD_SECONDS
+#define C4PRO_PLAYBACK_DIAG_HOLD_SECONDS 2
+#endif
+#define C4PRO_PLAYBACK_DIAG_HOLD (C4PRO_PLAYBACK_DIAG_HOLD_SECONDS * HZ)
 extern volatile int c4pro_codec_diag_pcm_count;
 extern volatile int c4pro_codec_diag_run_state;
+extern volatile int c4pro_codec_diag_filesize_kb;
+extern volatile int c4pro_codec_diag_curpos_kb;
 extern volatile int c4pro_pcm_diag_starts;
 extern volatile int c4pro_pcm_diag_irqs;
 extern volatile int c4pro_pcm_diag_stops;
@@ -103,6 +112,11 @@ extern volatile int c4pro_mix_diag_status;
 
 static void c4pro_playback_diag(const char *where, int a, int b)
 {
+#ifdef C4PRO_PLAYBACK_DIAG_FINAL_ONLY
+    if (strcmp(where, "codec complete") && strcmp(where, "codec pos"))
+        return;
+#endif
+
     lcd_setfont(FONT_SYSFIXED);
     lcd_clear_display();
     lcd_puts(0, 0, "C4 PLAYBACK DIAG");
@@ -117,6 +131,14 @@ static void c4pro_playback_diag(const char *where, int a, int b)
 static void c4pro_playback_diag_path(const char *where, const char *path,
                                      int a, int b)
 {
+#ifdef C4PRO_PLAYBACK_DIAG_FINAL_ONLY
+    (void)where;
+    (void)path;
+    (void)a;
+    (void)b;
+    return;
+#endif
+
     lcd_setfont(FONT_SYSFIXED);
     lcd_clear_display();
     lcd_puts(0, 0, "C4 PLAYBACK DIAG");
@@ -472,6 +494,7 @@ enum audio_start_playback_flags
 static void audio_start_playback(const struct audio_resume_info *resume_info,
                                  unsigned int flags);
 static void audio_stop_playback(void);
+static void audio_monitor_end_of_playlist(void);
 static void buffer_event_buffer_low_callback(unsigned short id, void *data, void *user_data);
 static void buffer_event_rebuffer_callback(unsigned short id, void *data);
 static void buffer_event_finished_callback(unsigned short id, void *data);
@@ -3139,6 +3162,8 @@ static void audio_on_codec_complete(int status)
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_PLAYBACK_DIAG)
     c4pro_playback_diag("codec complete", status, c4pro_codec_diag_pcm_count);
+    c4pro_playback_diag("codec pos", c4pro_codec_diag_filesize_kb,
+                        c4pro_codec_diag_curpos_kb);
     c4pro_playback_diag_mix_summary();
     c4pro_playback_diag_pcm_summary();
 #endif
@@ -3175,6 +3200,22 @@ static void audio_on_codec_complete(int status)
     }
 
     codec_skip_pending = false;
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
+    if (status == CODEC_OK)
+    {
+        long timeout = current_tick + 12 * HZ;
+
+        while (pcm_is_playing() && TIME_BEFORE(current_tick, timeout))
+        {
+            sleep(HZ / 20);
+        }
+
+        audio_monitor_end_of_playlist();
+        return;
+    }
+#endif
 
     int trackstat = LOAD_TRACK_OK;
 
@@ -4501,13 +4542,6 @@ static unsigned long audio_guess_frequency(struct mp3entry *id3)
 
 static bool audio_auto_change_frequency(struct mp3entry *id3, bool play)
 {
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
-    (void)id3;
-    (void)play;
-    return false;
-#endif
-
     if (!valid_mp3entry(id3))
         return false;
     unsigned long guessed_frequency = global_settings.play_frequency == 0 ? audio_guess_frequency(id3) : 0;

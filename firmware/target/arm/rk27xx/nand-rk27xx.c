@@ -630,36 +630,72 @@ uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
     unsigned i;
     unsigned char *data = databuffer;
     unsigned char *spare = sparebuffer;
-    static unsigned char page_data[4096];
-    static unsigned char page_spare[128];
-    static uint32_t cache_bank = 0xffffffff;
-    static uint32_t cache_page = 0xffffffff;
-    bool cache_hit = (cache_bank == bank && cache_page == page);
+    uint32_t column;
+    uint32_t spare_column;
 
     if (bank > 3 || sector >= 8 || (!data && !spare))
         return 1;
 
-    if (!cache_hit)
-    {
-        if (nand_read_page(bank, page, page_data, page_spare, 1, 0))
-            return 1;
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
 
-        cache_bank = bank;
-        cache_page = page;
+    nand_select(bank);
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
     }
 
     if (data)
     {
+        column = sector * 538;
+
+        FLASH_CMD(bank) = 0x00;
+        FLASH_ADDR(bank) = column & 0xff;
+        FLASH_ADDR(bank) = (column >> 8) & 0xff;
+        FLASH_ADDR(bank) = page & 0xff;
+        FLASH_ADDR(bank) = (page >> 8) & 0xff;
+        FLASH_ADDR(bank) = (page >> 16) & 0xff;
+        FLASH_CMD(bank) = 0x30;
+
+        nand_delay();
+        if (!nand_wait_ready())
+        {
+            nand_deselect();
+            return 1;
+        }
+
         for (i = 0; i < 512; i++)
-            data[i] = page_data[sector * 512 + i];
+            data[i] = FLASH_DATA(bank);
     }
 
     if (spare)
     {
+        spare_column = 4096 + sector * 16;
+
+        FLASH_CMD(bank) = 0x00;
+        FLASH_ADDR(bank) = spare_column & 0xff;
+        FLASH_ADDR(bank) = (spare_column >> 8) & 0xff;
+        FLASH_ADDR(bank) = page & 0xff;
+        FLASH_ADDR(bank) = (page >> 8) & 0xff;
+        FLASH_ADDR(bank) = (page >> 16) & 0xff;
+        FLASH_CMD(bank) = 0x30;
+
+        nand_delay();
+        if (!nand_wait_ready())
+        {
+            nand_deselect();
+            return 1;
+        }
+
         for (i = 0; i < 16; i++)
-            spare[i] = page_spare[sector * 16 + i];
+            spare[i] = FLASH_DATA(bank);
     }
 
+    nand_deselect();
+    last_activity = current_tick;
     return 0;
 }
 #endif

@@ -106,7 +106,11 @@ static unsigned int c4pro_clockgen_word(int fsel)
     case HW_FREQ_32: return 0x0014;
 #endif
 #ifdef HW_HAVE_44
-    case HW_FREQ_44: return 0x0001;
+#ifdef C4PRO_CLOCKGEN_44_WORD
+    case HW_FREQ_44: return C4PRO_CLOCKGEN_44_WORD;
+#else
+    case HW_FREQ_44: return 0x0005;
+#endif
 #endif
 #ifdef HW_HAVE_48
     case HW_FREQ_48: return 0x0005;
@@ -279,6 +283,10 @@ void audiohw_set_frequency(int fsel)
 
 void audiohw_set_volume(int vol_l, int vol_r)
 {
+#if defined(C4PRO_SELECTED_ONLY_PLAYBACK_TEST)
+    vol_l = CS4398_VOLUME_MAX;
+    vol_r = CS4398_VOLUME_MAX;
+#endif
 #ifdef HAVE_SW_VOLUME_CONTROL
     pcm_set_master_volume(0, 0);
 #endif

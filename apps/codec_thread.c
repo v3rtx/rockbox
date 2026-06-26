@@ -39,6 +39,8 @@
     defined(C4PRO_PLAYBACK_DIAG)
 volatile int c4pro_codec_diag_pcm_count;
 volatile int c4pro_codec_diag_run_state;
+volatile int c4pro_codec_diag_filesize_kb;
+volatile int c4pro_codec_diag_curpos_kb;
 #endif
 
 /* Define LOGF_ENABLE to enable logf output in this file */
@@ -557,6 +559,8 @@ static void run_codec(void)
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_PLAYBACK_DIAG)
     c4pro_codec_diag_run_state = status;
+    c4pro_codec_diag_filesize_kb = (int)(ci.filesize / 1024);
+    c4pro_codec_diag_curpos_kb = (int)(ci.curpos / 1024);
 #endif
 
     if (!encoder)

@@ -33,7 +33,8 @@
 static int locked = 0;
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_PLAYBACK_DIAG)
+    (defined(C4PRO_PLAYBACK_DIAG) || defined(C4PRO_PCM_DMA_TONE_SUBST))
+#if defined(C4PRO_PLAYBACK_DIAG)
 volatile int c4pro_pcm_diag_starts;
 volatile int c4pro_pcm_diag_irqs;
 volatile int c4pro_pcm_diag_stops;
@@ -46,6 +47,7 @@ volatile int c4pro_pcm_diag_peak;
 volatile int c4pro_pcm_diag_peak_max;
 volatile int c4pro_pcm_diag_first_l;
 volatile int c4pro_pcm_diag_first_r;
+#endif
 
 #if defined(C4PRO_PCM_DMA_TONE_SUBST)
 static int16_t c4pro_pcm_diag_tone[4096] __attribute__((aligned(4)));
@@ -135,7 +137,7 @@ static void hdma_i2s_transfer(const void *addr, size_t size)
 #endif
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_PLAYBACK_DIAG) && defined(C4PRO_PCM_DMA_TONE_SUBST)
+    defined(C4PRO_PCM_DMA_TONE_SUBST)
     c4pro_pcm_diag_tone_init();
     addr = c4pro_pcm_diag_tone;
     size = sizeof(c4pro_pcm_diag_tone);
