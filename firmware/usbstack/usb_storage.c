@@ -911,6 +911,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
     switch (cbw->command_block[0]) {
         case SCSI_TEST_UNIT_READY:
             logf("scsi test_unit_ready %d",lun);
+#if !(defined(COLORFLY_C4_PRO) && defined(C4PRO_USB_MSC_ENABLE))
             if(!usb_exclusive_storage()) {
                 send_csw(UMS_STATUS_FAIL);
                 cur_sense_data.sense_key=SENSE_NOT_READY;
@@ -918,6 +919,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                 cur_sense_data.ascq=0;
                 break;
             }
+#endif
             if(lun_present) {
                 send_csw(UMS_STATUS_GOOD);
             }

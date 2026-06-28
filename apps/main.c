@@ -3867,11 +3867,18 @@ int main(void)
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_diag_enter_storage_mode();
+    c4pro_usb_diag_force_reattach();
+    sleep(2 * HZ);
     c4pro_usb_diag_force_storage_config();
     c4pro_usb_msc_settle_storage();
 #ifdef C4PRO_USB_MSC_STATUS
     c4pro_show_usb_msc_status();
 #endif
+    while (usb_detect() == USB_INSERTED)
+    {
+        c4pro_usb_msc_settle_storage();
+        sleep(HZ);
+    }
 #endif
 #endif
 
@@ -4359,6 +4366,12 @@ static void init(void)
     c4pro_show_ftl_synth_audit();
 #endif
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_APP_SYSTEM_INSTALLER) && \
+    defined(C4PRO_APP_NATIVE_ROCKBOX_INSTALLER)
+    c4pro_app_native_rockbox_installer();
+#endif
+
 #if defined(NEED_ATA_POWER_BATT_MEASURE) && \
     (CONFIG_CHARGING <= CHARGING_MONITOR)
     /* After storage_init(), ATA power must be on, so battery voltage
@@ -4591,12 +4604,11 @@ static void init(void)
     defined(C4PRO_APP_SYSTEM_INSTALLER)
 #ifdef C4PRO_APP_LOADPATH_CORRUPTOR
     c4pro_app_loadpath_corruptor();
-#elif defined(C4PRO_APP_NATIVE_ROCKBOX_INSTALLER)
-    c4pro_app_native_rockbox_installer();
 #elif defined(C4PRO_APP_BOOT_INSTALLER)
     c4pro_app_boot_installer();
-#else
+#elif !defined(C4PRO_APP_NATIVE_ROCKBOX_INSTALLER)
     c4pro_app_system_installer();
+#else
 #endif
 #endif
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
