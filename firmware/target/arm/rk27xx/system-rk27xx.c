@@ -84,6 +84,18 @@ static const char * const irqname[] =
 static void UIRQ(void)
 {
     unsigned int offset = INTC_ISR & 0x1f;
+
+    /* The RK27xx interrupt controller reports source 0x1f (INT_SW_INT3, which
+     * nothing in this port enables) when the interrupt that asserted the IRQ
+     * line has already deasserted by the time the handler reads INTC_ISR. This
+     * spurious read happens under heavy concurrent IRQ load - e.g. sustained
+     * USB mass-storage writes alongside audio (HDMA) and timer interrupts - and
+     * is harmless. Ignore it instead of panicking; the dispatcher clears the
+     * (already inactive) source on return. Genuine unhandled sources at other
+     * indices still panic so real bugs stay visible. */
+    if (offset == 0x1f)
+        return;
+
     panicf("Unhandled IRQ %02X: %s", offset, irqname[offset]);
 }
 
