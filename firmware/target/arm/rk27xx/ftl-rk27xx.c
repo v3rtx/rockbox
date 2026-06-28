@@ -1001,10 +1001,6 @@ static void c4pro_ftl_build_hash_map(void)
 #define C4OWN_SECTORS_PER_BLOCK 1024u
 #define C4OWN_PAYLOAD_SECTORS_PER_BLOCK \
     ((C4OWN_PAGES_PER_BLOCK - 2u) * C4OWN_SECTORS_PER_PAGE)
-#define C4OWN_VOLUME_SECTORS 131072u
-#define C4OWN_LOGICAL_BLOCKS \
-    ((C4OWN_VOLUME_SECTORS + C4OWN_PAYLOAD_SECTORS_PER_BLOCK - 1u) / \
-     C4OWN_PAYLOAD_SECTORS_PER_BLOCK)
 #define C4OWN_FIRST_DATA_PBLK 2u
 
 #ifndef C4PRO_OWNED_PBLK_START
@@ -1015,8 +1011,32 @@ static void c4pro_ftl_build_hash_map(void)
 #define C4PRO_OWNED_PBLK_COUNT 160u
 #endif
 
+#ifndef C4PRO_OWNED_VOLUME_SECTORS_MAX
+/* Keep two superblocks plus two spare/rotation blocks outside the exposed
+ * logical volume. The native build can override this when a smaller test
+ * volume is wanted.
+ */
+#define C4PRO_OWNED_VOLUME_SECTORS_MAX \
+    ((C4PRO_OWNED_PBLK_COUNT - C4OWN_FIRST_DATA_PBLK - 2u) * \
+     C4OWN_PAYLOAD_SECTORS_PER_BLOCK)
+#endif
+
+#define C4OWN_VOLUME_SECTORS c4own_volume_sectors()
+#define C4OWN_RUNTIME_PBLK_COUNT c4own_runtime_pblk_count()
+#define C4OWN_LOGICAL_BLOCKS \
+    ((C4PRO_OWNED_VOLUME_SECTORS_MAX + C4OWN_PAYLOAD_SECTORS_PER_BLOCK - 1u) / \
+     C4OWN_PAYLOAD_SECTORS_PER_BLOCK)
+#define C4OWN_PARTITION_START 2048u
+#define C4OWN_PARTITION_SECTORS (C4OWN_VOLUME_SECTORS - C4OWN_PARTITION_START)
+#define C4OWN_IS_FAT32 (C4PRO_OWNED_VOLUME_SECTORS_MAX > 1048576u)
+#define C4OWN_FAT32_SECTORS_PER_CLUSTER 8u
+#define C4OWN_FAT32_RESERVED_SECTORS 32u
+#define C4OWN_FAT32_FAT_SECTORS \
+    (((C4OWN_PARTITION_SECTORS / C4OWN_FAT32_SECTORS_PER_CLUSTER) + 127u) / \
+     128u + 16u)
+
 #if C4OWN_LOGICAL_BLOCKS + C4OWN_FIRST_DATA_PBLK + 2u > C4PRO_OWNED_PBLK_COUNT
-#error "C4PRO_OWNED_PBLK_COUNT is too small for the 64 MiB owned FTL"
+#error "C4PRO_OWNED_PBLK_COUNT is too small for the requested owned FTL volume"
 #endif
 
 static uint16_t c4own_map[C4OWN_LOGICAL_BLOCKS];
@@ -1061,6 +1081,33 @@ static uint32_t c4own_get32(const unsigned char *p)
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static uint32_t c4own_runtime_pblk_count(void)
+{
+    uint32_t max_pblk;
+
+    if (!ftl_nand_type || ftl_banks == 0)
+        return 0;
+
+    max_pblk = ftl_banks * ftl_nand_type->blocks;
+    if (max_pblk <= C4PRO_OWNED_PBLK_START)
+        return 0;
+
+    max_pblk -= C4PRO_OWNED_PBLK_START;
+    return max_pblk < C4PRO_OWNED_PBLK_COUNT ?
+           max_pblk : C4PRO_OWNED_PBLK_COUNT;
+}
+
+static uint32_t c4own_volume_sectors(void)
+{
+    uint32_t pblk_count = c4own_runtime_pblk_count();
+
+    if (pblk_count <= C4OWN_FIRST_DATA_PBLK + 2u)
+        return 0;
+
+    return (pblk_count - C4OWN_FIRST_DATA_PBLK - 2u) *
+           C4OWN_PAYLOAD_SECTORS_PER_BLOCK;
+}
+
 static void c4own_put16(unsigned char *p, uint32_t v)
 {
     p[0] = v & 0xff;
@@ -1090,14 +1137,26 @@ static uint32_t c4own_crc32(const void *buf, uint32_t len)
     return crc ^ 0xffffffffu;
 }
 
+static uint32_t c4own_abs_pblk(uint32_t pblk)
+{
+    return C4PRO_OWNED_PBLK_START + pblk;
+}
+
+static uint32_t c4own_pblk_bank(uint32_t pblk)
+{
+    return c4own_abs_pblk(pblk) / ftl_nand_type->blocks;
+}
+
 static uint32_t c4own_pblk_page(uint32_t pblk)
 {
-    return (C4PRO_OWNED_PBLK_START + pblk) * C4OWN_PAGES_PER_BLOCK;
+    return (c4own_abs_pblk(pblk) % ftl_nand_type->blocks) *
+           C4OWN_PAGES_PER_BLOCK;
 }
 
 static bool c4own_pblk_valid(uint32_t pblk)
 {
-    return pblk < C4PRO_OWNED_PBLK_COUNT;
+    return pblk < C4OWN_RUNTIME_PBLK_COUNT &&
+           c4own_pblk_bank(pblk) < ftl_banks;
 }
 
 static int c4own_read_phys_sector(uint32_t pblk, uint32_t sector, void *buf)
@@ -1110,7 +1169,8 @@ static int c4own_read_phys_sector(uint32_t pblk, uint32_t sector, void *buf)
     page = c4own_pblk_page(pblk) + sector / C4OWN_SECTORS_PER_PAGE;
     if (!c4own_read_page_valid || c4own_read_page != page)
     {
-        if (c4pro_nand_read_linear_page(0, page, c4own_read_page_data))
+        if (c4pro_nand_read_linear_page(c4own_pblk_bank(pblk), page,
+                                        c4own_read_page_data))
             return 1;
 
         c4own_read_page = page;
@@ -1130,7 +1190,7 @@ static int c4own_read_phys_sector_uncached(uint32_t pblk, uint32_t sector,
         return 1;
 
     return c4pro_nand_read_linear_sector(
-        0,
+        c4own_pblk_bank(pblk),
         c4own_pblk_page(pblk) + sector / C4OWN_SECTORS_PER_PAGE,
         sector & (C4OWN_SECTORS_PER_PAGE - 1u),
         buf);
@@ -1143,7 +1203,8 @@ static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
 
     c4own_read_page_valid = false;
     memset(c4own_page_spare, 0xff, sizeof(c4own_page_spare));
-    return c4pro_nand_write_page(0, c4own_pblk_page(pblk) + page_in_block,
+    return c4pro_nand_write_page(c4own_pblk_bank(pblk),
+                                 c4own_pblk_page(pblk) + page_in_block,
                                  c4own_page_data, c4own_page_spare);
 }
 
@@ -1153,7 +1214,7 @@ static int c4own_erase_pblk(uint32_t pblk)
         return 1;
 
     c4own_read_page_valid = false;
-    return c4pro_nand_erase_block(0, c4own_pblk_page(pblk));
+    return c4pro_nand_erase_block(c4own_pblk_bank(pblk), c4own_pblk_page(pblk));
 }
 
 static void c4own_make_header(uint32_t logical, uint32_t gen)
@@ -1238,7 +1299,7 @@ static bool c4own_superblock_valid(uint32_t pblk)
            c4own_get32(sector + 4) == C4OWN_VERSION &&
            c4own_get32(sector + 8) == C4OWN_VOLUME_SECTORS &&
            c4own_get32(sector + 12) == C4PRO_OWNED_PBLK_START &&
-           c4own_get32(sector + 16) == C4PRO_OWNED_PBLK_COUNT &&
+           c4own_get32(sector + 16) == C4OWN_RUNTIME_PBLK_COUNT &&
            c4own_get32(sector + 20) == C4OWN_PAYLOAD_SECTORS_PER_BLOCK &&
            c4own_get32(sector + 28) == c4own_crc32(sector, 28);
 }
@@ -1253,7 +1314,7 @@ static int c4own_write_superblock(uint32_t pblk)
     c4own_put32(c4own_page_data + 4, C4OWN_VERSION);
     c4own_put32(c4own_page_data + 8, C4OWN_VOLUME_SECTORS);
     c4own_put32(c4own_page_data + 12, C4PRO_OWNED_PBLK_START);
-    c4own_put32(c4own_page_data + 16, C4PRO_OWNED_PBLK_COUNT);
+    c4own_put32(c4own_page_data + 16, C4OWN_RUNTIME_PBLK_COUNT);
     c4own_put32(c4own_page_data + 20, C4OWN_PAYLOAD_SECTORS_PER_BLOCK);
     c4own_put32(c4own_page_data + 24, C4OWN_LOGICAL_BLOCKS);
     c4own_put32(c4own_page_data + 28, c4own_crc32(c4own_page_data, 28));
@@ -1271,7 +1332,7 @@ static int c4own_mount_scan(void)
         return 1;
 
     for (uint32_t pblk = C4OWN_FIRST_DATA_PBLK;
-         pblk < C4PRO_OWNED_PBLK_COUNT; pblk++)
+         pblk < C4OWN_RUNTIME_PBLK_COUNT; pblk++)
     {
         uint32_t logical;
         uint32_t gen;
@@ -1309,7 +1370,7 @@ static int c4own_mount_scan(void)
 static int c4own_alloc_pblk(void)
 {
     for (uint32_t pblk = C4OWN_FIRST_DATA_PBLK;
-         pblk < C4PRO_OWNED_PBLK_COUNT; pblk++)
+         pblk < C4OWN_RUNTIME_PBLK_COUNT; pblk++)
     {
         if (!c4own_used[pblk] && !c4own_retired[pblk])
         {
@@ -1324,7 +1385,7 @@ static int c4own_alloc_pblk(void)
     }
 
     for (uint32_t pblk = C4OWN_FIRST_DATA_PBLK;
-         pblk < C4PRO_OWNED_PBLK_COUNT; pblk++)
+         pblk < C4OWN_RUNTIME_PBLK_COUNT; pblk++)
     {
         if (!c4own_used[pblk] && c4own_retired[pblk])
         {
@@ -1522,7 +1583,8 @@ static int c4own_read_internal(uint32_t sector, uint32_t count, void *buffer)
             {
                 page = c4own_pblk_page(c4own_map[logical]) +
                        phys_sector / C4OWN_SECTORS_PER_PAGE;
-                if (c4pro_nand_read_linear_page(0, page, out))
+                if (c4pro_nand_read_linear_page(c4own_pblk_bank(c4own_map[logical]),
+                                                page, out))
                     return 1;
 
                 c4own_read_page_valid = false;
@@ -1675,14 +1737,18 @@ static void c4own_make_mbr(unsigned char *s)
 {
     c4own_blank_sector(s);
     s[446] = 0x80;
+#if C4OWN_IS_FAT32
+    s[450] = 0x0c;
+#else
     s[450] = 0x06;
-    c4own_put32(s + 454, 2048u);
-    c4own_put32(s + 458, C4OWN_VOLUME_SECTORS - 2048u);
+#endif
+    c4own_put32(s + 454, C4OWN_PARTITION_START);
+    c4own_put32(s + 458, C4OWN_PARTITION_SECTORS);
     s[510] = 0x55;
     s[511] = 0xaa;
 }
 
-static void c4own_make_boot(unsigned char *s)
+static void c4own_make_fat16_boot(unsigned char *s)
 {
     static const unsigned char jmp[3] = { 0xeb, 0x3c, 0x90 };
 
@@ -1699,8 +1765,8 @@ static void c4own_make_boot(unsigned char *s)
     c4own_put16(s + 22, 128);
     c4own_put16(s + 24, 63);
     c4own_put16(s + 26, 255);
-    c4own_put32(s + 28, 2048u);
-    c4own_put32(s + 32, C4OWN_VOLUME_SECTORS - 2048u);
+    c4own_put32(s + 28, C4OWN_PARTITION_START);
+    c4own_put32(s + 32, C4OWN_PARTITION_SECTORS);
     s[36] = 0x80;
     s[38] = 0x29;
     c4own_put32(s + 39, 0xc4000001u);
@@ -1710,6 +1776,50 @@ static void c4own_make_boot(unsigned char *s)
     s[511] = 0xaa;
 }
 
+static void c4own_make_fat32_boot(unsigned char *s)
+{
+    static const unsigned char jmp[3] = { 0xeb, 0x58, 0x90 };
+
+    c4own_blank_sector(s);
+    memcpy(s, jmp, sizeof(jmp));
+    memcpy(s + 3, "MSDOS5.0", 8);
+    c4own_put16(s + 11, 512);
+    s[13] = C4OWN_FAT32_SECTORS_PER_CLUSTER;
+    c4own_put16(s + 14, C4OWN_FAT32_RESERVED_SECTORS);
+    s[16] = 2;
+    c4own_put16(s + 17, 0);
+    c4own_put16(s + 19, 0);
+    s[21] = 0xf8;
+    c4own_put16(s + 22, 0);
+    c4own_put16(s + 24, 63);
+    c4own_put16(s + 26, 255);
+    c4own_put32(s + 28, C4OWN_PARTITION_START);
+    c4own_put32(s + 32, C4OWN_PARTITION_SECTORS);
+    c4own_put32(s + 36, C4OWN_FAT32_FAT_SECTORS);
+    c4own_put16(s + 40, 0);
+    c4own_put16(s + 42, 0);
+    c4own_put32(s + 44, 2);
+    c4own_put16(s + 48, 1);
+    c4own_put16(s + 50, 6);
+    s[64] = 0x80;
+    s[66] = 0x29;
+    c4own_put32(s + 67, 0xc4000032u);
+    memcpy(s + 71, "C4 ROCKBOX ", 11);
+    memcpy(s + 82, "FAT32   ", 8);
+    s[510] = 0x55;
+    s[511] = 0xaa;
+}
+
+static void c4own_make_fat32_fsinfo(unsigned char *s)
+{
+    c4own_blank_sector(s);
+    c4own_put32(s + 0, 0x41615252u);
+    c4own_put32(s + 484, 0x61417272u);
+    c4own_put32(s + 488, 0xffffffffu);
+    c4own_put32(s + 492, 0xffffffffu);
+    c4own_put32(s + 508, 0xaa550000u);
+}
+
 static void c4own_make_fat0(unsigned char *s)
 {
     c4own_blank_sector(s);
@@ -1717,6 +1827,16 @@ static void c4own_make_fat0(unsigned char *s)
     s[1] = 0xff;
     s[2] = 0xff;
     s[3] = 0xff;
+#if C4OWN_IS_FAT32
+    s[4] = 0xff;
+    s[5] = 0xff;
+    s[6] = 0xff;
+    s[7] = 0x0f;
+    s[8] = 0xff;
+    s[9] = 0xff;
+    s[10] = 0xff;
+    s[11] = 0x0f;
+#endif
 }
 
 static int c4own_format(void)
@@ -1727,7 +1847,7 @@ static int c4own_format(void)
     c4own_formatting = true;
     c4own_reset_maps();
 
-    for (uint32_t pblk = 0; pblk < C4PRO_OWNED_PBLK_COUNT; pblk++)
+    for (uint32_t pblk = 0; pblk < C4OWN_RUNTIME_PBLK_COUNT; pblk++)
     {
         if (c4own_erase_pblk(pblk))
             c4own_retired[pblk] = 1;
@@ -1740,14 +1860,33 @@ static int c4own_format(void)
     if (c4own_write_internal(0, 1, sector))
         return 1;
 
-    c4own_make_boot(sector);
-    if (c4own_write_internal(2048u, 1, sector))
+#if C4OWN_IS_FAT32
+    c4own_make_fat32_boot(sector);
+    if (c4own_write_internal(C4OWN_PARTITION_START, 1, sector) ||
+        c4own_write_internal(C4OWN_PARTITION_START + 6u, 1, sector))
+        return 1;
+
+    c4own_make_fat32_fsinfo(sector);
+    if (c4own_write_internal(C4OWN_PARTITION_START + 1u, 1, sector) ||
+        c4own_write_internal(C4OWN_PARTITION_START + 7u, 1, sector))
         return 1;
 
     c4own_make_fat0(sector);
-    if (c4own_write_internal(2049u, 1, sector) ||
-        c4own_write_internal(2177u, 1, sector))
+    if (c4own_write_internal(C4OWN_PARTITION_START + C4OWN_FAT32_RESERVED_SECTORS,
+                             1, sector) ||
+        c4own_write_internal(C4OWN_PARTITION_START + C4OWN_FAT32_RESERVED_SECTORS +
+                             C4OWN_FAT32_FAT_SECTORS, 1, sector))
         return 1;
+#else
+    c4own_make_fat16_boot(sector);
+    if (c4own_write_internal(C4OWN_PARTITION_START, 1, sector))
+        return 1;
+
+    c4own_make_fat0(sector);
+    if (c4own_write_internal(C4OWN_PARTITION_START + 1u, 1, sector) ||
+        c4own_write_internal(C4OWN_PARTITION_START + 129u, 1, sector))
+        return 1;
+#endif
 
     if (c4own_flush_cache())
         return 1;
@@ -1768,6 +1907,16 @@ uint32_t ftl_init(void)
         return 1;
 
     ftl_banks = 1;
+    for (uint32_t bank = 1; bank < 4; bank++)
+    {
+        const struct nand_device_info_type *bank_type =
+            nand_get_device_type(bank);
+
+        if (bank_type == ftl_nand_type)
+            ftl_banks++;
+        else if (bank_type)
+            break;
+    }
 #ifdef COLORFLY_C4_PRO
 #ifdef C4PRO_FTL_ROCKBOX_OWNED_RW
     if (c4own_mount_scan())

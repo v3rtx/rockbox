@@ -126,7 +126,6 @@ static int flash_delay(int n)
     return cnt;
 }
 
-
 static void flash_wait_busy(void)
 {
     unsigned int i;
@@ -262,7 +261,6 @@ void flash_init(void)
             flash_spec[i].large = 1;
             if (j == 2)
                 flash_spec[i].five = 0;
-
 
             /* cell type */
             flash_spec[i].mlc = (buff[2] >> 2) & 0x03;
@@ -539,70 +537,6 @@ static bool nand_read_id(uint32_t bank, unsigned char id[5])
     return true;
 }
 
-#ifdef COLORFLY_C4_PRO
-static bool nand_read_id_window(uint32_t bank, uint32_t window,
-                                unsigned char id[5])
-{
-    int i;
-
-    if (bank > 3 || window > 3)
-        return false;
-
-    FMWAIT = 0x1081;
-    FLCTL = FL_RST;
-
-    nand_select(bank);
-    FLASH_CMD(window) = 0xff;
-    nand_delay();
-
-    if (!nand_wait_ready())
-    {
-        nand_deselect();
-        return false;
-    }
-
-    FLASH_CMD(window) = 0x90;
-    FLASH_ADDR(window) = 0x00;
-
-    for (i = 0; i < 5; i++)
-        id[i] = FLASH_DATA(window);
-
-    nand_deselect();
-    return true;
-}
-
-static bool nand_read_id_mask(uint32_t mask, uint32_t window,
-                              unsigned char id[5])
-{
-    int i;
-
-    if ((mask & ~0x0fu) || window > 3)
-        return false;
-
-    FMWAIT = 0x1081;
-    FLCTL = FL_RST;
-
-    FMCTL = (FMCTL & 0xf0) | mask;
-    FLASH_CMD(window) = 0xff;
-    nand_delay();
-
-    if (!nand_wait_ready())
-    {
-        nand_deselect();
-        return false;
-    }
-
-    FLASH_CMD(window) = 0x90;
-    FLASH_ADDR(window) = 0x00;
-
-    for (i = 0; i < 5; i++)
-        id[i] = FLASH_DATA(window);
-
-    nand_deselect();
-    return true;
-}
-#endif
-
 const struct nand_device_info_type* nand_get_device_type(uint32_t bank)
 {
     unsigned char id[5];
@@ -715,24 +649,6 @@ uint32_t c4pro_nand_read_id(uint32_t bank, unsigned char id[5])
         return 1;
 
     return nand_read_id(bank, id) ? 0 : 1;
-}
-
-uint32_t c4pro_nand_read_id_window(uint32_t bank, uint32_t window,
-                                   unsigned char id[5])
-{
-    if (bank > 3 || window > 3 || !id)
-        return 1;
-
-    return nand_read_id_window(bank, window, id) ? 0 : 1;
-}
-
-uint32_t c4pro_nand_read_id_mask(uint32_t mask, uint32_t window,
-                                 unsigned char id[5])
-{
-    if ((mask & ~0x0fu) || window > 3 || !id)
-        return 1;
-
-    return nand_read_id_mask(mask, window, id) ? 0 : 1;
 }
 
 uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
@@ -896,54 +812,6 @@ uint32_t c4pro_nand_read_linear_page(uint32_t bank, uint32_t page,
 
     for (i = 0; i < 4096; i++)
         data[i] = FLASH_DATA(bank);
-
-    nand_deselect();
-    last_activity = current_tick;
-    return 0;
-}
-
-/* Decoupled probe: select CE# via an explicit FMCTL low-nibble mask and issue
- * all byte I/O through an explicit register window, instead of coupling both to
- * a single bank index. Used to find the (mask, window) pair that reaches die 1.
- * Reads 4096 data bytes of one page. */
-uint32_t c4pro_nand_read_linear_page_mask(uint32_t mask, uint32_t window,
-                                          uint32_t page, void* databuffer)
-{
-    unsigned i;
-    unsigned char *data = databuffer;
-
-    if ((mask & ~0x0fu) || window > 3 || !data)
-        return 1;
-
-    FMWAIT = 0x1081;
-    FLCTL = FL_RST;
-
-    FMCTL = (FMCTL & 0xf0) | mask;
-    nand_delay();
-
-    if (!nand_wait_ready())
-    {
-        nand_deselect();
-        return 1;
-    }
-
-    FLASH_CMD(window) = 0x00;
-    FLASH_ADDR(window) = 0x00;
-    FLASH_ADDR(window) = 0x00;
-    FLASH_ADDR(window) = page & 0xff;
-    FLASH_ADDR(window) = (page >> 8) & 0xff;
-    FLASH_ADDR(window) = (page >> 16) & 0xff;
-    FLASH_CMD(window) = 0x30;
-
-    nand_delay();
-    if (!nand_wait_ready())
-    {
-        nand_deselect();
-        return 1;
-    }
-
-    for (i = 0; i < 4096; i++)
-        data[i] = FLASH_DATA(window);
 
     nand_deselect();
     last_activity = current_tick;
