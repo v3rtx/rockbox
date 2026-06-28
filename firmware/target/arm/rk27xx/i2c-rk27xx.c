@@ -113,12 +113,19 @@ static bool i2c_read_byte(unsigned char *data)
  */
 static void i2c_iomux(unsigned char slave)
 {
+#ifdef COLORFLY_C4_PRO
+    /* The C4 Pro always routes I2C to the external pads (bit 18); the codec is
+     * reached over the external bus. Crucially, bits 14 and 16 of SCU_IOMUXA_CON
+     * are the upper NAND chip-selects (IOMUX_NAND_CS2 / IOMUX_NAND_CS3) enabled
+     * by nand_device_init() for the 4-die / 32 GB layout. The generic
+     * `& ~(0x1f<<14)` read-modify-write would wipe them on every I2C transaction
+     * (the first DAC access then makes dies 2 and 3 inaccessible). Only set the
+     * external-bus bit and preserve the NAND CS fields. */
+    (void)slave;
+    SCU_IOMUXA_CON |= (1<<18);
+#else
     unsigned long muxa = SCU_IOMUXA_CON & ~(0x1f<<14);
 
-#ifdef COLORFLY_C4_PRO
-    (void)slave;
-    SCU_IOMUXA_CON = (muxa | (1<<18));
-#else
     if ((slave & 0xfe) == (0x27<<1))
     {
         /* internal codec */

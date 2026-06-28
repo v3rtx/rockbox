@@ -419,11 +419,24 @@ void flash_read_sector(int page, unsigned char *secbuf, int nsec)
 }
 
 #endif
+/*
+ * Full-capacity geometry: one 8 GiB die per chip-enable, four CE# = 32 GB.
+ *
+ * The C4 Pro carries four Micron 2C D9 D5 3E 88 dies, each on its own NAND
+ * chip-enable (CE#0..3). Each die is 16384 blocks × 128 pages × 4096 B = 8 GiB,
+ * addressed by a 3-byte row address within the die; the die is selected by the
+ * FMCTL low-nibble chip-enable bit (1 << bank), so the FTL's bank index maps
+ * 1:1 to the die index. The upper chip-selects are enabled by the IOMUX pin-mux
+ * in nand_device_init(). Four banks × 16384 blocks = the full 32 GB.
+ *
+ * Verified on-device: with the CS1..3 pin-mux set, all four CE# return the
+ * Micron ID and read/write distinct per-die data.
+ */
 static const struct nand_device_info_type c4pro_micron_2cd9d53e88 =
 {
     .id = 0x2cd9d53e,
-    .blocks = 8192,
-    .userblocks = 8192,
+    .blocks = 16384,
+    .userblocks = 16384,
     .pagesperblock = 128,
     .blocksizeexponent = 17,
     .tunk1 = 0,
@@ -482,6 +495,23 @@ static void nand_deselect(void)
     FMCTL &= 0xf0;
 }
 
+static bool nand_wait_ready_erase(void)
+{
+    int i;
+
+    /* MLC block erase can take 3-30 ms; the standard nand_wait_ready() budget
+     * of 100000 iterations (~2.5 ms at 200 MHz) is too tight for blocks that
+     * carry live data. 400000 (~10 ms ceiling) covers worst-case MLC erase
+     * while keeping the stall bounded under sustained multi-die writes. */
+    for (i = 0; i < 400000; i++)
+    {
+        if (FMCTL & FM_RDY)
+            return true;
+    }
+
+    return false;
+}
+
 static bool nand_read_id(uint32_t bank, unsigned char id[5])
 {
     int i;
@@ -509,11 +539,75 @@ static bool nand_read_id(uint32_t bank, unsigned char id[5])
     return true;
 }
 
+#ifdef COLORFLY_C4_PRO
+static bool nand_read_id_window(uint32_t bank, uint32_t window,
+                                unsigned char id[5])
+{
+    int i;
+
+    if (bank > 3 || window > 3)
+        return false;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    FLASH_CMD(window) = 0xff;
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return false;
+    }
+
+    FLASH_CMD(window) = 0x90;
+    FLASH_ADDR(window) = 0x00;
+
+    for (i = 0; i < 5; i++)
+        id[i] = FLASH_DATA(window);
+
+    nand_deselect();
+    return true;
+}
+
+static bool nand_read_id_mask(uint32_t mask, uint32_t window,
+                              unsigned char id[5])
+{
+    int i;
+
+    if ((mask & ~0x0fu) || window > 3)
+        return false;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    FMCTL = (FMCTL & 0xf0) | mask;
+    FLASH_CMD(window) = 0xff;
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return false;
+    }
+
+    FLASH_CMD(window) = 0x90;
+    FLASH_ADDR(window) = 0x00;
+
+    for (i = 0; i < 5; i++)
+        id[i] = FLASH_DATA(window);
+
+    nand_deselect();
+    return true;
+}
+#endif
+
 const struct nand_device_info_type* nand_get_device_type(uint32_t bank)
 {
     unsigned char id[5];
 
-    if (bank != 0)
+    if (bank > 3)
         return NULL;
 
     if (!nand_read_id(bank, id))
@@ -621,6 +715,24 @@ uint32_t c4pro_nand_read_id(uint32_t bank, unsigned char id[5])
         return 1;
 
     return nand_read_id(bank, id) ? 0 : 1;
+}
+
+uint32_t c4pro_nand_read_id_window(uint32_t bank, uint32_t window,
+                                   unsigned char id[5])
+{
+    if (bank > 3 || window > 3 || !id)
+        return 1;
+
+    return nand_read_id_window(bank, window, id) ? 0 : 1;
+}
+
+uint32_t c4pro_nand_read_id_mask(uint32_t mask, uint32_t window,
+                                 unsigned char id[5])
+{
+    if ((mask & ~0x0fu) || window > 3 || !id)
+        return 1;
+
+    return nand_read_id_mask(mask, window, id) ? 0 : 1;
 }
 
 uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
@@ -790,6 +902,54 @@ uint32_t c4pro_nand_read_linear_page(uint32_t bank, uint32_t page,
     return 0;
 }
 
+/* Decoupled probe: select CE# via an explicit FMCTL low-nibble mask and issue
+ * all byte I/O through an explicit register window, instead of coupling both to
+ * a single bank index. Used to find the (mask, window) pair that reaches die 1.
+ * Reads 4096 data bytes of one page. */
+uint32_t c4pro_nand_read_linear_page_mask(uint32_t mask, uint32_t window,
+                                          uint32_t page, void* databuffer)
+{
+    unsigned i;
+    unsigned char *data = databuffer;
+
+    if ((mask & ~0x0fu) || window > 3 || !data)
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    FMCTL = (FMCTL & 0xf0) | mask;
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(window) = 0x00;
+    FLASH_ADDR(window) = 0x00;
+    FLASH_ADDR(window) = 0x00;
+    FLASH_ADDR(window) = page & 0xff;
+    FLASH_ADDR(window) = (page >> 8) & 0xff;
+    FLASH_ADDR(window) = (page >> 16) & 0xff;
+    FLASH_CMD(window) = 0x30;
+
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    for (i = 0; i < 4096; i++)
+        data[i] = FLASH_DATA(window);
+
+    nand_deselect();
+    last_activity = current_tick;
+    return 0;
+}
+
 uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
                                const void* databuffer,
                                const void* sparebuffer)
@@ -917,7 +1077,7 @@ uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page)
     FLASH_ADDR(bank) = (page >> 16) & 0xff;
     FLASH_CMD(bank) = 0xd0;
 
-    if (!nand_wait_ready())
+    if (!nand_wait_ready_erase())
     {
         nand_deselect();
         return 1;
@@ -983,6 +1143,23 @@ uint32_t nand_reset(uint32_t bank)
 uint32_t nand_device_init(void)
 {
     SCU_CLKCFG &= ~CLKCFG_NAND;
+
+#ifdef COLORFLY_C4_PRO
+    /*
+     * Mux the upper NAND chip-select pins. The C4 Pro carries four 8 GiB dies,
+     * one per chip-enable. Rockbox only ever drove CE#0; CE#1..3 stay floating
+     * unless their chip-select pins are switched from GPIO/I2C to NAND function
+     * in SCU_IOMUXA_CON. The stock firmware does this in its board init before
+     * the first NAND ID scan. Without it dies 1..3 read back 0x00 / garbage and
+     * the device caps at 8 GiB. CS1=bit9, CS2=bit14, CS3=bit16 (the CS2/CS3
+     * fields are 2 bits wide, shared with GPIO_B6/B7, so clear before setting).
+     * Verified on-device: with these bits set all four CE# return the Micron ID
+     * and read distinct per-die data.
+     */
+    SCU_IOMUXA_CON = (SCU_IOMUXA_CON & ~((3u << 14) | (3u << 16))) |
+                     IOMUX_NAND_CS1 | IOMUX_NAND_CS2 | IOMUX_NAND_CS3;
+#endif
+
     nand_deselect();
 
     return nand_get_device_type(0) ? 0 : 1;
