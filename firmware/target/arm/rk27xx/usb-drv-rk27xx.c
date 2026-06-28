@@ -119,7 +119,13 @@ static bool c4pro_usb_did_soft_connect;
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
 void c4pro_usb_diag_force_reattach(void)
 {
-    DEV_CTL = DEV_SELF_PWR | DEV_PHY16BIT;
+    /* Do NOT set DEV_PHY16BIT: the RK27xx UDC uses an 8-bit UTMI+ PHY (60 MHz),
+     * not a 16-bit one. Selecting the 16-bit interface mismatches the PHY data
+     * width and corrupts the high-speed chirp handshake, forcing a full-speed
+     * fallback (~1.5 MB/s, and bulk-OUT then has no PING flow control, so the
+     * host resets the link during long NAND-write stalls). Stock firmware and
+     * bootloader both leave DEV_CTL at 0x118 (no bit 6) and negotiate HS. */
+    DEV_CTL = DEV_SELF_PWR;
     udelay(500000);
     udc_phy_reset();
     udelay(10000);
@@ -546,7 +552,10 @@ void usb_drv_init(void)
     if(!c4pro_usb_did_soft_connect)
     {
         c4pro_usb_did_soft_connect = true;
-        DEV_CTL = DEV_SELF_PWR | DEV_PHY16BIT;
+        /* No DEV_PHY16BIT: the UDC PHY is 8-bit UTMI+; the 16-bit bit breaks the
+         * high-speed chirp and drops the link to full-speed. See the note in
+         * c4pro_usb_diag_force_reattach(). */
+        DEV_CTL = DEV_SELF_PWR;
         udelay(250000);
         udc_phy_reset();
         udelay(10000);
