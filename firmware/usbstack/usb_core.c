@@ -227,7 +227,7 @@ enum {
 };
 static volatile int ep0_state;
 
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
 volatile int c4pro_usb_diag_ep0_state;
 volatile unsigned c4pro_usb_diag_xfer_count;
 volatile unsigned c4pro_usb_diag_response_count;
@@ -251,7 +251,7 @@ volatile unsigned c4pro_usb_diag_core_interfaces;
 #define set_ep0_state(new) {ep0_state = new; IF_C4PRO_USB_DIAG_STATE(new);}
 #endif
 
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
 #define IF_C4PRO_USB_DIAG_STATE(new) do { c4pro_usb_diag_ep0_state = (new); } while (0)
 #else
 #define IF_C4PRO_USB_DIAG_STATE(new) do { } while (0)
@@ -538,7 +538,7 @@ void usb_core_enable_driver(int driver, bool enabled)
 }
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_USB_DIAG_EXPORT)
+    (defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE))
 void c4pro_usb_diag_force_storage_config(void)
 {
     if(!initialized)
@@ -726,7 +726,7 @@ static bool usb_drv_ep_allocate(struct usb_drv_ep_alloc_ctx* ctx, int ep, int ty
 
 static void allocate_interfaces_and_endpoints(void)
 {
-#if defined(C4PRO_USB_DIAG_EXPORT) && defined(USB_ENABLE_STORAGE)
+#if (defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)) && defined(USB_ENABLE_STORAGE)
     drivers[USB_DRIVER_MASS_STORAGE]->enabled = true;
     drivers[USB_DRIVER_MASS_STORAGE]->error = false;
 #ifdef USB_ENABLE_HID
@@ -806,7 +806,7 @@ retry:
         driver->last_interface = cstate->num_interfaces;
     }
 
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_diag_core_interfaces = config_states[0].num_interfaces;
 #ifdef USB_ENABLE_STORAGE
     c4pro_usb_diag_core_storage =
@@ -1245,7 +1245,7 @@ static void usb_core_control_request_handler(struct usb_ctrlrequest* req, uint8_
 
         allocate_interfaces_and_endpoints();
     }
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_diag_core_state = usb_state;
     c4pro_usb_diag_core_config = usb_config;
 #ifdef USB_ENABLE_STORAGE
@@ -1340,7 +1340,7 @@ static bool check_for_new_setup(void) {
 
 /* called by usb_drv_transfer_completed() */
 void usb_core_transfer_complete(int endpoint, int dir, int status, int length) {
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_diag_xfer_count++;
     c4pro_usb_diag_last_xfer = ((unsigned)endpoint << 24) |
                                ((unsigned)dir << 16) |
@@ -1395,7 +1395,7 @@ void usb_core_transfer_complete(int endpoint, int dir, int status, int length) {
         logf("usb_core: control-out done success=%d", status == 0 && length == 0);
         set_ep0_state(EP0_READY);
         break;
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     case USB_DIR_IN | EP0_READY:
         /* RK27xx can report an EP0 IN completion left over from reset or
          * stale zero setup handling. No control transfer is active yet. */
@@ -1468,7 +1468,7 @@ void usb_core_setup_received(struct usb_ctrlrequest* req) {
 
 void usb_core_control_response(enum usb_control_response response, const void* data, size_t size) {
     logf("usb_core: response ack=%d size=%u ep0_state=%d tick=%lu", response, size, ep0_state, current_tick);
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_diag_response_count++;
     c4pro_usb_diag_last_response = ((unsigned)response << 24) |
                                    ((unsigned)(size & 0xffff) << 8) |

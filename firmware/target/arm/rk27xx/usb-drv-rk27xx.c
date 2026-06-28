@@ -107,12 +107,27 @@ uint8_t usb_drv_ep_specs_flags = 0;
 static volatile bool set_address = false;
 static volatile bool set_configuration = false;
 
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
 static void udc_phy_reset(void);
 static void udc_soft_connect(void);
 #endif
 
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
+static bool c4pro_usb_did_soft_connect;
+#endif
+
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
+void c4pro_usb_diag_force_reattach(void)
+{
+    DEV_CTL = DEV_SELF_PWR | DEV_PHY16BIT;
+    udelay(500000);
+    udc_phy_reset();
+    udelay(10000);
+    udc_soft_connect();
+}
+#endif
+
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
 volatile unsigned c4pro_usb_diag_irq_count;
 volatile unsigned c4pro_usb_diag_reset_count;
 volatile unsigned c4pro_usb_diag_conn_count;
@@ -144,7 +159,6 @@ volatile unsigned c4pro_usb_diag_live_scu_clkcfg;
 volatile unsigned c4pro_usb_diag_live_scu_rstcfg;
 volatile unsigned c4pro_usb_diag_live_scu_iomuxa;
 volatile unsigned c4pro_usb_diag_live_scu_iomuxb;
-static bool c4pro_usb_diag_did_soft_connect;
 
 void c4pro_usb_diag_sample(void)
 {
@@ -163,14 +177,6 @@ void c4pro_usb_diag_sample(void)
     c4pro_usb_diag_live_scu_iomuxb = SCU_IOMUXB_CON;
 }
 
-void c4pro_usb_diag_force_reattach(void)
-{
-    DEV_CTL = DEV_SELF_PWR | DEV_PHY16BIT;
-    udelay(500000);
-    udc_phy_reset();
-    udelay(10000);
-    udc_soft_connect();
-}
 #endif
 
 #undef ENDPOINT
@@ -183,7 +189,7 @@ static void setup_received(void)
     /* copy setup data from packet */
     setup_data[0] = SETUP1;
     setup_data[1] = SETUP2;
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_diag_setup_count++;
     c4pro_usb_diag_last_setup0 = setup_data[0];
     c4pro_usb_diag_last_setup1 = setup_data[1];
@@ -249,7 +255,7 @@ static void ep_read(struct endpoint_t *endp)
 static void in_intr(struct endpoint_t *endp)
 {
     uint32_t txstat = TXSTAT(endp);
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     if(endp->ep_num == 0)
     {
         c4pro_usb_diag_in0_count++;
@@ -283,7 +289,7 @@ static void in_intr(struct endpoint_t *endp)
 static void out_intr(struct endpoint_t *endp)
 {
     uint32_t rxstat = RXSTAT(endp);
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     if(endp->ep_num == 0)
     {
         c4pro_usb_diag_out0_count++;
@@ -536,10 +542,10 @@ void usb_drv_init(void)
     for(int ep_num = 1; ep_num < USB_NUM_ENDPOINTS; ep_num++)
         semaphore_init(&endpoints[ep_num].complete, 1, 0);
 
-#ifdef C4PRO_USB_DIAG_EXPORT
-    if(!c4pro_usb_diag_did_soft_connect)
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
+    if(!c4pro_usb_did_soft_connect)
     {
-        c4pro_usb_diag_did_soft_connect = true;
+        c4pro_usb_did_soft_connect = true;
         DEV_CTL = DEV_SELF_PWR | DEV_PHY16BIT;
         udelay(250000);
         udc_phy_reset();
@@ -578,7 +584,7 @@ void INT_UDC(void)
     uint32_t intsrc = INT2FLAG & 0x7fffff;
     if(intsrc == 0)
         return;
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_diag_irq_count++;
     c4pro_usb_diag_last_intsrc = intsrc;
     c4pro_usb_diag_last_dev_info = DEV_INFO;
@@ -586,7 +592,7 @@ void INT_UDC(void)
 
     if(intsrc & USBRST_INTR) /* usb reset */
     {
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
         c4pro_usb_diag_reset_count++;
 #endif
         logf("udc_int: reset, %ld", current_tick);
@@ -606,7 +612,7 @@ void INT_UDC(void)
 
         RX0CON = RXACKINTEN |
                  RXEPEN;           /* Keep EP0 OUT/SETUP receptive after reset. */
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
         c4pro_usb_diag_last_tx0con = TX0CON;
         c4pro_usb_diag_last_rx0con = RX0CON;
 #endif
@@ -651,7 +657,7 @@ void INT_UDC(void)
     }
     if(intsrc & CONN_INTR)
     {
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
         c4pro_usb_diag_conn_count++;
 #endif
         /* usb connect */

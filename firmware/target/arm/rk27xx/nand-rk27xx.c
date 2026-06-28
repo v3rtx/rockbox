@@ -842,6 +842,56 @@ uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
     return (i & 1) ? 1 : 0;
 }
 
+uint32_t c4pro_nand_program_bytes(uint32_t bank, uint32_t page,
+                                  uint32_t column,
+                                  const void* databuffer,
+                                  uint32_t count)
+{
+    unsigned i;
+    const unsigned char *data = databuffer;
+
+    if (bank > 3 || !data || count == 0 || column >= 4224 ||
+        count > 4224 - column)
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x80;
+    FLASH_ADDR(bank) = column & 0xff;
+    FLASH_ADDR(bank) = (column >> 8) & 0xff;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+
+    for (i = 0; i < count; i++)
+        FLASH_DATA(bank) = data[i];
+
+    FLASH_CMD(bank) = 0x10;
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x70;
+    i = FLASH_DATA(bank);
+    nand_deselect();
+    last_activity = current_tick;
+
+    return (i & 1) ? 1 : 0;
+}
+
 uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page)
 {
     unsigned status;

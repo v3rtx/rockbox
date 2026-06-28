@@ -814,7 +814,7 @@ bool usb_exclusive_storage(void)
 }
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_USB_DIAG_EXPORT)
+    (defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE))
 void c4pro_usb_diag_enter_storage_mode(void)
 {
     if(!exclusive_storage_enabled)

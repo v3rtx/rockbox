@@ -39,6 +39,12 @@
 #include "menu.h"
 #include "usb.h"
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    (defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE))
+extern void c4pro_usb_diag_enter_storage_mode(void);
+extern void c4pro_usb_diag_force_reattach(void);
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_USB_DIAG_EXPORT)
 #include "usb_core.h"
 #endif
@@ -94,6 +100,1138 @@
 #include "nand-target.h"
 #endif
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_APP_SYSTEM_INSTALLER)
+#ifdef C4PRO_APP_SYSTEM_INSTALLER_EMBEDDED
+#include "c4pro-installer-payload.h"
+#endif
+
+#define C4PRO_INSTALL_SYSTEM_PSEC_BASE 20480u
+#define C4PRO_INSTALL_SYSTEM_SECTORS 43008u
+#define C4PRO_INSTALL_SECTORS_PER_PAGE 8u
+#define C4PRO_INSTALL_PAGES_PER_BLOCK 128u
+#define C4PRO_INSTALL_BYTES_PER_SECTOR 512u
+#define C4PRO_INSTALL_SECTORS_PER_CLUSTER 4u
+#define C4PRO_INSTALL_RESERVED_SECTORS 1u
+#define C4PRO_INSTALL_FAT_COUNT 2u
+#define C4PRO_INSTALL_ROOT_ENTRIES 512u
+#define C4PRO_INSTALL_SECTORS_PER_FAT 42u
+#define C4PRO_INSTALL_ROOT_SECTORS \
+    ((C4PRO_INSTALL_ROOT_ENTRIES * 32u) / C4PRO_INSTALL_BYTES_PER_SECTOR)
+#define C4PRO_INSTALL_FIRST_FAT_SECTOR C4PRO_INSTALL_RESERVED_SECTORS
+#define C4PRO_INSTALL_FIRST_ROOT_SECTOR \
+    (C4PRO_INSTALL_RESERVED_SECTORS + \
+     C4PRO_INSTALL_FAT_COUNT * C4PRO_INSTALL_SECTORS_PER_FAT)
+#define C4PRO_INSTALL_FIRST_DATA_SECTOR \
+    (C4PRO_INSTALL_FIRST_ROOT_SECTOR + C4PRO_INSTALL_ROOT_SECTORS)
+#define C4PRO_INSTALL_CLUSTER_BYTES \
+    (C4PRO_INSTALL_SECTORS_PER_CLUSTER * C4PRO_INSTALL_BYTES_PER_SECTOR)
+
+static unsigned char c4pro_install_page[4096];
+#ifdef C4PRO_APP_SYSTEM_INSTALLER_STOCK_RAW_WRITE
+static unsigned char c4pro_install_verify[4096];
+#endif
+#ifdef C4PRO_APP_LOADPATH_CORRUPTOR
+static unsigned char c4pro_install_verify[4096];
+#endif
+#ifdef C4PRO_APP_NATIVE_ROCKBOX_INSTALLER
+static unsigned char c4pro_install_verify[4096];
+static unsigned char c4pro_install_verify_spare[128];
+#endif
+static unsigned char c4pro_install_spare[128];
+
+static uint32_t c4pro_installer_crc32_update(uint32_t crc,
+                                             const unsigned char *buf,
+                                             uint32_t len)
+{
+    while (len--)
+    {
+        crc ^= *buf++;
+        for (int i = 0; i < 8; i++)
+            crc = (crc >> 1) ^ (0xedb88320u & -(crc & 1u));
+    }
+
+    return crc;
+}
+
+static void c4pro_installer_status(const char *a, const char *b,
+                                   uint32_t x, uint32_t y)
+{
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4 installer");
+    lcd_puts(0, 1, a);
+    lcd_puts(0, 2, b);
+    lcd_putsf(0, 3, "a %lu", (unsigned long)x);
+    lcd_putsf(0, 4, "b %lu", (unsigned long)y);
+    lcd_update();
+}
+
+static void c4pro_installer_halt(void) NORETURN_ATTR;
+static void c4pro_installer_halt(void)
+{
+    while (1)
+        sleep(HZ);
+}
+
+static void c4pro_installer_fail(const char *where, int rc) NORETURN_ATTR;
+static void c4pro_installer_fail(const char *where, int rc)
+{
+    c4pro_installer_status("FAIL", where, (uint32_t)rc, 0);
+    c4pro_installer_halt();
+}
+
+static void c4pro_installer_fail2(const char *where, uint32_t x,
+                                  uint32_t y) NORETURN_ATTR;
+static void c4pro_installer_fail2(const char *where, uint32_t x,
+                                  uint32_t y)
+{
+    c4pro_installer_status("FAIL", where, x, y);
+    c4pro_installer_halt();
+}
+
+static void c4pro_install_put16(unsigned char *p, uint32_t value)
+{
+    p[0] = value & 0xffu;
+    p[1] = (value >> 8) & 0xffu;
+}
+
+static void c4pro_install_put32(unsigned char *p, uint32_t value)
+{
+    p[0] = value & 0xffu;
+    p[1] = (value >> 8) & 0xffu;
+    p[2] = (value >> 16) & 0xffu;
+    p[3] = (value >> 24) & 0xffu;
+}
+
+static uint32_t c4pro_install_get32(const unsigned char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint32_t c4pro_install_base_clusters(void)
+{
+    return (c4pro_installer_payload_size + C4PRO_INSTALL_CLUSTER_BYTES - 1u) /
+           C4PRO_INSTALL_CLUSTER_BYTES;
+}
+
+static bool c4pro_install_cluster_in_file(uint32_t cluster, uint32_t first,
+                                          uint32_t clusters)
+{
+    return cluster >= first && cluster < first + clusters;
+}
+
+static uint32_t c4pro_install_fat_entry(uint32_t cluster)
+{
+    uint32_t base_clusters = c4pro_install_base_clusters();
+    uint32_t system_dir = 2u;
+    uint32_t system00_dir = 3u;
+    uint32_t base0_first = 4u;
+    uint32_t base1_first = base0_first + base_clusters;
+
+    if (cluster == 0)
+        return 0xfff8u;
+    if (cluster == 1 || cluster == system_dir || cluster == system00_dir)
+        return 0xffffu;
+
+    if (c4pro_install_cluster_in_file(cluster, base0_first, base_clusters))
+    {
+        if (cluster == base0_first + base_clusters - 1u)
+            return 0xffffu;
+        return cluster + 1u;
+    }
+
+    if (c4pro_install_cluster_in_file(cluster, base1_first, base_clusters))
+    {
+        if (cluster == base1_first + base_clusters - 1u)
+            return 0xffffu;
+        return cluster + 1u;
+    }
+
+    return 0;
+}
+
+static void c4pro_install_dirent(unsigned char *ent, const char name[11],
+                                 uint8_t attr, uint32_t cluster,
+                                 uint32_t size)
+{
+    memset(ent, 0, 32);
+    memcpy(ent, name, 11);
+    ent[11] = attr;
+    c4pro_install_put16(ent + 26, cluster);
+    c4pro_install_put32(ent + 28, size);
+}
+
+static void c4pro_install_fill_boot(unsigned char *sector)
+{
+    memset(sector, 0, 512);
+    sector[0] = 0xeb;
+    sector[1] = 0x3c;
+    sector[2] = 0x90;
+    memcpy(sector + 3, "MSDOS5.0", 8);
+    c4pro_install_put16(sector + 11, C4PRO_INSTALL_BYTES_PER_SECTOR);
+    sector[13] = C4PRO_INSTALL_SECTORS_PER_CLUSTER;
+    c4pro_install_put16(sector + 14, C4PRO_INSTALL_RESERVED_SECTORS);
+    sector[16] = C4PRO_INSTALL_FAT_COUNT;
+    c4pro_install_put16(sector + 17, C4PRO_INSTALL_ROOT_ENTRIES);
+    c4pro_install_put16(sector + 19, C4PRO_INSTALL_SYSTEM_SECTORS);
+    sector[21] = 0xf8;
+    c4pro_install_put16(sector + 22, C4PRO_INSTALL_SECTORS_PER_FAT);
+    c4pro_install_put16(sector + 24, 63);
+    c4pro_install_put16(sector + 26, 255);
+    c4pro_install_put32(sector + 28, 0);
+    c4pro_install_put32(sector + 32, 0);
+    sector[36] = 0x80;
+    sector[38] = 0x29;
+    c4pro_install_put32(sector + 39, 0xc4000002u);
+    memcpy(sector + 43, "C4 ROCKBOX ", 11);
+    memcpy(sector + 54, "FAT16   ", 8);
+    sector[510] = 0x55;
+    sector[511] = 0xaa;
+}
+
+static void c4pro_install_fill_fat(uint32_t sector_lba, unsigned char *sector)
+{
+    uint32_t fat_sector = (sector_lba - C4PRO_INSTALL_FIRST_FAT_SECTOR) %
+                          C4PRO_INSTALL_SECTORS_PER_FAT;
+    uint32_t first_cluster = fat_sector * 256u;
+
+    memset(sector, 0, 512);
+    for (uint32_t i = 0; i < 256u; i++)
+        c4pro_install_put16(sector + i * 2u,
+                            c4pro_install_fat_entry(first_cluster + i));
+}
+
+static void c4pro_install_fill_root(unsigned char *sector)
+{
+    memset(sector, 0, 512);
+    c4pro_install_dirent(sector + 0, "SYSTEM     ", 0x10, 2u, 0);
+    c4pro_install_dirent(sector + 32, "SYSTEM00   ", 0x10, 3u, 0);
+}
+
+static void c4pro_install_fill_system_dir(unsigned char *sector,
+                                          bool second_copy)
+{
+    uint32_t base_clusters = c4pro_install_base_clusters();
+    uint32_t dir_cluster = second_copy ? 3u : 2u;
+    uint32_t base_first = second_copy ? 4u + base_clusters : 4u;
+
+    memset(sector, 0, 512);
+    c4pro_install_dirent(sector + 0, ".          ", 0x10, dir_cluster, 0);
+    c4pro_install_dirent(sector + 32, "..         ", 0x10, 0, 0);
+    c4pro_install_dirent(sector + 64, "BASE    RKW", 0x20, base_first,
+                         c4pro_installer_payload_size);
+}
+
+static void c4pro_install_fill_data(uint32_t sector_lba, unsigned char *sector)
+{
+    uint32_t cluster = 2u + (sector_lba - C4PRO_INSTALL_FIRST_DATA_SECTOR) /
+                             C4PRO_INSTALL_SECTORS_PER_CLUSTER;
+    uint32_t sector_in_cluster =
+        (sector_lba - C4PRO_INSTALL_FIRST_DATA_SECTOR) %
+        C4PRO_INSTALL_SECTORS_PER_CLUSTER;
+    uint32_t base_clusters = c4pro_install_base_clusters();
+    uint32_t base0_first = 4u;
+    uint32_t base1_first = base0_first + base_clusters;
+    uint32_t file_cluster;
+    uint32_t file_off;
+
+    memset(sector, 0, 512);
+    if (cluster == 2u || cluster == 3u)
+    {
+        if (sector_in_cluster == 0)
+            c4pro_install_fill_system_dir(sector, cluster == 3u);
+        return;
+    }
+
+    if (c4pro_install_cluster_in_file(cluster, base0_first, base_clusters))
+        file_cluster = cluster - base0_first;
+    else if (c4pro_install_cluster_in_file(cluster, base1_first, base_clusters))
+        file_cluster = cluster - base1_first;
+    else
+        return;
+
+    file_off = file_cluster * C4PRO_INSTALL_CLUSTER_BYTES +
+               sector_in_cluster * C4PRO_INSTALL_BYTES_PER_SECTOR;
+    if (file_off < c4pro_installer_payload_size)
+    {
+        uint32_t n = c4pro_installer_payload_size - file_off;
+        if (n > 512u)
+            n = 512u;
+        memcpy(sector, c4pro_installer_payload + file_off, n);
+    }
+}
+
+static void c4pro_install_fill_sector(uint32_t sector_lba,
+                                      unsigned char *sector)
+{
+    if (sector_lba == 0)
+        c4pro_install_fill_boot(sector);
+    else if (sector_lba >= C4PRO_INSTALL_FIRST_FAT_SECTOR &&
+             sector_lba < C4PRO_INSTALL_FIRST_ROOT_SECTOR)
+        c4pro_install_fill_fat(sector_lba, sector);
+    else if (sector_lba >= C4PRO_INSTALL_FIRST_ROOT_SECTOR &&
+             sector_lba < C4PRO_INSTALL_FIRST_DATA_SECTOR)
+    {
+        if (sector_lba == C4PRO_INSTALL_FIRST_ROOT_SECTOR)
+            c4pro_install_fill_root(sector);
+        else
+            memset(sector, 0, 512);
+    }
+    else if (sector_lba < C4PRO_INSTALL_SYSTEM_SECTORS)
+        c4pro_install_fill_data(sector_lba, sector);
+    else
+        memset(sector, 0, 512);
+}
+
+static void c4pro_install_fill_page(uint32_t page, unsigned char *page_buf)
+{
+    for (uint32_t sec = 0; sec < C4PRO_INSTALL_SECTORS_PER_PAGE; sec++)
+        c4pro_install_fill_sector(page * C4PRO_INSTALL_SECTORS_PER_PAGE + sec,
+                                  page_buf + sec * 512u);
+}
+
+#ifdef C4PRO_APP_BOOT_INSTALLER
+#define C4PRO_BOOT_INSTALL_PAGE_BYTES 4224u
+#define C4PRO_BOOT_INSTALL_DATA_BYTES 4096u
+#define C4PRO_BOOT_INSTALL_SPARE_BYTES 128u
+#define C4PRO_BOOT_INSTALL_PAGE_COUNT 30u
+
+static void c4pro_app_boot_installer(void) NORETURN_ATTR;
+static void c4pro_app_boot_installer(void)
+{
+    uint32_t crc = 0xffffffffu;
+
+    if (c4pro_installer_payload_size !=
+        C4PRO_BOOT_INSTALL_PAGE_COUNT * C4PRO_BOOT_INSTALL_PAGE_BYTES)
+        c4pro_installer_fail("payload size",
+                             (int)c4pro_installer_payload_size);
+
+    c4pro_installer_status("boot install", "erase block0",
+                           C4PRO_BOOT_INSTALL_PAGE_COUNT,
+                           c4pro_installer_payload_size);
+
+    if (c4pro_nand_erase_block(0, 0))
+        c4pro_installer_fail("erase boot", 0);
+
+    for (uint32_t page = 0; page < C4PRO_BOOT_INSTALL_PAGE_COUNT; page++)
+    {
+        const unsigned char *src = c4pro_installer_payload +
+                                   page * C4PRO_BOOT_INSTALL_PAGE_BYTES;
+
+        memcpy(c4pro_install_page, src, C4PRO_BOOT_INSTALL_DATA_BYTES);
+        memcpy(c4pro_install_spare, src + C4PRO_BOOT_INSTALL_DATA_BYTES,
+               C4PRO_BOOT_INSTALL_SPARE_BYTES);
+
+        crc = c4pro_installer_crc32_update(crc, c4pro_install_page,
+                                           C4PRO_BOOT_INSTALL_DATA_BYTES);
+        crc = c4pro_installer_crc32_update(crc, c4pro_install_spare,
+                                           C4PRO_BOOT_INSTALL_SPARE_BYTES);
+
+        if (c4pro_nand_write_page(0, page, c4pro_install_page,
+                                  c4pro_install_spare))
+            c4pro_installer_fail("write boot", (int)page);
+
+#ifdef C4PRO_APP_BOOT_INSTALLER_VERIFY_DATA
+        if (c4pro_nand_read_linear_page(0, page, c4pro_install_verify))
+            c4pro_installer_fail("read boot", (int)page);
+        if (memcmp(c4pro_install_page, c4pro_install_verify,
+                   C4PRO_BOOT_INSTALL_DATA_BYTES))
+            c4pro_installer_fail("verify boot", (int)page);
+#endif
+
+        c4pro_installer_status("write boot", "native pages",
+                               page + 1u, C4PRO_BOOT_INSTALL_PAGE_COUNT);
+    }
+
+    c4pro_installer_status("done", "boot native", crc ^ 0xffffffffu,
+                           C4PRO_BOOT_INSTALL_PAGE_COUNT);
+    c4pro_installer_halt();
+}
+#endif
+
+#ifdef C4PRO_APP_NATIVE_ROCKBOX_INSTALLER
+#define C4PRO_NATIVE_INSTALL_MAGIC 0x31494e43u /* CNI1 */
+#define C4PRO_NATIVE_INSTALL_VERSION 1u
+#define C4PRO_NATIVE_PAGE_BYTES 4224u
+#define C4PRO_NATIVE_DATA_BYTES 4096u
+#define C4PRO_NATIVE_SPARE_BYTES 128u
+#define C4PRO_NATIVE_HEADER_BYTES 512u
+#define C4PRO_NATIVE_RECORD_DATA_BYTES 512u
+#define C4PRO_NATIVE_RECORD_BYTES 528u
+#define C4PRO_NATIVE_RECORDS_PER_PAGE 4u
+#ifdef C4PRO_NATIVE_PAYLOAD_FULLPAGE
+#define C4PRO_NATIVE_PAYLOAD_BYTES_PER_PAGE C4PRO_NATIVE_DATA_BYTES
+#else
+#define C4PRO_NATIVE_PAYLOAD_BYTES_PER_PAGE \
+    (C4PRO_NATIVE_RECORD_DATA_BYTES * C4PRO_NATIVE_RECORDS_PER_PAGE)
+#endif
+#ifndef C4PRO_NATIVE_PAYLOAD_PBLK_START
+#define C4PRO_NATIVE_PAYLOAD_PBLK_START 512u
+#endif
+#ifndef C4PRO_NATIVE_PAYLOAD_PBLK_ALT1
+#define C4PRO_NATIVE_PAYLOAD_PBLK_ALT1 640u
+#endif
+#ifndef C4PRO_NATIVE_PAYLOAD_PBLK_ALT2
+#define C4PRO_NATIVE_PAYLOAD_PBLK_ALT2 768u
+#endif
+#ifndef C4PRO_NATIVE_PAYLOAD_PBLK_ALT3
+#define C4PRO_NATIVE_PAYLOAD_PBLK_ALT3 896u
+#endif
+#ifndef C4PRO_NATIVE_PAYLOAD_PBLK_ALT4
+#define C4PRO_NATIVE_PAYLOAD_PBLK_ALT4 1024u
+#endif
+#ifndef C4PRO_NATIVE_PAYLOAD_PBLK_ALT5
+#define C4PRO_NATIVE_PAYLOAD_PBLK_ALT5 1152u
+#endif
+#ifndef C4PRO_NATIVE_PAYLOAD_PBLK_ALT6
+#define C4PRO_NATIVE_PAYLOAD_PBLK_ALT6 1280u
+#endif
+#ifndef C4PRO_NATIVE_PAYLOAD_PBLK_ALT7
+#define C4PRO_NATIVE_PAYLOAD_PBLK_ALT7 1408u
+#endif
+#ifndef C4PRO_NATIVE_PAYLOAD_PAGE_STRIDE
+#define C4PRO_NATIVE_PAYLOAD_PAGE_STRIDE C4PRO_INSTALL_PAGES_PER_BLOCK
+#endif
+
+static const uint32_t c4pro_native_payload_pblk_candidates[] = {
+    C4PRO_NATIVE_PAYLOAD_PBLK_START,
+    C4PRO_NATIVE_PAYLOAD_PBLK_ALT1,
+    C4PRO_NATIVE_PAYLOAD_PBLK_ALT2,
+    C4PRO_NATIVE_PAYLOAD_PBLK_ALT3,
+    C4PRO_NATIVE_PAYLOAD_PBLK_ALT4,
+    C4PRO_NATIVE_PAYLOAD_PBLK_ALT5,
+    C4PRO_NATIVE_PAYLOAD_PBLK_ALT6,
+    C4PRO_NATIVE_PAYLOAD_PBLK_ALT7,
+};
+
+static uint32_t c4pro_native_fail_candidate;
+static uint32_t c4pro_native_fail_page;
+static uint32_t c4pro_native_fail_off;
+static uint32_t c4pro_native_fail_expact;
+
+static void c4pro_native_fail_payload(void) NORETURN_ATTR;
+static void c4pro_native_fail_payload(void)
+{
+    uint32_t pblk = 0;
+
+    if (c4pro_native_fail_candidate <
+        ARRAYLEN(c4pro_native_payload_pblk_candidates))
+        pblk = c4pro_native_payload_pblk_candidates[c4pro_native_fail_candidate] +
+               c4pro_native_fail_page / C4PRO_INSTALL_PAGES_PER_BLOCK;
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "FAIL payload");
+    lcd_putsf(0, 1, "cand %lu",
+              (unsigned long)c4pro_native_fail_candidate);
+    lcd_putsf(0, 2, "pblk %lu pg %lu", (unsigned long)pblk,
+              (unsigned long)c4pro_native_fail_page);
+    lcd_putsf(0, 3, "off %lu", (unsigned long)c4pro_native_fail_off);
+    lcd_putsf(0, 4, "exp %02lx act %02lx",
+              (unsigned long)(c4pro_native_fail_expact >> 8),
+              (unsigned long)(c4pro_native_fail_expact & 0xffu));
+    lcd_update();
+    c4pro_installer_halt();
+}
+
+static uint32_t c4pro_native_crc_region(const unsigned char *buf,
+                                        uint32_t len)
+{
+    return c4pro_installer_crc32_update(0xffffffffu, buf, len) ^
+           0xffffffffu;
+}
+
+static uint32_t c4pro_native_nand_read_linear_page(uint32_t page, void *data)
+{
+    int old_irq = disable_irq_save();
+    uint32_t rc = c4pro_nand_read_linear_page(0, page, data);
+    restore_irq(old_irq);
+    return rc;
+}
+
+static uint32_t c4pro_native_nand_read_sector_spare(uint32_t page,
+                                                    uint32_t sector,
+                                                    void *spare)
+{
+    int old_irq = disable_irq_save();
+    uint32_t rc = c4pro_nand_read_sector(0, page, sector, NULL, spare);
+    restore_irq(old_irq);
+    return rc;
+}
+
+static uint32_t c4pro_native_nand_write_page(uint32_t page,
+                                             const void *data,
+                                             const void *spare)
+{
+    int old_irq = disable_irq_save();
+    uint32_t rc = c4pro_nand_write_page(0, page, data, spare);
+    restore_irq(old_irq);
+    return rc;
+}
+
+static uint32_t c4pro_native_nand_erase_block(uint32_t page)
+{
+    int old_irq = disable_irq_save();
+    uint32_t rc = c4pro_nand_erase_block(0, page);
+    restore_irq(old_irq);
+    return rc;
+}
+
+static int c4pro_native_write_pages(const char *label, uint32_t start_page,
+                                    const unsigned char *pages,
+                                    uint32_t page_count, bool fatal)
+{
+    for (uint32_t page = 0; page < page_count; page++)
+    {
+        const unsigned char *src = pages + page * C4PRO_NATIVE_PAGE_BYTES;
+        bool verified = false;
+
+        memcpy(c4pro_install_page, src, C4PRO_NATIVE_DATA_BYTES);
+        memcpy(c4pro_install_spare, src + C4PRO_NATIVE_DATA_BYTES,
+               C4PRO_NATIVE_SPARE_BYTES);
+
+        for (uint32_t attempt = 0; attempt < 4u && !verified; attempt++)
+        {
+            verified = true;
+
+            if (c4pro_native_nand_write_page(start_page + page,
+                                             c4pro_install_page,
+                                             c4pro_install_spare))
+            {
+                if (!fatal)
+                    return -(int)(page + 1u);
+                c4pro_installer_fail(label, (int)page);
+            }
+
+            if (c4pro_native_nand_read_linear_page(start_page + page,
+                                                   c4pro_install_verify))
+            {
+                if (!fatal)
+                    return -(int)(page + 1u);
+                c4pro_installer_fail("verify read", (int)page);
+            }
+
+            if (memcmp(c4pro_install_page, c4pro_install_verify,
+                       C4PRO_NATIVE_DATA_BYTES))
+            {
+                verified = false;
+
+                if (attempt + 1u >= 4u)
+                {
+                    for (uint32_t off = 0; off < C4PRO_NATIVE_DATA_BYTES; off++)
+                    {
+                        if (c4pro_install_page[off] !=
+                            c4pro_install_verify[off])
+                        {
+                            if (!fatal)
+                                return -(int)(page + 1u);
+                            c4pro_installer_status("FAIL", "data pg/off",
+                                                   start_page + page,
+                                                   (page << 16) | off);
+                            sleep(2 * HZ);
+                            c4pro_installer_fail2("exp/act off", off,
+                                ((uint32_t)c4pro_install_page[off] << 8) |
+                                c4pro_install_verify[off]);
+                        }
+                    }
+                    c4pro_installer_fail("verify data", (int)page);
+                }
+
+                continue;
+            }
+
+            for (uint32_t sector = 0; sector < 8; sector++)
+            {
+                if (c4pro_native_nand_read_sector_spare(
+                        start_page + page, sector,
+                        c4pro_install_verify_spare + sector * 16u))
+                {
+                    if (!fatal)
+                        return -(int)(page + 1u);
+                    c4pro_installer_fail("verify spare read", (int)page);
+                }
+            }
+
+            if (memcmp(c4pro_install_spare, c4pro_install_verify_spare,
+                       C4PRO_NATIVE_SPARE_BYTES))
+            {
+                verified = false;
+
+                if (attempt + 1u >= 4u)
+                {
+                    for (uint32_t off = 0; off < C4PRO_NATIVE_SPARE_BYTES;
+                         off++)
+                    {
+                        if (c4pro_install_spare[off] !=
+                            c4pro_install_verify_spare[off])
+                        {
+                            if (!fatal)
+                                return -(int)(page + 1u);
+                            c4pro_installer_status("FAIL", "spare pg/off",
+                                                   start_page + page,
+                                                   (page << 16) | off);
+                            sleep(2 * HZ);
+                            c4pro_installer_fail2("exp/act off", off,
+                                ((uint32_t)c4pro_install_spare[off] << 8) |
+                                c4pro_install_verify_spare[off]);
+                        }
+                    }
+                    c4pro_installer_fail("verify spare", (int)page);
+                }
+
+                continue;
+            }
+        }
+
+        if (!verified)
+        {
+            if (!fatal)
+                return -(int)(page + 1u);
+            c4pro_installer_fail("verify data", (int)page);
+        }
+
+        if ((page & 0x1fu) == 0 || page + 1u == page_count)
+            c4pro_installer_status(label, "pages", page + 1u, page_count);
+    }
+
+    return 0;
+}
+
+static int c4pro_native_write_payload_pages(const char *label,
+                                            uint32_t start_page,
+                                            uint32_t candidate,
+                                            const unsigned char *pages,
+                                            uint32_t page_count,
+                                            bool fatal)
+{
+    for (uint32_t page = 0; page < page_count; page++)
+    {
+        uint32_t phys_page = start_page +
+                             page * C4PRO_NATIVE_PAYLOAD_PAGE_STRIDE;
+        const unsigned char *src = pages + page * C4PRO_NATIVE_PAGE_BYTES;
+        const unsigned char *spare = src + C4PRO_NATIVE_DATA_BYTES;
+        bool verified = false;
+
+        memcpy(c4pro_install_page, src, C4PRO_NATIVE_DATA_BYTES);
+        memcpy(c4pro_install_spare, spare, C4PRO_NATIVE_SPARE_BYTES);
+
+        for (uint32_t attempt = 0; attempt < 4u && !verified; attempt++)
+        {
+            verified = true;
+
+            if (c4pro_native_nand_write_page(phys_page,
+                                             c4pro_install_page,
+                                             c4pro_install_spare))
+            {
+                if (!fatal)
+                    return -(int)(page + 1u);
+                c4pro_installer_fail(label, (int)page);
+            }
+
+            if (c4pro_native_nand_read_linear_page(phys_page,
+                                                   c4pro_install_verify))
+            {
+                if (!fatal)
+                    return -(int)(page + 1u);
+                c4pro_installer_fail("payload read", (int)page);
+            }
+
+#ifdef C4PRO_NATIVE_PAYLOAD_FULLPAGE
+            for (uint32_t off = 0; off < C4PRO_NATIVE_DATA_BYTES; off++)
+            {
+                if (src[off] != c4pro_install_verify[off])
+                {
+                    verified = false;
+                    c4pro_native_fail_candidate = candidate;
+                    c4pro_native_fail_page = page;
+                    c4pro_native_fail_off = off;
+                    c4pro_native_fail_expact =
+                        ((uint32_t)src[off] << 8) |
+                        c4pro_install_verify[off];
+                    break;
+                }
+            }
+#else
+            for (uint32_t record = 0; record < C4PRO_NATIVE_RECORDS_PER_PAGE;
+                 record++)
+            {
+                uint32_t base = record * C4PRO_NATIVE_RECORD_BYTES;
+
+                for (uint32_t i = 0; i < C4PRO_NATIVE_RECORD_DATA_BYTES; i++)
+                {
+                    uint32_t off = base + i;
+
+                    if (src[off] != c4pro_install_verify[off])
+                    {
+                        verified = false;
+                        c4pro_native_fail_candidate = candidate;
+                        c4pro_native_fail_page = page;
+                        c4pro_native_fail_off = off;
+                        c4pro_native_fail_expact =
+                            ((uint32_t)src[off] << 8) |
+                            c4pro_install_verify[off];
+                        break;
+                    }
+                }
+
+                if (!verified)
+                    break;
+            }
+#endif
+        }
+
+        if (!verified)
+        {
+            if (!fatal)
+                return -(int)(page + 1u);
+            c4pro_native_fail_payload();
+        }
+
+        if ((page & 0x1fu) == 0 || page + 1u == page_count)
+            c4pro_installer_status(label, "payload pages",
+                                   page + 1u, page_count);
+    }
+
+    return 0;
+}
+
+static int c4pro_native_crc_payload_region(uint32_t start_page,
+                                           uint32_t byte_count,
+                                           uint32_t expected_crc,
+                                           uint32_t *actual_crc)
+{
+    uint32_t done = 0;
+    uint32_t crc = 0xffffffffu;
+
+    while (done < byte_count)
+    {
+        if (c4pro_native_nand_read_linear_page(start_page,
+                                               c4pro_install_verify))
+            return -1;
+
+#ifdef C4PRO_NATIVE_PAYLOAD_FULLPAGE
+        {
+            uint32_t n = byte_count - done;
+            if (n > C4PRO_NATIVE_DATA_BYTES)
+                n = C4PRO_NATIVE_DATA_BYTES;
+
+            crc = c4pro_installer_crc32_update(crc,
+                                               c4pro_install_verify, n);
+            done += n;
+        }
+#else
+        for (uint32_t record = 0;
+             record < C4PRO_NATIVE_RECORDS_PER_PAGE && done < byte_count;
+             record++)
+        {
+            uint32_t n = byte_count - done;
+            uint32_t off = record * C4PRO_NATIVE_RECORD_BYTES;
+
+            if (n > C4PRO_NATIVE_RECORD_DATA_BYTES)
+                n = C4PRO_NATIVE_RECORD_DATA_BYTES;
+
+            crc = c4pro_installer_crc32_update(crc,
+                                               c4pro_install_verify + off, n);
+            done += n;
+        }
+#endif
+
+        start_page += C4PRO_NATIVE_PAYLOAD_PAGE_STRIDE;
+    }
+
+    *actual_crc = crc ^ 0xffffffffu;
+    return *actual_crc == expected_crc ? 0 : -2;
+}
+
+static bool c4pro_native_erase_pages(uint32_t start_page, uint32_t page_count)
+{
+    for (uint32_t page = 0; page < page_count; page++)
+    {
+        uint32_t phys_page = start_page +
+                             page * C4PRO_NATIVE_PAYLOAD_PAGE_STRIDE;
+
+        if (c4pro_native_nand_erase_block(phys_page))
+            return false;
+    }
+
+    return true;
+}
+
+static int c4pro_native_verify_blank_payload(uint32_t start_page,
+                                             uint32_t page_count)
+{
+    for (uint32_t page = 0; page < page_count; page++)
+    {
+        uint32_t phys_page = start_page +
+                             page * C4PRO_NATIVE_PAYLOAD_PAGE_STRIDE;
+
+        if (c4pro_native_nand_read_linear_page(phys_page,
+                                               c4pro_install_verify))
+            return -(int)(page + 1u);
+
+#ifdef C4PRO_NATIVE_PAYLOAD_FULLPAGE
+        for (uint32_t i = 0; i < C4PRO_NATIVE_DATA_BYTES; i++)
+        {
+            if (c4pro_install_verify[i] != 0xffu)
+                return (int)(page + 1u);
+        }
+#else
+        for (uint32_t record = 0; record < C4PRO_NATIVE_RECORDS_PER_PAGE;
+             record++)
+        {
+            uint32_t base = record * C4PRO_NATIVE_RECORD_BYTES;
+
+            for (uint32_t i = 0; i < C4PRO_NATIVE_RECORD_DATA_BYTES; i++)
+            {
+                if (c4pro_install_verify[base + i] != 0xffu)
+                    return (int)(page + 1u);
+            }
+        }
+#endif
+    }
+
+    return 0;
+}
+
+static void c4pro_app_native_rockbox_installer(void) NORETURN_ATTR;
+static void c4pro_app_native_rockbox_installer(void)
+{
+    const unsigned char *hdr = c4pro_installer_payload;
+    uint32_t magic = c4pro_install_get32(hdr + 0);
+    uint32_t version = c4pro_install_get32(hdr + 4);
+    uint32_t boot_pages = c4pro_install_get32(hdr + 8);
+    uint32_t payload_pages = c4pro_install_get32(hdr + 12);
+    uint32_t boot_crc = c4pro_install_get32(hdr + 16);
+    uint32_t payload_crc = c4pro_install_get32(hdr + 20);
+    uint32_t boot_bytes = c4pro_install_get32(hdr + 24);
+    uint32_t payload_bytes = c4pro_install_get32(hdr + 28);
+    const unsigned char *boot_image;
+    const unsigned char *payload_image;
+    uint32_t expected_size;
+    uint32_t payload_start_page = 0;
+    uint32_t last_payload_start_page = 0;
+    uint32_t boot_payload_pages;
+    uint32_t last_payload_pblk = 0;
+    uint32_t last_payload_stage = 0;
+    uint32_t last_payload_detail = 0;
+    uint32_t last_payload_expected = 0;
+
+    if (magic != C4PRO_NATIVE_INSTALL_MAGIC ||
+        version != C4PRO_NATIVE_INSTALL_VERSION)
+        c4pro_installer_fail("native header", (int)magic);
+
+    expected_size = C4PRO_NATIVE_HEADER_BYTES + boot_bytes + payload_bytes;
+    if (boot_pages == 0 || payload_pages == 0 ||
+        boot_bytes != boot_pages * C4PRO_NATIVE_PAGE_BYTES ||
+        payload_bytes != payload_pages * C4PRO_NATIVE_PAGE_BYTES ||
+        expected_size != c4pro_installer_payload_size)
+        c4pro_installer_fail("native size", (int)c4pro_installer_payload_size);
+
+    boot_image = c4pro_installer_payload + C4PRO_NATIVE_HEADER_BYTES;
+    payload_image = boot_image + boot_bytes;
+
+    if (c4pro_native_crc_region(boot_image, boot_bytes) != boot_crc)
+        c4pro_installer_fail("boot crc", (int)boot_crc);
+    if (c4pro_native_crc_region(payload_image, payload_bytes) != payload_crc)
+        c4pro_installer_fail("payload crc", (int)payload_crc);
+
+    boot_payload_pages =
+        (c4pro_install_get32(payload_image + 8) +
+         C4PRO_NATIVE_PAYLOAD_BYTES_PER_PAGE - 1u) /
+        C4PRO_NATIVE_PAYLOAD_BYTES_PER_PAGE;
+
+    c4pro_installer_status("native install", "find payload",
+                           payload_pages, boot_pages);
+    for (uint32_t candidate = 0;
+         candidate < ARRAYLEN(c4pro_native_payload_pblk_candidates);
+         candidate++)
+    {
+        uint32_t start_page =
+            c4pro_native_payload_pblk_candidates[candidate] *
+            C4PRO_INSTALL_PAGES_PER_BLOCK;
+        bool erase_ok = true;
+
+        last_payload_start_page = start_page;
+        c4pro_installer_status("native install", "erase payload",
+                               c4pro_native_payload_pblk_candidates[candidate],
+                               candidate);
+        erase_ok = c4pro_native_erase_pages(start_page, payload_pages);
+
+        if (!erase_ok)
+        {
+            last_payload_pblk = c4pro_native_payload_pblk_candidates[candidate];
+            last_payload_stage = 1;
+            last_payload_detail = start_page;
+            last_payload_expected = 0;
+            continue;
+        }
+
+        int blank_rc = c4pro_native_verify_blank_payload(start_page,
+                                                         payload_pages);
+        if (blank_rc)
+        {
+            last_payload_pblk = c4pro_native_payload_pblk_candidates[candidate];
+            last_payload_stage = 5;
+            last_payload_detail = (uint32_t)(blank_rc < 0 ? -blank_rc :
+                                             blank_rc);
+            last_payload_expected = 0;
+            c4pro_installer_status("payload bad", "erase blank",
+                                   last_payload_pblk, last_payload_detail);
+            continue;
+        }
+
+        int write_rc = c4pro_native_write_payload_pages("payload ok",
+                                                        start_page,
+                                                        candidate,
+                                                        payload_image,
+                                                        payload_pages,
+                                                        false);
+        last_payload_pblk = c4pro_native_payload_pblk_candidates[candidate];
+        if (write_rc == 0)
+        {
+            uint32_t actual_boot_crc = 0;
+            uint32_t actual_app_crc = 0;
+            uint32_t expected_boot_crc = c4pro_install_get32(payload_image + 16);
+            uint32_t expected_app_crc = c4pro_install_get32(payload_image + 20);
+            uint32_t boot_size = c4pro_install_get32(payload_image + 8);
+            uint32_t app_size = c4pro_install_get32(payload_image + 12);
+            int boot_rc;
+            int app_rc;
+
+            boot_rc = c4pro_native_crc_payload_region(
+                start_page + C4PRO_NATIVE_PAYLOAD_PAGE_STRIDE,
+                boot_size, expected_boot_crc, &actual_boot_crc);
+            if (boot_rc == 0 && app_size != 0)
+                app_rc = c4pro_native_crc_payload_region(
+                    start_page + (1u + boot_payload_pages) *
+                                     C4PRO_NATIVE_PAYLOAD_PAGE_STRIDE,
+                    app_size, expected_app_crc, &actual_app_crc);
+            else if (boot_rc == 0)
+                app_rc = 0;
+            else
+                app_rc = -99;
+
+            if (boot_rc == 0 && app_rc == 0)
+            {
+                payload_start_page = start_page;
+                break;
+            }
+
+            if (boot_rc)
+            {
+                last_payload_stage = 3;
+                last_payload_detail = actual_boot_crc;
+                last_payload_expected = expected_boot_crc;
+                c4pro_installer_status("payload bad", "boot crc",
+                                       last_payload_pblk, actual_boot_crc);
+            }
+            else
+            {
+                last_payload_stage = 4;
+                last_payload_detail = actual_app_crc;
+                last_payload_expected = expected_app_crc;
+                c4pro_installer_status("payload bad", "app crc",
+                                       last_payload_pblk, actual_app_crc);
+            }
+        }
+        else
+        {
+            last_payload_stage = 2;
+            last_payload_detail = (uint32_t)(-write_rc);
+            last_payload_expected = 0;
+            c4pro_installer_status("payload bad", "write page",
+                                   last_payload_pblk, last_payload_detail);
+        }
+    }
+
+    if (payload_start_page == 0)
+    {
+        lcd_setfont(FONT_SYSFIXED);
+        lcd_clear_display();
+        lcd_puts(0, 0, "FAIL payload");
+        lcd_putsf(0, 1, "pblk %lu stage %lu",
+                  (unsigned long)last_payload_pblk,
+                  (unsigned long)last_payload_stage);
+        lcd_putsf(0, 2, "page %lu", (unsigned long)last_payload_start_page);
+        lcd_putsf(0, 3, "exp %08lx", (unsigned long)last_payload_expected);
+        lcd_putsf(0, 4, "act %08lx", (unsigned long)last_payload_detail);
+        lcd_update();
+        c4pro_installer_halt();
+    }
+
+    c4pro_installer_status("native install", "erase boot", 0, boot_pages);
+    if (c4pro_native_nand_erase_block(0))
+        c4pro_installer_fail("erase boot", 0);
+
+    c4pro_native_write_pages("boot ok", 0, boot_image, boot_pages, true);
+
+    c4pro_installer_status("done", "native", payload_start_page, boot_pages);
+    c4pro_installer_halt();
+}
+#endif
+
+#ifdef C4PRO_APP_LOADPATH_CORRUPTOR
+static void c4pro_app_loadpath_corruptor(void) NORETURN_ATTR;
+static void c4pro_app_loadpath_corruptor(void)
+{
+#ifdef C4PRO_APP_LOADPATH_SCAN
+    int hits[8];
+    unsigned hit_count = 0;
+
+    for (unsigned i = 0; i < ARRAYLEN(hits); i++)
+        hits[i] = -1;
+
+    lcd_setfont(FONT_SYSFIXED);
+    c4pro_installer_status("scan base", "wait", 0, 0);
+
+    for (uint32_t psec = 0; psec < 1048576u && hit_count < ARRAYLEN(hits);
+         psec++)
+    {
+        uint32_t page = psec / C4PRO_INSTALL_SECTORS_PER_PAGE;
+        uint32_t sector = psec % C4PRO_INSTALL_SECTORS_PER_PAGE;
+
+        if (c4pro_nand_read_linear_page(0, page, c4pro_install_page))
+            continue;
+
+        for (uint32_t off = sector * 512u; off + 11u <= sector * 512u + 512u;
+             off += 32u)
+        {
+            if (!memcmp(c4pro_install_page + off, "BASE    RKW", 11))
+            {
+                hits[hit_count++] = (int)psec;
+                break;
+            }
+        }
+
+        if ((psec & 0x3fffu) == 0)
+            c4pro_installer_status("scan base", "psec", psec, hit_count);
+    }
+
+    lcd_clear_display();
+    lcd_putsf(0, 0, "BASE hits %u", hit_count);
+    for (unsigned i = 0; i < ARRAYLEN(hits) && i < 7; i++)
+        lcd_putsf(0, i + 1, "%u p%d", i, hits[i]);
+    lcd_update();
+    c4pro_installer_halt();
+#else
+    static const uint32_t target_psecs[] = { 324369u, 331461u };
+    static const char *target_names[] = { "SYSTEM", "SYSTEM00" };
+    uint32_t crc = 0xffffffffu;
+    const unsigned char zero = 0;
+
+    for (unsigned target = 0; target < ARRAYLEN(target_psecs); target++)
+    {
+        uint32_t psec = target_psecs[target];
+        uint32_t page = psec / C4PRO_INSTALL_SECTORS_PER_PAGE;
+        uint32_t sector = psec % C4PRO_INSTALL_SECTORS_PER_PAGE;
+        uint32_t sector_base = sector * 512u;
+        uint32_t column = 0xffffffffu;
+
+        if (c4pro_nand_read_linear_page(0, page, c4pro_install_page))
+            c4pro_installer_fail("read page", (int)page);
+
+        for (uint32_t off = sector_base; off < sector_base + 512u; off += 32u)
+        {
+            if (!memcmp(c4pro_install_page + off, "BASE    RKW", 11))
+            {
+                column = off;
+                break;
+            }
+        }
+
+        if (column == 0xffffffffu)
+            c4pro_installer_fail("no base ent", (int)page);
+
+        crc = c4pro_installer_crc32_update(crc, c4pro_install_page,
+                                           sizeof(c4pro_install_page));
+
+        if (c4pro_nand_program_bytes(0, page, column, &zero, 1))
+            c4pro_installer_fail("patch byte", (int)page);
+
+        if (c4pro_nand_read_linear_page(0, page, c4pro_install_verify))
+            c4pro_installer_fail("verify read", (int)page);
+
+        if (c4pro_install_verify[column] != 0)
+            c4pro_installer_fail("verify byte", (int)page);
+
+        c4pro_installer_status("hide base", target_names[target],
+                               page, psec);
+        sleep(2 * HZ);
+    }
+
+    c4pro_installer_status("done", "hide base", crc ^ 0xffffffffu,
+                           ARRAYLEN(target_psecs));
+    c4pro_installer_halt();
+#endif
+}
+#endif
+
+static void c4pro_app_system_installer(void) NORETURN_ATTR;
+static void c4pro_app_system_installer(void)
+{
+    uint32_t image_pages = C4PRO_INSTALL_SYSTEM_SECTORS /
+                           C4PRO_INSTALL_SECTORS_PER_PAGE;
+    uint32_t start_page = C4PRO_INSTALL_SYSTEM_PSEC_BASE /
+                          C4PRO_INSTALL_SECTORS_PER_PAGE;
+    uint32_t first_block = start_page / C4PRO_INSTALL_PAGES_PER_BLOCK;
+    uint32_t last_page = start_page + image_pages - 1u;
+    uint32_t last_block = last_page / C4PRO_INSTALL_PAGES_PER_BLOCK;
+    uint32_t crc = 0xffffffffu;
+
+    c4pro_installer_status("embedded", "BASE.RKW", image_pages,
+                           c4pro_installer_payload_size);
+
+#ifdef C4PRO_APP_SYSTEM_INSTALLER_STOCK_RAW_WRITE
+    for (uint32_t block = first_block; block <= last_block; block++)
+    {
+        uint32_t page = block * C4PRO_INSTALL_PAGES_PER_BLOCK;
+        if (c4pro_nand_erase_block(0, page))
+            c4pro_installer_fail("erase", (int)block);
+        if ((block & 3u) == 0)
+            c4pro_installer_status("erase", "stock raw", block, last_block);
+    }
+#else
+    c4pro_installer_status("verify-only", "no erase", first_block, last_block);
+#endif
+
+    memset(c4pro_install_spare, 0xff, sizeof(c4pro_install_spare));
+    for (uint32_t page = 0; page < image_pages; page++)
+    {
+        c4pro_install_fill_page(page, c4pro_install_page);
+        crc = c4pro_installer_crc32_update(crc, c4pro_install_page,
+                                           sizeof(c4pro_install_page));
+
+#ifdef C4PRO_APP_SYSTEM_INSTALLER_STOCK_RAW_WRITE
+        if (c4pro_nand_write_page(0, start_page + page, c4pro_install_page,
+                                  c4pro_install_spare))
+            c4pro_installer_fail("write", (int)page);
+
+        if (c4pro_nand_read_linear_page(0, start_page + page,
+                                        c4pro_install_verify))
+            c4pro_installer_fail("readback", (int)page);
+
+        if (memcmp(c4pro_install_page, c4pro_install_verify,
+                   sizeof(c4pro_install_page)))
+            c4pro_installer_fail("verify", (int)page);
+#endif
+
+        if ((page & 0x7fu) == 0)
+            c4pro_installer_status("page", "system image", page, image_pages);
+    }
+
+    c4pro_installer_status("done",
+#ifdef C4PRO_APP_SYSTEM_INSTALLER_STOCK_RAW_WRITE
+                           "raw stock write",
+#else
+                           "verified embed",
+#endif
+                           crc ^ 0xffffffffu, image_pages);
+    c4pro_installer_halt();
+}
+#endif
+
 #if (CONFIG_PLATFORM & PLATFORM_ANDROID)
 #include "notification.h"
 #endif
@@ -131,7 +1269,7 @@
 #endif
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_USB_DIAG_EXPORT)
+    (defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE))
 extern volatile unsigned c4pro_usb_diag_irq_count;
 extern volatile unsigned c4pro_usb_diag_reset_count;
 extern volatile unsigned c4pro_usb_diag_conn_count;
@@ -1159,6 +2297,69 @@ static void c4pro_show_usb_diag_loop(void)
         sleep(HZ / 2);
     }
 }
+
+#elif defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_MSC_ENABLE)
+static void c4pro_usb_msc_settle_storage(void)
+{
+    for (int i = 0; i < 16; i++)
+    {
+        c4pro_usb_diag_sample();
+        if (c4pro_usb_diag_setup_count != 0 &&
+            c4pro_usb_diag_core_config == 0)
+        {
+            c4pro_usb_diag_enter_storage_mode();
+            c4pro_usb_diag_force_storage_config();
+        }
+
+        sleep(HZ / 4);
+    }
+}
+
+#ifdef C4PRO_USB_MSC_STATUS
+static void c4pro_show_usb_msc_status(void)
+{
+    lcd_setfont(FONT_SYSFIXED);
+
+    while (1)
+    {
+        c4pro_usb_msc_settle_storage();
+        c4pro_usb_diag_sample();
+        lcd_clear_display();
+        lcd_puts(0, 0, "C4MSC final");
+        lcd_putsf(0, 1, "irq%u rst%u con%u",
+                  c4pro_usb_diag_irq_count,
+                  c4pro_usb_diag_reset_count,
+                  c4pro_usb_diag_conn_count);
+        lcd_putsf(0, 2, "setup%u in%u out%u",
+                  c4pro_usb_diag_setup_count,
+                  c4pro_usb_diag_in0_count,
+                  c4pro_usb_diag_out0_count);
+        lcd_putsf(0, 3, "core s%u c%u if%u",
+                  c4pro_usb_diag_core_state,
+                  c4pro_usb_diag_core_config,
+                  c4pro_usb_diag_core_interfaces);
+        lcd_putsf(0, 4, "ep%d xf%u rp%u",
+                  c4pro_usb_diag_ep0_state,
+                  c4pro_usb_diag_xfer_count,
+                  c4pro_usb_diag_response_count);
+        lcd_putsf(0, 5, "stor i%u a%u x%u",
+                  c4pro_usb_storage_diag_init_count,
+                  c4pro_usb_storage_diag_arm_count,
+                  c4pro_usb_storage_diag_xfer_count);
+        lcd_putsf(0, 6, "cbw%u bad%u cmd%02x",
+                  c4pro_usb_storage_diag_cbw_count,
+                  c4pro_usb_storage_diag_bad_sig,
+                  c4pro_usb_storage_diag_last_cmd);
+        lcd_putsf(0, 7, "ex%u lun%u bs%u",
+                  c4pro_usb_storage_diag_exclusive,
+                  c4pro_usb_storage_diag_lun_present,
+                  c4pro_usb_storage_diag_block_size);
+        lcd_update();
+        sleep(HZ);
+    }
+}
+#endif
 
 #ifdef C4PRO_FTL_META_TAG_PROBE
 static void c4pro_show_meta_tag_probe(void)
@@ -2509,8 +3710,86 @@ static void c4pro_show_ftl_probe(void)
 #endif /* !defined(SIMULATOR) */
 #endif /* COLORFLY_C4_PRO */
 
-#if 1
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_BOOT_PROFILE)
+#define C4PRO_BOOT_PROFILE_MAX 32
+static const char *c4pro_boot_profile_step[C4PRO_BOOT_PROFILE_MAX];
+static long c4pro_boot_profile_tick[C4PRO_BOOT_PROFILE_MAX];
+static int c4pro_boot_profile_count;
+
+static void c4pro_boot_profile_add(const char *step)
+{
+    if (c4pro_boot_profile_count < C4PRO_BOOT_PROFILE_MAX)
+    {
+        int i = c4pro_boot_profile_count++;
+        c4pro_boot_profile_step[i] = step;
+        c4pro_boot_profile_tick[i] = current_tick;
+    }
+}
+
+static void c4pro_boot_profile_show(const char *where)
+{
+    int best[6];
+    int best_count = 0;
+
+    for (int i = 0; i < 6; i++)
+        best[i] = -1;
+
+    for (int i = 0; i < c4pro_boot_profile_count; i++)
+    {
+        long prev = i > 0 ? c4pro_boot_profile_tick[i - 1] : 0;
+        long delta = c4pro_boot_profile_tick[i] - prev;
+        int insert = best_count;
+
+        for (int j = 0; j < best_count; j++)
+        {
+            int b = best[j];
+            long bprev = b > 0 ? c4pro_boot_profile_tick[b - 1] : 0;
+            long bdelta = c4pro_boot_profile_tick[b] - bprev;
+
+            if (delta > bdelta)
+            {
+                insert = j;
+                break;
+            }
+        }
+
+        if (insert < 6)
+        {
+            if (best_count < 6)
+                best_count++;
+            for (int j = best_count - 1; j > insert; j--)
+                best[j] = best[j - 1];
+            best[insert] = i;
+        }
+    }
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "C4BOOT");
+    lcd_putsf(0, 1, "%s t%ld n%d", where, current_tick,
+              c4pro_boot_profile_count);
+    for (int line = 2, i = 0; i < best_count && line < 8; i++, line++)
+    {
+        int step = best[i];
+        long prev = step > 0 ? c4pro_boot_profile_tick[step - 1] : 0;
+        lcd_putsf(0, line, "%ld +%ld %.12s",
+                  c4pro_boot_profile_tick[step],
+                  c4pro_boot_profile_tick[step] - prev,
+                  c4pro_boot_profile_step[step]);
+    }
+    lcd_update();
+    sleep(10 * HZ);
+}
+
+#define C4PRO_BOOT_STEP(step) c4pro_boot_profile_add(step)
+#define C4PRO_PRE_ROOT_MENU_HALT(step) c4pro_boot_profile_show(step)
+#else
 #define C4PRO_BOOT_STEP(step) do { } while (0)
+#define C4PRO_PRE_ROOT_MENU_HALT(step) do { } while (0)
+#endif
+
+#if 1
 #define C4PRO_BOOT_HALT(step) do { } while (0)
 #define C4PRO_APP_ENTRY_HALT() do { } while (0)
 #define C4PRO_SYSTEM_HALT() do { } while (0)
@@ -2525,7 +3804,6 @@ static void c4pro_show_ftl_probe(void)
 #define C4PRO_STORAGE_HALT() do { } while (0)
 #define C4PRO_MOUNT_READY_HALT() do { } while (0)
 #define C4PRO_POST_CORE_INIT_HALT() do { } while (0)
-#define C4PRO_PRE_ROOT_MENU_HALT(step) do { } while (0)
 #else
 #define C4PRO_BOOT_STEP(step) do { } while (0)
 #define C4PRO_BOOT_HALT(step) do { } while (0)
@@ -2563,24 +3841,38 @@ int main(void)
     CHART(">init");
     init();
     CHART("<init");
+    C4PRO_BOOT_STEP("init done");
     C4PRO_BOOT_HALT("init complete");
     FOR_NB_SCREENS(i)
     {
         screens[i].clear_display();
         screens[i].update();
     }
+    C4PRO_BOOT_STEP("screens ok");
     list_init();
+    C4PRO_BOOT_STEP("list ok");
     C4PRO_BOOT_STEP("tree_init");
     tree_init();
+    C4PRO_BOOT_STEP("tree ok");
 #if defined(HAVE_DEVICEDATA) && !defined(BOOTLOADER) /* SIMULATOR */
     verify_device_data();
 #endif
     /* Keep the order of this 3
      * Must be done before any code uses the multi-screen API */
 #if defined(HAVE_USBSTACK) && \
-    (!defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_DIAG_EXPORT))
+    (!defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_DIAG_EXPORT) || \
+     defined(C4PRO_USB_MSC_ENABLE))
     /* All threads should be created and public queues registered by now */
     usb_start_monitoring();
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_MSC_ENABLE)
+    c4pro_usb_diag_enter_storage_mode();
+    c4pro_usb_diag_force_storage_config();
+    c4pro_usb_msc_settle_storage();
+#ifdef C4PRO_USB_MSC_STATUS
+    c4pro_show_usb_msc_status();
+#endif
+#endif
 #endif
 
 #if !defined(DISABLE_ACTION_REMAP) && defined(CORE_KEYREMAP_FILE)
@@ -2634,6 +3926,7 @@ int main(void)
 
     global_status.last_volume_change = 0;
     validate_start_directory_init();
+    C4PRO_BOOT_STEP("startdir ok");
     /* no calls INIT_ATTR functions after this point anymore!
      * see definition of INIT_ATTR in config.h */
     C4PRO_BOOT_STEP("root_menu");
@@ -2986,7 +4279,8 @@ static void init(void)
     adc_init();
     C4PRO_BOOT_STEP("adc ok");
 
-#if !defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_DIAG_EXPORT)
+#if !defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_DIAG_EXPORT) || \
+    defined(C4PRO_USB_MSC_ENABLE)
     usb_init();
 #endif
 #if CONFIG_USBOTG == USBOTG_ISP1362
@@ -3293,6 +4587,18 @@ static void init(void)
 
     C4PRO_MOUNT_READY_HALT();
     C4PRO_BOOT_STEP("mount ok");
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_APP_SYSTEM_INSTALLER)
+#ifdef C4PRO_APP_LOADPATH_CORRUPTOR
+    c4pro_app_loadpath_corruptor();
+#elif defined(C4PRO_APP_NATIVE_ROCKBOX_INSTALLER)
+    c4pro_app_native_rockbox_installer();
+#elif defined(C4PRO_APP_BOOT_INSTALLER)
+    c4pro_app_boot_installer();
+#else
+    c4pro_app_system_installer();
+#endif
+#endif
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_USB_DIAG_EXPORT)
     if (usb_detect() == USB_INSERTED)

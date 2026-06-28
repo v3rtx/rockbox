@@ -1123,6 +1123,19 @@ static int c4own_read_phys_sector(uint32_t pblk, uint32_t sector, void *buf)
     return 0;
 }
 
+static int c4own_read_phys_sector_uncached(uint32_t pblk, uint32_t sector,
+                                           void *buf)
+{
+    if (!c4own_pblk_valid(pblk) || sector >= C4OWN_SECTORS_PER_BLOCK)
+        return 1;
+
+    return c4pro_nand_read_linear_sector(
+        0,
+        c4own_pblk_page(pblk) + sector / C4OWN_SECTORS_PER_PAGE,
+        sector & (C4OWN_SECTORS_PER_PAGE - 1u),
+        buf);
+}
+
 static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
 {
     if (!c4own_pblk_valid(pblk) || page_in_block >= C4OWN_PAGES_PER_BLOCK)
@@ -1218,7 +1231,7 @@ static bool c4own_superblock_valid(uint32_t pblk)
 {
     unsigned char sector[512];
 
-    if (c4own_read_phys_sector(pblk, 0, sector))
+    if (c4own_read_phys_sector_uncached(pblk, 0, sector))
         return false;
 
     return c4own_get32(sector) == C4OWN_MAGIC_SB &&
@@ -1263,12 +1276,12 @@ static int c4own_mount_scan(void)
         uint32_t logical;
         uint32_t gen;
 
-        if (c4own_read_phys_sector(pblk, 0, header) ||
+        if (c4own_read_phys_sector_uncached(pblk, 0, header) ||
             !c4own_parse_header(header, &logical, &gen))
             continue;
 
-        if (c4own_read_phys_sector(pblk, C4OWN_SECTORS_PER_BLOCK - 1u,
-                                   commit) ||
+        if (c4own_read_phys_sector_uncached(
+                pblk, C4OWN_SECTORS_PER_BLOCK - 1u, commit) ||
             !c4own_parse_commit(commit, logical, gen))
             continue;
 
@@ -1306,6 +1319,19 @@ static int c4own_alloc_pblk(void)
                 c4own_retired[pblk] = 1;
                 continue;
             }
+            return pblk;
+        }
+    }
+
+    for (uint32_t pblk = C4OWN_FIRST_DATA_PBLK;
+         pblk < C4PRO_OWNED_PBLK_COUNT; pblk++)
+    {
+        if (!c4own_used[pblk] && c4own_retired[pblk])
+        {
+            c4own_used[pblk] = 1;
+            if (c4own_erase_pblk(pblk))
+                continue;
+            c4own_retired[pblk] = 0;
             return pblk;
         }
     }
@@ -1427,7 +1453,7 @@ static int c4own_read_sector_internal(uint32_t sector, void *buffer)
 
     int slot = c4own_find_cache_slot(logical);
 
-    if (slot >= 0 && c4own_cache_dirty[slot])
+    if (slot >= 0)
     {
         memcpy(buffer, c4own_cache_data[slot] + offset * 512u, 512);
         return 0;
@@ -1442,6 +1468,87 @@ static int c4own_read_sector_internal(uint32_t sector, void *buffer)
     return c4own_read_phys_sector(c4own_map[logical],
                                   C4OWN_SECTORS_PER_PAGE + offset,
                                   buffer);
+}
+
+static int c4own_read_internal(uint32_t sector, uint32_t count, void *buffer)
+{
+    unsigned char *out = buffer;
+
+    if (sector > C4OWN_VOLUME_SECTORS ||
+        count > C4OWN_VOLUME_SECTORS - sector)
+        return 1;
+
+    while (count > 0)
+    {
+        uint32_t logical = sector / C4OWN_PAYLOAD_SECTORS_PER_BLOCK;
+        uint32_t offset = sector % C4OWN_PAYLOAD_SECTORS_PER_BLOCK;
+        uint32_t n = C4OWN_PAYLOAD_SECTORS_PER_BLOCK - offset;
+        int slot;
+
+        if (n > count)
+            n = count;
+
+        slot = c4own_find_cache_slot(logical);
+        if (slot >= 0)
+        {
+            memcpy(out, c4own_cache_data[slot] + offset * 512u, n * 512u);
+            out += n * 512u;
+            sector += n;
+            count -= n;
+            continue;
+        }
+
+        if (c4own_map[logical] == 0xffffu)
+        {
+            memset(out, 0, n * 512u);
+            out += n * 512u;
+            sector += n;
+            count -= n;
+            continue;
+        }
+
+        while (n > 0)
+        {
+            uint32_t phys_sector = C4OWN_SECTORS_PER_PAGE + offset;
+            uint32_t sector_in_page =
+                phys_sector & (C4OWN_SECTORS_PER_PAGE - 1u);
+            uint32_t page_n = C4OWN_SECTORS_PER_PAGE - sector_in_page;
+            uint32_t page;
+
+            if (page_n > n)
+                page_n = n;
+
+            if (sector_in_page == 0 && page_n == C4OWN_SECTORS_PER_PAGE)
+            {
+                page = c4own_pblk_page(c4own_map[logical]) +
+                       phys_sector / C4OWN_SECTORS_PER_PAGE;
+                if (c4pro_nand_read_linear_page(0, page, out))
+                    return 1;
+
+                c4own_read_page_valid = false;
+            }
+            else
+            {
+                if (c4own_read_phys_sector(c4own_map[logical], phys_sector,
+                                           out))
+                    return 1;
+
+                if (page_n > 1)
+                    memcpy(out + 512u,
+                           c4own_read_page_data +
+                               (sector_in_page + 1u) * 512u,
+                           (page_n - 1u) * 512u);
+            }
+
+            out += page_n * 512u;
+            sector += page_n;
+            offset += page_n;
+            count -= page_n;
+            n -= page_n;
+        }
+    }
+
+    return 0;
 }
 
 static int c4own_write_logical_block(uint32_t logical, uint32_t first,
@@ -1713,17 +1820,14 @@ uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer)
     c4own_diag_map0 = c4own_map[0] == 0xffffu ? -1 : (int)c4own_map[0];
     c4own_diag_map2 = c4own_map[2] == 0xffffu ? -1 : (int)c4own_map[2];
 
-    while (count--)
-    {
-        if (c4own_read_sector_internal(sector++, out))
-            return 1;
-        if (first_sector == 0)
-            c4own_diag_lba0_sig = (int)c4own_get32(out);
-        if (first_sector == 2048u)
-            c4own_diag_lba2048_sig = (int)c4own_get32(out);
-        out += 512;
-        first_sector++;
-    }
+    if (c4own_read_internal(sector, count, out))
+        return 1;
+
+    if (first_sector == 0)
+        c4own_diag_lba0_sig = (int)c4own_get32(out);
+    if (first_sector <= 2048u && first_sector + count > 2048u)
+        c4own_diag_lba2048_sig =
+            (int)c4own_get32(out + (2048u - first_sector) * 512u);
 
     return 0;
 #elif defined(COLORFLY_C4_PRO)
@@ -1844,8 +1948,15 @@ uint32_t ftl_write(uint32_t sector, uint32_t count, const void* buffer)
     if (!c4own_ready && !c4own_formatting)
         return (uint32_t)-1;
 
-    return c4own_write_internal(sector, count, buffer) ?
-           (uint32_t)-1 : 0;
+    if (c4own_write_internal(sector, count, buffer))
+        return (uint32_t)-1;
+
+#ifdef C4PRO_FTL_ROCKBOX_OWNED_WRITETHROUGH
+    if (!c4own_formatting && c4own_flush_cache())
+        return (uint32_t)-1;
+#endif
+
+    return 0;
 #elif defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_RAM_WRITE_TEST)
     const unsigned char *in = buffer;
 

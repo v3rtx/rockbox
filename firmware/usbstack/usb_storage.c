@@ -140,7 +140,7 @@ static int usb_storage_flush_media(void)
 #endif
 }
 
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
 volatile unsigned c4pro_usb_storage_diag_xfer_count;
 volatile unsigned c4pro_usb_storage_diag_init_count;
 volatile unsigned c4pro_usb_storage_diag_arm_count;
@@ -482,7 +482,7 @@ static int usb_handle = 0;
 static int usb_storage_init_connection(void)
 {
     logf("ums: set config");
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_storage_diag_init_count++;
 #endif
     /* prime rx endpoint. We only need room for commands */
@@ -522,7 +522,7 @@ static int usb_storage_init_connection(void)
 #endif
 #endif
     usb_drv_recv_nonblocking(EP_OUT, cbw_buffer, MAX_CBW_SIZE);
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_storage_diag_arm_count++;
 #endif
 
@@ -552,7 +552,7 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
 #endif
 
     logf("transfer result for ep %d/%d %X %d", ep,dir,status, length);
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_storage_diag_xfer_count++;
     c4pro_usb_storage_diag_last_xfer = ((unsigned)(ep & 0xff) << 24) |
                                        ((unsigned)(dir & 0xff) << 16) |
@@ -563,7 +563,7 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
 
     switch(state) {
         case RECEIVING_BLOCKS:
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
             c4pro_usb_storage_diag_recv_blocks_count++;
             c4pro_usb_storage_diag_recv_length = (unsigned)length;
             c4pro_usb_storage_diag_recv_status = (unsigned)status;
@@ -576,7 +576,7 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                 if((unsigned int)length!=(cur_cmd.block_size* cur_cmd.count)
                   && (unsigned int)length!=WRITE_BUFFER_SIZE) {
                     logf("unexpected length :%d",length);
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
                     c4pro_usb_storage_diag_unexpected_length++;
 #endif
                     break;
@@ -604,7 +604,7 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                 int result = USBSTOR_WRITE_SECTORS_FILTER();
 
                 if (result == 0) {
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
                     c4pro_usb_storage_diag_storage_write_calls++;
 #endif
                     result = storage_write_sectors(IF_MD(cur_cmd.lun,)
@@ -612,7 +612,7 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                         MIN(WRITE_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
                 }
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
                 c4pro_usb_storage_diag_storage_write_result = result;
 #endif
 
@@ -850,14 +850,14 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 
     if(letoh32(cbw->signature) != CBW_SIGNATURE) {
         logf("ums: bad cbw signature (%x)", cbw->signature);
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
         c4pro_usb_storage_diag_bad_sig++;
 #endif
         usb_drv_stall(EP_IN, true,true);
         usb_drv_stall(EP_OUT, true,false);
         return;
     }
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_storage_diag_cbw_count++;
 #endif
     /* Clear the signature to prevent possible bugs elsewhere
@@ -898,7 +898,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
     cur_cmd.tag = cbw->tag;
     cur_cmd.lun = lun;
     cur_cmd.cur_cmd = cbw->command_block[0];
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_storage_diag_last_cmd = cbw->command_block[0];
     c4pro_usb_storage_diag_last_lun = lun;
     c4pro_usb_storage_diag_last_len = length;
@@ -1378,7 +1378,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                 (cbw->command_block[7] << 8 |
                  cbw->command_block[8]);
             cur_cmd.block_size = block_size;
-#ifdef C4PRO_USB_DIAG_EXPORT
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
             c4pro_usb_storage_diag_write_cmd_count++;
             c4pro_usb_storage_diag_write_lba = (unsigned)cur_cmd.sector;
             c4pro_usb_storage_diag_write_blocks = cur_cmd.count;
