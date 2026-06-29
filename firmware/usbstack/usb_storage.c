@@ -474,7 +474,12 @@ static int usb_storage_get_config_descriptor(unsigned char *dest,int max_packet_
 }
 #if (CONFIG_CPU == IMX31L || defined(CPU_TCC780X) || \
      CONFIG_CPU == S5L8702 || CONFIG_CPU == S5L8701 || CONFIG_CPU == AS3525v2 || \
-     defined(BOOTLOADER) || CONFIG_CPU == DM320) && !defined(CPU_PP502x)
+     defined(BOOTLOADER) || CONFIG_CPU == DM320 || defined(COLORFLY_C4_PRO)) && \
+     !defined(CPU_PP502x)
+/* COLORFLY_C4_PRO: use the static-BSS transfer buffer (same low-DRAM memory
+ * class as the working capacity/CSW buffers in `tb`) rather than the dynamic
+ * core_alloc heap buffer, which the rk27xx UDC IN DMA does not transfer
+ * reliably for 512-byte bulk reads. */
 #define USB_STATIC_ALLOC
 #else
 static int usb_handle = 0;

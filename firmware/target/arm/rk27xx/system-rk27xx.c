@@ -143,6 +143,7 @@ void system_init(void)
     MCSDR_T_RCD = 1;               /* active to RD/WR delay */
 
     /* turn off clock for unused modules */
+#ifndef COLORFLY_C4_PRO
     SCU_CLKCFG |= CLKCFG_WDT        |        /* WDT pclk */
                   CLKCFG_RTC        |        /* RTC pclk */
                   CLKCFG_HSADC      |        /* HS_ADC clock */
@@ -152,19 +153,40 @@ void system_init(void)
                   CLKCFG_UART0      |        /* UART0 clock */
                   CLKCFG_VIP        |        /* VIP clock */
                   CLKCFG_HCLK_VIP   |        /* VIP HCLK */
-#ifndef COLORFLY_C4_PRO
                   CLKCFG_LCDC       |        /* LCDC clock */
-#endif
                   CLKCFG_NAND       |        /* NAND HCLK */
                   CLKCFG_UHC        |        /* USB host HCLK */
                   CLKCFG_DSP        |        /* DSP clock */
                   CLKCFG_OTP;                /* OTP clock (dunno what it is */
+#else
+    /* C4PRO: do NOT gate any clocks. MaskROM leaves SCU_CLKCFG = 0x00100000
+     * (almost everything on) and USB enumerates at high-speed; Rockbox's
+     * gating (0xc7bcc003) was starving the USB device PHY's clock domain,
+     * corrupting signalling (host error -71, full-speed only). Leaving the
+     * inherited clock config intact costs a little idle power but keeps USB
+     * working. */
+#endif
 
+#ifndef COLORFLY_C4_PRO
     /* turn off DSP pll */
     SCU_PLLCON2 |= (1<<22);
 
     /* turn off codec pll */
     SCU_PLLCON3 |= (1<<22);
+#else
+    /* C4PRO: do NOT power down the DSP/codec PLLs. The USB device PHY's
+     * reference clock appears to derive from one of these, so powering them
+     * down corrupts USB signalling (host error -71, full-speed only) even
+     * though MaskROM enumerates high-speed with them left running. */
+
+    /* NOTE: clearing PLLCON3 bit0 (the only inherited-register difference
+     * between the USB-working warm state ...f8 and the failing NAND cold boot
+     * ...f9) was tried and made NO difference - cold boot still falls back to
+     * full-speed/error-71. So the cold-boot HS failure is NOT a static register
+     * difference; the mask BootROM's USB bring-up does something to the PHY
+     * (its internal HS PLL / analog state) that a NAND cold boot never runs and
+     * SOFT_POR cannot reproduce. Fix requires porting that PHY init sequence. */
+#endif
 #endif
 }
 
@@ -250,6 +272,13 @@ void commit_discard_dcache_range (const void *base, unsigned int size)
         CACHEOP = opcode;
         opcode += 32;
     }
+
+    /* The loop waits for the PREVIOUS op at the top of each iteration, so the
+     * final opcode issued above is never waited on. Without this, the last
+     * cache line's commit-discard can still be in flight when the caller starts
+     * a DMA from the just-flushed buffer (the rk27xx UDC IN DMA is a separate
+     * bus master). Wait for it here, matching cache_invalidate_way(). */
+    while (CACHEOP & 0x03);
 }
 
 #if !defined(BOOTLOADER) && defined(HAVE_ADJUSTABLE_CPU_FREQ)

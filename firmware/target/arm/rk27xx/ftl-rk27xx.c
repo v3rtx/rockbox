@@ -1341,6 +1341,17 @@ static int c4own_mount_scan(void)
             !c4own_parse_header(header, &logical, &gen))
             continue;
 
+        /* Reject stale headers whose logical block number is outside the
+         * current map. A block left over from a LARGER owned-volume geometry
+         * (e.g. after shrinking C4PRO_OWNED_PBLK_COUNT) carries logical numbers
+         * up to that larger volume's count; without this guard the
+         * c4own_map[logical]/c4own_gen[logical] writes below run off the end of
+         * the (now smaller) arrays and corrupt adjacent globals/code, which
+         * manifested as data-abort / undefined-instruction crashes in the
+         * c4own_* map/cache functions during USB reads. */
+        if (logical >= C4OWN_LOGICAL_BLOCKS)
+            continue;
+
         if (c4own_read_phys_sector_uncached(
                 pblk, C4OWN_SECTORS_PER_BLOCK - 1u, commit) ||
             !c4own_parse_commit(commit, logical, gen))

@@ -72,6 +72,7 @@ struct endpoint_t
 #define DMAINCTL(endp)      *(3 + (endp)->stat)
 #define DMAINLMADDR(endp)   *(4 + (endp)->stat)
 
+
 #define ENDPOINT(num, type, dir, reg) \
     {num, USB_ENDPOINT_XFER_##type, USB_DIR_##dir, reg, NULL, 0, 0, true, {{0, 0}, 0, 0}}
 
@@ -110,6 +111,7 @@ static volatile bool set_configuration = false;
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
 static void udc_phy_reset(void);
 static void udc_soft_connect(void);
+static void c4pro_udc_arm_and_connect(void);
 #endif
 
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
@@ -125,11 +127,29 @@ void c4pro_usb_diag_force_reattach(void)
      * fallback (~1.5 MB/s, and bulk-OUT then has no PING flow control, so the
      * host resets the link during long NAND-write stalls). Stock firmware and
      * bootloader both leave DEV_CTL at 0x118 (no bit 6) and negotiate HS. */
-    DEV_CTL = DEV_SELF_PWR;
-    udelay(500000);
+    /* Re-present to the host: drop the pull-up, reset the PHY, then re-arm EP0
+     * and reconnect. The real cold-boot enumeration failure was the USB host
+     * clock (CLKCFG_UHC) being gated off in system_init() — on this OTG part it
+     * shares the device PHY clock domain, so the PHY signaling was corrupted
+     * (host saw "error -71", full-speed only). With UHC kept on for C4PRO the
+     * standard phy_reset + arm-before-connect sequence enumerates. */
+    /* Maximal preservation of the BootROM-initialised PHY: do NOT SOFT_POR the
+     * PHY (udc_phy_reset) and do NOT hard-reset the controller (RSTCFG_UDC is
+     * skipped in usb_init_device for C4PRO). Just toggle the D+ pull-up so the
+     * host re-enumerates, keeping whatever HS-capable analog/clock state the
+     * BootROM left. SOFT_POR + controller reset were corrupting the signalling
+     * (host error -71, full-speed only) on a native boot. */
+    c4pro_usb_did_soft_connect = true;
+    DEV_CTL &= ~DEV_SOFT_CN;        /* disconnect */
+    udelay(100000);                 /* let the host see the detach */
+#ifdef C4PRO_USB_STOCK_PATH
+    /* A/B: stock rk27xx reattach (SOFT_POR -> PHY16BIT set, then soft connect) */
     udc_phy_reset();
     udelay(10000);
     udc_soft_connect();
+#else
+    c4pro_udc_arm_and_connect();    /* re-arm EP0 + reconnect, no SOFT_POR */
+#endif
 }
 #endif
 
@@ -218,10 +238,102 @@ static int max_pkt_size(struct endpoint_t *endp)
     }
 }
 
+#if defined(COLORFLY_C4_PRO)
+/* Chunk size for the synchronous bulk-IN sender. One USB max-packet (512) per
+ * DMA is the simplest, guaranteed-aligned choice. The stock firmware uses a
+ * runtime halfword chunk (var [0x6070F510], <=2047 = TXLEN field width) and
+ * lets the controller auto-packetize each chunk into 512-byte USB packets;
+ * bump this to a larger <=2047 value later if a single multi-packet DMA per
+ * chunk is desired. */
+#define C4PRO_SYNC_IN_CHUNK   512
+
+/* Return true for the bulk-IN data endpoints whose send is diverted to the
+ * synchronous polled path (ep != 0, IN, BULK). EP0/control and OUT stay on the
+ * stock interrupt-driven path. */
+static inline bool c4pro_is_sync_in_ep(struct endpoint_t *endp)
+{
+    return endp->ep_num != 0 &&
+           endp->dir == USB_DIR_IN &&
+           endp->type == USB_ENDPOINT_XFER_BULK;
+}
+
+/* Synchronous, polled bulk-IN (device->host) sender mirroring the stock
+ * Colorfly C4 Pro firmware's single-DMA send @0x607041BC, looped over the whole
+ * transfer (@0x60704990). The interrupt-driven per-packet ep_write() path does
+ * not transmit >=512-byte reads reliably on this controller; the stock path
+ * never depends on TXACK to advance packets.
+ *
+ * Per chunk, exactly per 0x607041BC:
+ *   1. wait while(DMAINCTL & DMA_START)   ; previous DMA engine idle
+ *   2. wait while(TXBUF & TXFULL)         ; FIFO not full
+ *   3. TXSTAT  = chunk count              ; byte count for this DMA
+ *   4. DMAINLMADDR = src                  ; source buffer address
+ *   5. DMAINCTL = DMA_START               ; fire the DMA (GO bit) and continue
+ *
+ * Like stock, a chunk does NOT wait for its own DMA to self-clear: the wait at
+ * step 1 of the NEXT send (including the CSW, which uses this same bulk-IN ep)
+ * serialises it. Every poll is tick-bounded (HZ/10) so a stuck controller can't
+ * hang the thread. The data has already been committed out of the D-cache by
+ * _usb_drv_send()/commit_discard_dcache_range() before we get here. */
+static void c4pro_ep_write_sync(struct endpoint_t *endp)
+{
+    int remaining = endp->cnt;
+
+    while(remaining > 0)
+    {
+        int chunk = MIN(C4PRO_SYNC_IN_CHUNK, remaining);
+        unsigned int timeout;
+
+        /* 1. DMA engine idle */
+        timeout = current_tick + HZ/10;
+        while(DMAINCTL(endp) & DMA_START)
+            if(TIME_AFTER(current_tick, timeout)) break;
+
+        /* 2. FIFO not full */
+        timeout = current_tick + HZ/10;
+        while(TXBUF(endp) & TXFULL)
+            if(TIME_AFTER(current_tick, timeout)) break;
+
+        /* 3-5. program count + source and fire the DMA, then return to the
+         * loop IMMEDIATELY - exactly per stock @0x607041BC, which does NOT wait
+         * for DMA_START to self-clear and NEVER touches TXCON in the send path.
+         * The double-buffer pipelines naturally: the wait at step 1/2 of the
+         * NEXT chunk is the only synchronisation. A read-modify-write on TXCON
+         * here would diverge from stock and can disturb the TX FIFO
+         * double-buffer (slots stuck full, DMA retiring without refill). */
+        TXSTAT(endp)      = chunk;
+        DMAINLMADDR(endp) = (uint32_t)endp->buf;
+        DMAINCTL(endp)    = DMA_START;
+
+        endp->buf += chunk;
+        remaining -= chunk;
+    }
+
+    /* The whole payload has been drained synchronously. Complete the transfer
+     * WITHOUT relying on the TXACK interrupt, mirroring exactly what in_intr()
+     * does on the final TXACK so the usb_storage state machine advances to the
+     * CSW. endp->len is the total length set in _usb_drv_send(). */
+    endp->cnt = 0;
+    usb_core_transfer_complete(endp->ep_num, endp->dir, 0, endp->len);
+    if(endp->block)
+        semaphore_release(&endp->complete);
+}
+#endif /* COLORFLY_C4_PRO */
+
 static void ep_write(struct endpoint_t *endp)
 {
     int xfer_size = MIN(max_pkt_size(endp), endp->cnt);
     unsigned int timeout = current_tick + HZ/10;
+
+#if defined(COLORFLY_C4_PRO)
+    /* Divert bulk-IN data endpoints to the synchronous polled sender (stock
+     * @0x607041BC). EP0/control and OUT stay on the interrupt-driven path. */
+    if(c4pro_is_sync_in_ep(endp))
+    {
+        c4pro_ep_write_sync(endp);
+        return;
+    }
+#endif
 
     while(TXBUF(endp) & TXFULL) /* TXFULL flag */
     {
@@ -233,6 +345,21 @@ static void ep_write(struct endpoint_t *endp)
     TXSTAT(endp) = xfer_size;
     DMAINLMADDR(endp) = (uint32_t)endp->buf; /* local buffer address */
     DMAINCTL(endp) = DMA_START;
+#if defined(COLORFLY_C4_PRO)
+    /* Wait for the DMA engine to finish loading the TX FIFO before the packet
+     * is clocked out. The stock bulk-IN sender (@0x607041BC) polls the
+     * DMA_START bit until it self-clears after every chunk; without this wait
+     * the controller can transmit before the DMA has filled the FIFO and clock
+     * out stale FIFO residue for >=512-byte transfers. */
+    {
+        unsigned int dma_to = current_tick + HZ/10;
+        while(DMAINCTL(endp) & DMA_START)
+        {
+            if(TIME_AFTER(current_tick, dma_to))
+                break;
+        }
+    }
+#endif
     /* Decrement by max packet size is intentional.
      * This way if we have final packet short one we will get negative len
      * after transfer, which in turn indicates we *don't* need to send
@@ -275,6 +402,16 @@ static void in_intr(struct endpoint_t *endp)
         logf("clear_stall: %d", endp->ep_num);
         usb_drv_stall(endp->ep_num, false, true);
     }
+#if defined(COLORFLY_C4_PRO)
+    /* Bulk-IN data endpoints are sent synchronously in c4pro_ep_write_sync(),
+     * which already drained the whole transfer and called
+     * usb_core_transfer_complete() exactly once. The hardware still raises a
+     * TXACK per packet afterwards; ignore those here so the transfer is not
+     * completed (and the next one not re-armed) a second time. Control EP0 and
+     * the OUT path are untouched. */
+    if(c4pro_is_sync_in_ep(endp))
+        return;
+#endif
     /* check if a transfer has finished */
     if(txstat & TXACK)
     {
@@ -347,6 +484,35 @@ static void udc_soft_connect(void)
                DEV_SELF_PWR;
 }
 
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
+/* Arm EP0 (and latch CSR_DONE) BEFORE asserting the D+ pull-up, mirroring the
+ * stock RK27xx first-stage loader's USB bring-up (init @0x60005438, EP config
+ * @0x60004114): EN_INT/INTCON/TX0CON/RX0CON and CSR_DONE are all configured
+ * first, and DEV_SOFT_CN (connect) is the very last write.
+ *
+ * Rockbox's default path instead asserted DEV_SOFT_CN in udc_soft_connect()
+ * while EP0's receiver (RX0CON.RXEPEN) was still disarmed and CSR_DONE not yet
+ * latched; EP0 only got armed later inside the USBRST ISR. On a cold NAND boot
+ * (no MaskROM USB warm-up) the controller therefore had no armed EP0 SETUP
+ * receiver when the host began enumeration, so the host's bus resets were seen
+ * but the first SETUP was never captured (observed as rst>0, con0, setup0, and
+ * no host enumeration). Arming before connect is the fix. */
+static void c4pro_udc_arm_and_connect(void)
+{
+    EN_INT = EN_SETUP_INTR | EN_IN0_INTR | EN_OUT0_INTR |
+             EN_USBRST_INTR | EN_RESUME_INTR | EN_SUSP_INTR;
+    INTCON = UDC_INTHIGH_ACT | UDC_INTEN;
+    TX0CON = TXNAK | TXACKINTEN;            /* 0x44 */
+    RX0CON = RXNAK | RXEPEN | RXACKINTEN;   /* 0x98: arm EP0 SETUP/OUT receiver */
+    /* EXPERIMENT: preserve the hardware-set DEV_PHY16BIT (16-bit PHY) rather
+     * than forcing it clear. Clearing it to 0x118 did NOT enable HS (still
+     * full-speed + host error -71), so the PHY may genuinely be 16-bit and need
+     * the bit set for the chirp. Only clear SOFT_POR while latching CSR_DONE. */
+    DEV_CTL = (DEV_CTL & ~SOFT_POR) | CSR_DONE | DEV_SELF_PWR;
+    DEV_CTL |= DEV_SOFT_CN;                 /* assert pull-up LAST */
+}
+#endif
+
 static void udc_helper(void)
 {
     uint32_t dev_info = DEV_INFO;
@@ -403,9 +569,24 @@ void usb_drv_ep_init(const struct usb_drv_ep_alloc_ctx* ctx, int ep)
     struct endpoint_t *endp = &endpoints[epnum];
 
     if(epdir == DIR_IN)
+#if defined(COLORFLY_C4_PRO)
+        /* Match the stock C4 firmware's bulk-IN endpoint config (TX2CON=0x248):
+         * TXEPEN|TXACKINTEN, with NO TXNAK and NO TXCFINTE. Leaving TXNAK set
+         * (Rockbox default 0x124C) makes the controller transmit stale FIFO/DMA
+         * residue for >=512-byte bulk reads instead of the freshly-DMA'd data
+         * (host saw a {sector,~sector} pattern). Verified against stock EP-config
+         * routine @0x60704114. */
+        TXCON(endp) = (epnum << 8) | TXEPEN | TXACKINTEN;
+#else
         TXCON(endp) = (epnum << 8) | TXEPEN | TXNAK | TXACKINTEN | TXCFINTE;
+#endif
     else
+#if defined(COLORFLY_C4_PRO)
+        /* Stock bulk-OUT config (RX1CON=0x190): RXEPEN|RXACKINTEN, no RXNAK. */
+        RXCON(endp) = (epnum << 8) | RXEPEN | RXACKINTEN;
+#else
         RXCON(endp) = (epnum << 8) | RXEPEN | RXNAK | RXACKINTEN | RXCFINTE | RXERRINTEN;
+#endif
     EN_INT |= 1 << (epnum + 7);
 }
 
@@ -552,14 +733,27 @@ void usb_drv_init(void)
     if(!c4pro_usb_did_soft_connect)
     {
         c4pro_usb_did_soft_connect = true;
-        /* No DEV_PHY16BIT: the UDC PHY is 8-bit UTMI+; the 16-bit bit breaks the
-         * high-speed chirp and drops the link to full-speed. See the note in
-         * c4pro_usb_diag_force_reattach(). */
+#ifdef C4PRO_USB_STOCK_PATH
+        /* A/B EXPERIMENT: stock rk27xx connect path (as HM-801, which does
+         * negotiate high-speed): SOFT_POR the PHY (hardware then sets PHY16BIT,
+         * DEV_CTL->0x158), wait, then standard udc_soft_connect. Tests whether
+         * the C4 'no POR / no PHY16BIT' customisation is what blocks HS. */
         DEV_CTL = DEV_SELF_PWR;
-        udelay(250000);
         udc_phy_reset();
         udelay(10000);
         udc_soft_connect();
+#else
+        /* Do NOT SOFT_POR the PHY here. Boot snapshot proves the BootROM (cold
+         * boot) / MaskROM (s2run) leaves the UDC PHY at DEV_CTL=0x08: an 8-bit
+         * UTMI state (PHY16BIT clear, SOFT_POR clear) that chirps and enumerates
+         * HIGH-speed cleanly. A udc_phy_reset() (SOFT_POR) re-inits the PHY,
+         * after which the hardware re-detects 16-bit mode (DEV_CTL->0x158) and
+         * the high-speed chirp no longer matches what the host saw from the ROM,
+         * so it falls back to corrupted full-speed (host error -71). The stock
+         * RK27xx loader never PORs the PHY either. Inherit the ROM's known-good
+         * HS PHY state and only arm EP0 + assert the pull-up. */
+        c4pro_udc_arm_and_connect();
+#endif
     }
 #endif
 }
@@ -668,11 +862,22 @@ void INT_UDC(void)
     {
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
         c4pro_usb_diag_conn_count++;
+#ifdef C4PRO_USB_STOCK_PATH
+        /* A/B: stock CONN handler (phy reset + soft connect) */
+        udc_phy_reset();
+        udelay(10000);
+        udc_soft_connect();
 #endif
+        /* C4 (no-POR path) is already armed and connected from init
+         * (c4pro_udc_arm_and_connect). The stock RK27xx loader's CONN handler
+         * only reads DEV_SPEED; it does NOT pulse SOFT_POR. Re-resetting the
+         * PHY here would tear the link down mid-enumeration, so skip it. */
+#else
         /* usb connect */
         udc_phy_reset();
         udelay(10000);         /* wait at least 10ms */
         udc_soft_connect();
+#endif
     }
     /* other endpoints */
     for(int ep_num = 1; ep_num < 16; ep_num++)

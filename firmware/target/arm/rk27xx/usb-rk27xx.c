@@ -33,10 +33,18 @@ int usb_status = USB_EXTRACTED;
 void usb_init_device(void)
 {
     SCU_CLKCFG &= ~CLKCFG_UDC;
+#if !defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_STOCK_PATH)
+    /* Hard-reset the UDC controller. NOT done on C4PRO: the BootROM already
+     * brought the UDC/PHY up to a working (high-speed-capable) state, and
+     * pulsing RSTCFG_UDC wipes that analog/PHY setup, leaving corrupted
+     * signaling (host "error -71", full-speed only). The stock RK27xx loader
+     * likewise never re-pulses RSTCFG_UDC (its udc_reset routine is dead code),
+     * relying on the BootROM init - so match that and only ungate the clock. */
     SCU_RSTCFG |= RSTCFG_UDC;
     udelay(10000);
     SCU_RSTCFG &= ~RSTCFG_UDC;
     udelay(10000);
+#endif
 
     /* enable UDC interrupt */
     INTC_IMR |= (1<<16);

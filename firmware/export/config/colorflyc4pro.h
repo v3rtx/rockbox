@@ -128,6 +128,14 @@
 #define USB_PRODUCT_ID 0x3203
 #define HAVE_BOOTLOADER_USB_MODE
 
+/* Use the standard rk27xx USB connect path (SOFT_POR -> PHY16BIT, controller
+ * reset pulse, standard CONN handler), exactly as the HM-801 does. This is
+ * REQUIRED for high-speed enumeration on the C4 - the earlier C4-specific
+ * customisations (no SOFT_POR, force-clear PHY16BIT, skip RSTCFG pulse) broke
+ * the HS chirp and the host rejected the link (full-speed only, error -71).
+ * Verified high-speed + stable /dev/sda 2026-06-29. */
+#define C4PRO_USB_STOCK_PATH
+
 /* The exact type of CPU */
 #define CONFIG_CPU RK27XX
 
