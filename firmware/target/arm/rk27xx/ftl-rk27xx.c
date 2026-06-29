@@ -22,6 +22,7 @@
 #include "config.h"
 #include "ftl-target.h"
 #include "nand-target.h"
+#include "kernel.h"
 #include "string.h"
 #include <stdbool.h>
 
@@ -1913,19 +1914,38 @@ uint32_t ftl_init(void)
     if (nand_device_init())
         return 1;
 
-    ftl_nand_type = nand_get_device_type(0);
+    /* Cold-boot robustness: the four dies (CE#0..3) need a brief power-up
+     * settle before they answer the ID read. A transient NULL here would make
+     * ftl_banks come out smaller than the true die count, which shrinks the
+     * computed geometry (c4own_runtime_pblk_count) and makes the persisted
+     * superblock look mismatched -> a needless full reformat on cold plug.
+     * Retry each die a few times so detection is identical on cold and warm
+     * boots and the owned volume mounts instead of reformatting. */
+    ftl_nand_type = NULL;
+    for (int retry = 0; retry < 20 && !ftl_nand_type; retry++)
+    {
+        ftl_nand_type = nand_get_device_type(0);
+        if (!ftl_nand_type)
+            sleep(HZ / 50);
+    }
     if (!ftl_nand_type)
         return 1;
 
     ftl_banks = 1;
     for (uint32_t bank = 1; bank < 4; bank++)
     {
-        const struct nand_device_info_type *bank_type =
-            nand_get_device_type(bank);
+        const struct nand_device_info_type *bank_type = NULL;
+
+        for (int retry = 0; retry < 20 && bank_type != ftl_nand_type; retry++)
+        {
+            bank_type = nand_get_device_type(bank);
+            if (bank_type != ftl_nand_type)
+                sleep(HZ / 50);
+        }
 
         if (bank_type == ftl_nand_type)
             ftl_banks++;
-        else if (bank_type)
+        else
             break;
     }
 #ifdef COLORFLY_C4_PRO
