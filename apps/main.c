@@ -4195,9 +4195,10 @@ static void init(void)
     show_logo_boot();
     button_init();
     powermgmt_init();
-#ifndef COLORFLY_C4_PRO
+    /* C4 Pro: backlight subsystem re-enabled so brightness control works.
+     * backlight_init() starts the thread that applies brightness changes
+     * (backlight_set_brightness -> queue -> backlight_hw_brightness). */
     backlight_init();
-#endif
     unicode_init();
 #ifdef HAVE_MULTIVOLUME
     init_volume_names();
@@ -4351,9 +4352,10 @@ static void init(void)
     m5636_init();
 #endif
 
-#ifndef COLORFLY_C4_PRO
+    /* C4 Pro: backlight subsystem re-enabled so brightness control works.
+     * backlight_init() starts the thread that applies brightness changes
+     * (backlight_set_brightness -> queue -> backlight_hw_brightness). */
     backlight_init();
-#endif
 
     button_init();
     C4PRO_BOOT_STEP("button ok");

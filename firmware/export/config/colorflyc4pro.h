@@ -76,8 +76,11 @@
 #define LCD_DEPTH  16
 #define LCD_PIXELFORMAT RGB565
 
-/* Define this if your LCD can be enabled/disabled */
-#define HAVE_LCD_ENABLE
+/* NOTE: HAVE_LCD_ENABLE intentionally NOT defined. With the backlight subsystem
+ * live, backlight_hw_off() would call lcd_enable(false) -> DISPOFF+SLEEP-IN,
+ * blanking the panel (white/blank screen) on any fade/timeout. The sibling
+ * rk27xx targets don't define it either; backlight-off just kills the PWM. */
+/* #define HAVE_LCD_ENABLE */
 
 #define CONFIG_KEYPAD C4PRO_PAD
 
