@@ -1351,6 +1351,7 @@ extern int c4own_diag_cache_logical;
 extern void c4pro_usb_diag_sample(void);
 extern void c4pro_usb_diag_force_reattach(void);
 extern void c4pro_usb_diag_enter_storage_mode(void);
+extern void c4pro_usb_diag_exit_storage_mode(void);
 extern void c4pro_usb_diag_force_storage_config(void);
 #endif
 
@@ -3874,10 +3875,62 @@ int main(void)
 #ifdef C4PRO_USB_MSC_STATUS
     c4pro_show_usb_msc_status();
 #endif
-    while (usb_detect() == USB_INSERTED)
+    /* USB is the only power on a battery-less unit, so usb_detect() (VBUS) never
+     * drops while the cable is in - the unit would be stuck in mass-storage with
+     * no way to reach the player. Stay in storage mode but let MENU eject to the
+     * player: c4pro_usb_diag_exit_storage_mode() disconnects the USB device and
+     * hands the NAND back, while VBUS keeps the unit powered. Re-plug for
+     * storage again. */
     {
-        c4pro_usb_msc_settle_storage();
-        sleep(HZ);
+        /* ~3 consecutive ~20ms ADC reads (~60ms) = a stable MENU press */
+        const int C4PRO_MENU_EJECT_SAMPLES = 3;
+        bool eject = false;
+        int menu_samples = 0;
+
+        lcd_setfont(FONT_SYSFIXED);
+        lcd_clear_display();
+        lcd_puts(0, 0, "USB Mass Storage");
+        lcd_puts(0, 1, "Connected to PC");
+        lcd_puts(0, 3, "MENU: Rockbox player");
+        lcd_update();
+
+        /* Poll the button ADC directly instead of the button queue. The old
+         * loop blocked ~4s per pass in c4pro_usb_msc_settle_storage() and then
+         * did a single button_get_w_tmo() pop tested with exact "==BUTTON_MENU"
+         * -- it missed REPEAT/REL events and the backlight first-keypress
+         * filter, so MENU only worked ~1/20 presses. Sampling button_read_device()
+         * every ~20ms with a small debounce ejects on the first press. The
+         * storage keepalive is inlined (one pass, non-blocking) so it no longer
+         * gates input. */
+        while (!eject && usb_detect() == USB_INSERTED)
+        {
+            c4pro_usb_diag_sample();
+            if (c4pro_usb_diag_setup_count != 0 &&
+                c4pro_usb_diag_core_config == 0)
+            {
+                c4pro_usb_diag_enter_storage_mode();
+                c4pro_usb_diag_force_storage_config();
+            }
+
+            if (button_read_device() == BUTTON_MENU)
+            {
+                if (++menu_samples >= C4PRO_MENU_EJECT_SAMPLES)
+                    eject = true;
+            }
+            else
+                menu_samples = 0;
+
+            sleep(HZ / 50);
+        }
+
+        if (eject)
+        {
+            lcd_clear_display();
+            lcd_puts(0, 0, "Ejecting USB...");
+            lcd_update();
+            c4pro_usb_diag_exit_storage_mode();
+            sleep(HZ / 2);
+        }
     }
 #endif
 #endif
