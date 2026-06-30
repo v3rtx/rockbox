@@ -71,6 +71,7 @@
 #include "libbch.h"
 
 /* glue code */
+#ifndef C4PRO_LIBBCH_GLUE
 #define kmalloc(x,y) malloc(x)
 #define kfree(x) free(x)
 
@@ -78,12 +79,13 @@ static void *kzalloc(size_t size, int flags)
 {
 	(void)flags;
 	void *p = malloc(size);
-	
+
 	if (p)
 		memset(p, 0, size);
-		
+
 	return p;
 }
+#endif /* C4PRO_LIBBCH_GLUE */
 
 #define EXPORT_SYMBOL_GPL(x)
 #define MODULE_LICENSE(x)
@@ -92,8 +94,10 @@ static void *kzalloc(size_t size, int flags)
 
 #define DIV_ROUND_UP(n,d) (((n) + (d) - 1)/(d))
 
+#ifndef C4PRO_LIBBCH_GLUE
 #include <arpa/inet.h>
 #define cpu_to_be32(x) htonl(x)
+#endif /* C4PRO_LIBBCH_GLUE */
 
 static inline int fls(int x)
 {

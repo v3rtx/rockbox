@@ -483,6 +483,17 @@ static void nand_select(uint32_t bank)
 {
     unsigned long ctl = FMCTL;
 
+#ifdef COLORFLY_C4_PRO
+    /* Re-assert the NAND CS2/CS3 pin-mux on every select. These IOMUXA bits
+     * (14/16) are SHARED with the codec-I2C routing, and a codec transaction
+     * (i2c_iomux) transiently clears them; re-asserting here guarantees the
+     * pins carry the NAND-CS function for this access regardless of I2C timing,
+     * so a volume-change I2C write can never corrupt a concurrent die-2/3 read.
+     * Mirrors the setup in nand_device_init(). */
+    SCU_IOMUXA_CON = (SCU_IOMUXA_CON & ~((3u << 14) | (3u << 16))) |
+                     IOMUX_NAND_CS1 | IOMUX_NAND_CS2 | IOMUX_NAND_CS3;
+#endif
+
     ctl &= 0xf0;
     ctl |= 1u << bank;
     FMCTL = ctl;
@@ -812,6 +823,124 @@ uint32_t c4pro_nand_read_linear_page(uint32_t bank, uint32_t page,
 
     for (i = 0; i < 4096; i++)
         data[i] = FLASH_DATA(bank);
+
+    nand_deselect();
+    last_activity = current_tick;
+    return 0;
+}
+
+/* Linear read of the full page: 4096 data bytes + 128 spare bytes, matching the
+ * linear write layout in c4pro_nand_write_page (data then spare, contiguous).
+ * Used by the owned FTL so software BCH can correct each sector from its spare;
+ * the buffered PAGE_BUF engine uses a different layout incompatible with the
+ * linear PIO writes, so reads must stay linear. */
+uint32_t c4pro_nand_read_linear_page_spare(uint32_t bank, uint32_t page,
+                                           void* databuffer, void* sparebuffer)
+{
+    unsigned i;
+    unsigned char *data = databuffer;
+    unsigned char *spare = sparebuffer;
+
+    if (bank > 3 || !data || !spare)
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+    FLASH_CMD(bank) = 0x30;
+
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    for (i = 0; i < 4096; i++)
+        data[i] = FLASH_DATA(bank);
+    for (i = 0; i < 128; i++)
+        spare[i] = FLASH_DATA(bank);
+
+    nand_deselect();
+    last_activity = current_tick;
+    return 0;
+}
+
+/* Diagnostic: read a page's 4096 data bytes via the buffered PAGE_BUF engine
+ * with a caller-supplied FLCTL base (0xA24 = ECC on, 0x224 = ECC off), so an
+ * in-app test can compare the buffered engine against the linear read.
+ * Returns 0 ok, 1 = NAND not ready, 2 = FL_RDY timeout (engine never finished).*/
+uint32_t c4pro_nand_read_page_flctl(uint32_t bank, uint32_t page,
+                                    void* databuffer, uint32_t flctl_base)
+{
+    unsigned i;
+    unsigned sector;
+    unsigned half;
+    unsigned char *data = databuffer;
+
+    if (bank > 3 || !data)
+        return 1;
+
+    FMWAIT = 0x1081;
+    FLCTL = FL_RST;
+    nand_select(bank);
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+    BCHCTL = 1;
+
+    for (half = 0; half < 2; half++)
+    {
+        unsigned column = half * 2048;
+
+        FLASH_CMD(bank) = 0x00;
+        FLASH_ADDR(bank) = column & 0xff;
+        FLASH_ADDR(bank) = (column >> 8) & 0xff;
+        FLASH_ADDR(bank) = page & 0xff;
+        FLASH_ADDR(bank) = (page >> 8) & 0xff;
+        FLASH_ADDR(bank) = (page >> 16) & 0xff;
+        FLASH_CMD(bank) = 0x30;
+        nand_delay();
+        if (!nand_wait_ready())
+        {
+            nand_deselect();
+            return 1;
+        }
+
+        for (sector = 0; sector < 4; sector++)
+        {
+            unsigned out_sector = half * 4 + sector;
+
+            FLCTL = flctl_base | ((sector & 3) << 3);
+            if (!nand_wait_fl_ready())
+            {
+                nand_deselect();
+                return 2;
+            }
+            for (i = 0; i < 512; i++)
+                data[out_sector * 512 + i] =
+                    *((volatile unsigned char *)&PAGE_BUF +
+                      ((sector & 3) << 9) + i);
+        }
+    }
 
     nand_deselect();
     last_activity = current_tick;

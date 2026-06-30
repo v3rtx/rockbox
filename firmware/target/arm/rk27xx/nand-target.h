@@ -51,6 +51,10 @@ uint32_t c4pro_nand_read_linear_sector(uint32_t bank, uint32_t page,
                                        uint32_t sector, void* databuffer);
 uint32_t c4pro_nand_read_linear_page(uint32_t bank, uint32_t page,
                                      void* databuffer);
+uint32_t c4pro_nand_read_linear_page_spare(uint32_t bank, uint32_t page,
+                                           void* databuffer, void* sparebuffer);
+uint32_t c4pro_nand_read_page_flctl(uint32_t bank, uint32_t page,
+                                    void* databuffer, uint32_t flctl_base);
 uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
                                const void* databuffer,
                                const void* sparebuffer);

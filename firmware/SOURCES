@@ -1914,6 +1914,10 @@ target/arm/rk27xx/c4pro/button-c4pro.c
 target/arm/rk27xx/c4pro/powermgmt-c4pro.c
 target/arm/rk27xx/c4pro/power-c4pro.c
 target/arm/rk27xx/c4pro/audio-c4pro.c
+target/arm/rk27xx/c4pro/c4pro_bch.c
+target/arm/rk27xx/c4pro/c4pro_bch_tab.c
+target/arm/rk27xx/c4pro/c4pro_bch_dectab.c
+target/arm/rk27xx/c4pro/c4pro_libbch.c
 #endif
 
 #if defined(MA9) || defined(MA9C) || defined(MA8) || defined(MA8C)

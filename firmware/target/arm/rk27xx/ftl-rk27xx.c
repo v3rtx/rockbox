@@ -24,6 +24,10 @@
 #include "nand-target.h"
 #include "kernel.h"
 #include "string.h"
+#include "c4pro/c4pro_bch.h"
+#ifdef C4PRO_FTL_ECC_SELFTEST
+#include "lcd.h"
+#endif
 #include <stdbool.h>
 
 #ifdef COLORFLY_C4_PRO
@@ -998,7 +1002,10 @@ static void c4pro_ftl_build_hash_map(void)
 #define C4OWN_MAGIC_COMMIT 0x31434b52u /* RKC1 */
 #define C4OWN_MAGIC_CKPT 0x314b4f43u /* COK1 - mount checkpoint footer */
 #define C4OWN_MAGIC_DIRTY 0x31524443u /* CDR1 - checkpoint invalidation */
-#define C4OWN_VERSION 3u
+/* v4: owned-volume data path gained BCH ECC (parity on write, hardware correct
+ * on read). v3 pages have no valid ECC and are unreadable by the 0xA24 decoder,
+ * so the version bump forces a one-time reformat migrating off v3. */
+#define C4OWN_VERSION 4u
 #define C4OWN_SECTORS_PER_PAGE 8u
 #define C4OWN_PAGES_PER_BLOCK 128u
 #define C4OWN_SECTORS_PER_BLOCK 1024u
@@ -1068,9 +1075,14 @@ static unsigned char c4own_page_data[4096];
 static unsigned char c4own_page_spare[128];
 static unsigned char c4own_read_page_data[4096];
 static uint32_t c4own_read_page;
+static uint32_t c4own_read_bank;
 static bool c4own_read_page_valid;
 #ifndef C4OWN_CACHE_SLOTS
-#define C4OWN_CACHE_SLOTS 4u
+/* 8 slots x 504 KB = ~4 MB of the 16 MiB DRAM. More resident blocks coalesce
+ * the scattered FAT/root/FSInfo writes of a host format into fewer whole-block
+ * COW flushes (each flush rewrites all 128 pages), cutting write amplification.
+ * The audio buffer absorbs the rest of DRAM, so playback is unaffected. */
+#define C4OWN_CACHE_SLOTS 8u
 #endif
 
 static unsigned char c4own_cache_data[C4OWN_CACHE_SLOTS][C4OWN_PAYLOAD_SECTORS_PER_BLOCK * 512u];
@@ -1201,6 +1213,40 @@ static bool c4own_pblk_valid(uint32_t pblk)
            c4own_pblk_bank(pblk) < ftl_banks;
 }
 
+static unsigned char c4own_read_spare[128];
+
+/* Diagnostics: count BCH outcomes across the corrected read path so a self-test
+ * can tell uncorrectable bit-rot (rc<0) apart from a logical/map bug. */
+int c4own_diag_uncorr;     /* sectors BCH reported uncorrectable (rc < 0) */
+int c4own_diag_corrected;  /* total bits BCH corrected (sum of rc >= 0) */
+
+/* Read a full 4096-byte page via the LINEAR path (which matches the linear PIO
+ * write layout) plus its 128-byte spare, then software-BCH-correct each of the
+ * 8 sectors in place. The hardware buffered PAGE_BUF engine uses a different
+ * on-NAND layout that cannot read our PIO-written pages, so every owned-FTL
+ * read goes through this. Correction is best-effort: an uncorrectable sector is
+ * left as read (c4pro_bch_correct_sector returns -1 and does not alter it). */
+static int c4own_read_page_corrected(uint32_t bank, uint32_t page,
+                                     unsigned char *out4096)
+{
+    unsigned s;
+
+    if (c4pro_nand_read_linear_page_spare(bank, page, out4096,
+                                          c4own_read_spare))
+        return 1;
+
+    for (s = 0; s < C4OWN_SECTORS_PER_PAGE; s++)
+    {
+        int rc = c4pro_bch_correct_sector(out4096 + s * 512u,
+                                          c4own_read_spare + s * 16u);
+        if (rc < 0)
+            c4own_diag_uncorr++;
+        else
+            c4own_diag_corrected += rc;
+    }
+    return 0;
+}
+
 static int c4own_read_phys_sector(uint32_t pblk, uint32_t sector, void *buf)
 {
     uint32_t page;
@@ -1209,13 +1255,19 @@ static int c4own_read_phys_sector(uint32_t pblk, uint32_t sector, void *buf)
         return 1;
 
     page = c4own_pblk_page(pblk) + sector / C4OWN_SECTORS_PER_PAGE;
-    if (!c4own_read_page_valid || c4own_read_page != page)
+    /* Key the page cache on BANK too: c4own_pblk_page() is an in-die page index,
+     * so on a multi-die volume two blocks one die apart share a page number and
+     * would alias to the wrong die's data (silent corruption during playback's
+     * interleaved reads -- the "static" on the 30 GB / 4-die volume). */
+    if (!c4own_read_page_valid || c4own_read_page != page ||
+        c4own_read_bank != c4own_pblk_bank(pblk))
     {
-        if (c4pro_nand_read_linear_page(c4own_pblk_bank(pblk), page,
-                                        c4own_read_page_data))
+        if (c4own_read_page_corrected(c4own_pblk_bank(pblk), page,
+                                      c4own_read_page_data))
             return 1;
 
         c4own_read_page = page;
+        c4own_read_bank = c4own_pblk_bank(pblk);
         c4own_read_page_valid = true;
     }
 
@@ -1228,14 +1280,27 @@ static int c4own_read_phys_sector(uint32_t pblk, uint32_t sector, void *buf)
 static int c4own_read_phys_sector_uncached(uint32_t pblk, uint32_t sector,
                                            void *buf)
 {
+    uint32_t page;
+
     if (!c4own_pblk_valid(pblk) || sector >= C4OWN_SECTORS_PER_BLOCK)
         return 1;
 
-    return c4pro_nand_read_linear_sector(
-        c4own_pblk_bank(pblk),
-        c4own_pblk_page(pblk) + sector / C4OWN_SECTORS_PER_PAGE,
-        sector & (C4OWN_SECTORS_PER_PAGE - 1u),
-        buf);
+    /* Read is page-granular, so read+correct the whole page and copy out the
+     * requested sector. The cache is invalidated because this path
+     * intentionally does not update its key. */
+    page = c4own_pblk_page(pblk) + sector / C4OWN_SECTORS_PER_PAGE;
+    if (c4own_read_page_corrected(c4own_pblk_bank(pblk), page,
+                                  c4own_read_page_data))
+    {
+        c4own_read_page_valid = false;
+        return 1;
+    }
+    c4own_read_page_valid = false;
+
+    memcpy(buf, c4own_read_page_data +
+                (sector & (C4OWN_SECTORS_PER_PAGE - 1u)) * 512u,
+           512);
+    return 0;
 }
 
 static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
@@ -1244,7 +1309,9 @@ static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
         return 1;
 
     c4own_read_page_valid = false;
-    memset(c4own_page_spare, 0xff, sizeof(c4own_page_spare));
+    /* Generate BCH parity for every sector so the hardware engine can correct
+     * bit errors on read; the 0xA24 decoder reads this layout back. */
+    c4pro_bch_fill_page_spare(c4own_page_data, c4own_page_spare);
     return c4pro_nand_write_page(c4own_pblk_bank(pblk),
                                  c4own_pblk_page(pblk) + page_in_block,
                                  c4own_page_data, c4own_page_spare);
@@ -1375,9 +1442,9 @@ static int c4own_ckpt_read_block_page(uint32_t pblk, uint32_t page_in_block,
     if (!c4own_pblk_valid(pblk) || page_in_block >= C4OWN_PAGES_PER_BLOCK)
         return 1;
 
-    return c4pro_nand_read_linear_page(c4own_pblk_bank(pblk),
-                                       c4own_pblk_page(pblk) + page_in_block,
-                                       buf);
+    return c4own_read_page_corrected(c4own_pblk_bank(pblk),
+                                     c4own_pblk_page(pblk) + page_in_block,
+                                     buf);
 }
 
 /* Write the dirty/invalidation marker for the active checkpoint. Must be called
@@ -1896,8 +1963,8 @@ static int c4own_read_internal(uint32_t sector, uint32_t count, void *buffer)
             {
                 page = c4own_pblk_page(c4own_map[logical]) +
                        phys_sector / C4OWN_SECTORS_PER_PAGE;
-                if (c4pro_nand_read_linear_page(c4own_pblk_bank(c4own_map[logical]),
-                                                page, out))
+                if (c4own_read_page_corrected(c4own_pblk_bank(c4own_map[logical]),
+                                              page, out))
                     return 1;
 
                 c4own_read_page_valid = false;
@@ -2272,6 +2339,75 @@ uint32_t ftl_init(void)
             break;
     }
 #ifdef COLORFLY_C4_PRO
+    /* Build the libbch decoder tables once before any owned-volume read; reads
+     * software-BCH-correct each sector from its spare on the linear layout. */
+    c4pro_bch_init();
+#ifdef C4PRO_FTL_ECC_SELFTEST
+    /* Multi-cycle persistence test: single write->sync->remount passes
+     * (mism=0), but real use shows data degrading across MULTIPLE cold boots
+     * (boot1 md5 ok -> boot3 md5 wrong). This reproduces that in isolation:
+     * write a "file" (sectors 0..PN), then loop NCYC times { write a DIFFERENT
+     * region (like player/FAT churn) -> ftl_sync (flush+checkpoint) -> remount
+     * via c4own_mount_scan -> re-verify the file is byte-exact }. If the file
+     * corrupts after some cycle, the FTL checkpoint/COW/generation logic drifts
+     * across cycles -> that's the bug. failcyc = first cycle the file broke
+     * (-1 = survived all NCYC). Halts. */
+    {
+        static unsigned char bw[512];
+        static unsigned char br[512];
+        const uint32_t PN = 3000u;             /* "file" = sectors 0..PN-1 */
+        const uint32_t QBASE = 5000u, QN = 500u; /* churn region */
+        const int NCYC = 30;
+        int fmt_rc, failcyc = -1, badsec = -1, cyc, i;
+        uint32_t s;
+
+        fmt_rc = (int)c4own_format();
+        c4own_mount_scan();
+
+        for (s = 0; s < PN; s++)
+        {
+            for (i = 0; i < 512; i++)
+                bw[i] = (unsigned char)(s * 7u + (unsigned)i * 13u + 0x5au);
+            c4own_write_internal(s, 1u, bw);
+        }
+        ftl_sync();
+
+        for (cyc = 0; cyc < NCYC && failcyc < 0; cyc++)
+        {
+            for (s = QBASE; s < QBASE + QN; s++)
+            {
+                for (i = 0; i < 512; i++)
+                    bw[i] = (unsigned char)(s * 3u + (unsigned)i * 11u
+                                            + (unsigned)cyc);
+                c4own_write_internal(s, 1u, bw);
+            }
+            ftl_sync();
+            c4own_mount_scan();   /* remount via checkpoint */
+
+            for (s = 0; s < PN; s++)
+            {
+                for (i = 0; i < 512; i++)
+                    bw[i] = (unsigned char)(s * 7u + (unsigned)i * 13u + 0x5au);
+                if (c4own_read_sector_internal(s, br) ||
+                    memcmp(br, bw, 512))
+                {
+                    failcyc = cyc;
+                    badsec = (int)s;
+                    break;
+                }
+            }
+        }
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "MULTI-CYCLE");
+        lcd_putsf(0, 1, "fmt=%d ncyc=%d", fmt_rc, NCYC);
+        lcd_putsf(0, 2, "failcyc=%d", failcyc);
+        lcd_putsf(0, 3, "badsec=%d", badsec);
+        lcd_putsf(0, 4, "uncorr=%d", c4own_diag_uncorr);
+        lcd_update();
+        while (1) sleep(HZ);
+    }
+#endif
 #ifdef C4PRO_FTL_ROCKBOX_OWNED_RW
     if (c4own_mount_scan())
     {
