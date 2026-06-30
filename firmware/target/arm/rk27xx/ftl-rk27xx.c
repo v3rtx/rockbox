@@ -996,6 +996,8 @@ static void c4pro_ftl_build_hash_map(void)
 #define C4OWN_MAGIC_SB 0x31465443u /* CTF1 */
 #define C4OWN_MAGIC_HDR 0x31484b52u /* RKH1 */
 #define C4OWN_MAGIC_COMMIT 0x31434b52u /* RKC1 */
+#define C4OWN_MAGIC_CKPT 0x314b4f43u /* COK1 - mount checkpoint footer */
+#define C4OWN_MAGIC_DIRTY 0x31524443u /* CDR1 - checkpoint invalidation */
 #define C4OWN_VERSION 3u
 #define C4OWN_SECTORS_PER_PAGE 8u
 #define C4OWN_PAGES_PER_BLOCK 128u
@@ -1003,6 +1005,24 @@ static void c4pro_ftl_build_hash_map(void)
 #define C4OWN_PAYLOAD_SECTORS_PER_BLOCK \
     ((C4OWN_PAGES_PER_BLOCK - 2u) * C4OWN_SECTORS_PER_PAGE)
 #define C4OWN_FIRST_DATA_PBLK 2u
+
+/* Mount checkpoint: a sparse snapshot of the live logical->physical map, stored
+ * in the otherwise-unused spare pages of the two superblock blocks (pblk 0/1),
+ * so cold mount can skip the full ~64000-block scan. Page 0 of each superblock
+ * block stays the superblock; pages 1..125 hold {logical,pblk,gen} entries;
+ * page 126 is the footer; page 127 is the dirty/invalidation marker. The two
+ * superblock blocks are written alternately so one complete copy always
+ * survives a crash. A checkpoint is trusted on mount only if its footer is
+ * valid AND no dirty marker (written before the first commit after it) is
+ * present; any failure falls back to the full scan. Checkpoint writes never
+ * touch data blocks, so a bug here cannot corrupt file data. */
+#define C4OWN_CKPT_FIRST_PAGE 1u
+#define C4OWN_CKPT_FOOTER_PAGE 126u
+#define C4OWN_CKPT_DIRTY_PAGE 127u
+#define C4OWN_CKPT_ENTRY_BYTES 10u
+#define C4OWN_CKPT_ENTRIES_PER_PAGE (4096u / C4OWN_CKPT_ENTRY_BYTES)
+#define C4OWN_CKPT_MAX_ENTRIES \
+    ((C4OWN_CKPT_FOOTER_PAGE - C4OWN_CKPT_FIRST_PAGE) * C4OWN_CKPT_ENTRIES_PER_PAGE)
 
 #ifndef C4PRO_OWNED_PBLK_START
 #define C4PRO_OWNED_PBLK_START 288u
@@ -1061,6 +1081,18 @@ static bool c4own_cache_valid[C4OWN_CACHE_SLOTS];
 static bool c4own_cache_dirty[C4OWN_CACHE_SLOTS];
 static bool c4own_ready;
 static bool c4own_formatting;
+
+/* Mount-checkpoint state. active_block = superblock block (0/1) holding the
+ * current on-NAND checkpoint, or -1 if none loaded/written this boot.
+ * seq = its monotonic version. marked_dirty = whether the dirty marker for the
+ * active checkpoint has already been written (so we only write it once, before
+ * the first commit after a checkpoint). map_dirty = whether the live map has
+ * changed since the last checkpoint write (so sync only rewrites when needed). */
+static int c4own_ckpt_active_block = -1;
+static uint32_t c4own_ckpt_seq;
+static bool c4own_ckpt_marked_dirty;
+static bool c4own_map_dirty;
+static unsigned char c4own_ckpt_buf[4096];
 int c4own_diag_format_count;
 int c4own_diag_write_count;
 int c4own_diag_read_count;
@@ -1123,10 +1155,9 @@ static void c4own_put32(unsigned char *p, uint32_t v)
     p[3] = (v >> 24) & 0xff;
 }
 
-static uint32_t c4own_crc32(const void *buf, uint32_t len)
+static uint32_t c4own_crc32_cont(uint32_t crc, const void *buf, uint32_t len)
 {
     const unsigned char *p = buf;
-    uint32_t crc = 0xffffffffu;
 
     while (len--)
     {
@@ -1135,7 +1166,17 @@ static uint32_t c4own_crc32(const void *buf, uint32_t len)
             crc = (crc >> 1) ^ (0xedb88320u & -(crc & 1u));
     }
 
-    return crc ^ 0xffffffffu;
+    return crc;
+}
+
+static uint32_t c4own_crc32(const void *buf, uint32_t len)
+{
+    return c4own_crc32_cont(0xffffffffu, buf, len) ^ 0xffffffffu;
+}
+
+static uint32_t c4own_get16(const unsigned char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
 }
 
 static uint32_t c4own_abs_pblk(uint32_t pblk)
@@ -1305,11 +1346,8 @@ static bool c4own_superblock_valid(uint32_t pblk)
            c4own_get32(sector + 28) == c4own_crc32(sector, 28);
 }
 
-static int c4own_write_superblock(uint32_t pblk)
+static void c4own_fill_superblock_page(void)
 {
-    if (c4own_erase_pblk(pblk))
-        return 1;
-
     memset(c4own_page_data, 0xff, sizeof(c4own_page_data));
     c4own_put32(c4own_page_data + 0, C4OWN_MAGIC_SB);
     c4own_put32(c4own_page_data + 4, C4OWN_VERSION);
@@ -1319,7 +1357,259 @@ static int c4own_write_superblock(uint32_t pblk)
     c4own_put32(c4own_page_data + 20, C4OWN_PAYLOAD_SECTORS_PER_BLOCK);
     c4own_put32(c4own_page_data + 24, C4OWN_LOGICAL_BLOCKS);
     c4own_put32(c4own_page_data + 28, c4own_crc32(c4own_page_data, 28));
+}
+
+static int c4own_write_superblock(uint32_t pblk)
+{
+    if (c4own_erase_pblk(pblk))
+        return 1;
+
+    c4own_fill_superblock_page();
     return c4own_write_page(pblk, 0);
+}
+
+/* Read a full 4096-byte page from a superblock block (pblk 0/1) into buf. */
+static int c4own_ckpt_read_block_page(uint32_t pblk, uint32_t page_in_block,
+                                      unsigned char *buf)
+{
+    if (!c4own_pblk_valid(pblk) || page_in_block >= C4OWN_PAGES_PER_BLOCK)
+        return 1;
+
+    return c4pro_nand_read_linear_page(c4own_pblk_bank(pblk),
+                                       c4own_pblk_page(pblk) + page_in_block,
+                                       buf);
+}
+
+/* Write the dirty/invalidation marker for the active checkpoint. Must be called
+ * (and succeed) BEFORE the first data-block commit after a checkpoint, so a
+ * crash can never leave a clean checkpoint that omits a committed block. */
+static int c4own_ckpt_mark_dirty(void)
+{
+    if (c4own_ckpt_active_block < 0)
+        return 0;
+
+    memset(c4own_page_data, 0xff, sizeof(c4own_page_data));
+    c4own_put32(c4own_page_data + 0, C4OWN_MAGIC_DIRTY);
+    c4own_put32(c4own_page_data + 4, c4own_ckpt_seq);
+    c4own_put32(c4own_page_data + 8, c4own_crc32(c4own_page_data, 8));
+    if (c4own_write_page((uint32_t)c4own_ckpt_active_block,
+                         C4OWN_CKPT_DIRTY_PAGE))
+        return 1;
+
+    c4own_ckpt_marked_dirty = true;
+    return 0;
+}
+
+/* Serialize the live map into a fresh checkpoint on the inactive superblock
+ * block. Best-effort: on any failure the old checkpoint (already dirty-marked,
+ * because map_dirty implies a prior commit) keeps mount on the scan path. */
+static int c4own_ckpt_write(void)
+{
+    uint32_t target = (c4own_ckpt_active_block == 0) ? 1u : 0u;
+    uint32_t count = 0;
+    uint32_t entries_crc = 0xffffffffu;
+    uint32_t logical = 0;
+    uint32_t written = 0;
+    uint32_t page_in_block = C4OWN_CKPT_FIRST_PAGE;
+
+    for (uint32_t l = 0; l < C4OWN_LOGICAL_BLOCKS; l++)
+        if (c4own_map[l] != 0xffffu)
+            count++;
+
+    if (count > C4OWN_CKPT_MAX_ENTRIES)
+        return 1; /* too full to snapshot; leave dirty so mount scans */
+
+    if (c4own_erase_pblk(target))
+        return 1;
+
+    c4own_fill_superblock_page();
+    if (c4own_write_page(target, 0))
+        return 1;
+
+    while (written < count)
+    {
+        uint32_t in_page = 0;
+
+        memset(c4own_page_data, 0xff, sizeof(c4own_page_data));
+        while (in_page < C4OWN_CKPT_ENTRIES_PER_PAGE && written < count)
+        {
+            unsigned char *ent;
+
+            while (logical < C4OWN_LOGICAL_BLOCKS && c4own_map[logical] == 0xffffu)
+                logical++;
+            if (logical >= C4OWN_LOGICAL_BLOCKS)
+                break;
+
+            ent = c4own_page_data + in_page * C4OWN_CKPT_ENTRY_BYTES;
+            c4own_put32(ent + 0, logical);
+            c4own_put16(ent + 4, c4own_map[logical]);
+            c4own_put32(ent + 6, c4own_gen[logical]);
+            logical++;
+            in_page++;
+            written++;
+        }
+
+        entries_crc = c4own_crc32_cont(entries_crc, c4own_page_data,
+                                       in_page * C4OWN_CKPT_ENTRY_BYTES);
+        if (c4own_write_page(target, page_in_block))
+            return 1;
+        page_in_block++;
+    }
+    entries_crc ^= 0xffffffffu;
+
+    memset(c4own_page_data, 0xff, sizeof(c4own_page_data));
+    c4own_put32(c4own_page_data + 0, C4OWN_MAGIC_CKPT);
+    c4own_put32(c4own_page_data + 4, C4OWN_VERSION);
+    c4own_put32(c4own_page_data + 8, C4OWN_VOLUME_SECTORS);
+    c4own_put32(c4own_page_data + 12, C4PRO_OWNED_PBLK_START);
+    c4own_put32(c4own_page_data + 16, C4OWN_RUNTIME_PBLK_COUNT);
+    c4own_put32(c4own_page_data + 20, C4OWN_PAYLOAD_SECTORS_PER_BLOCK);
+    c4own_put32(c4own_page_data + 24, c4own_ckpt_seq + 1u);
+    c4own_put32(c4own_page_data + 28, count);
+    c4own_put32(c4own_page_data + 32, entries_crc);
+    c4own_put32(c4own_page_data + 36, c4own_crc32(c4own_page_data, 36));
+    if (c4own_write_page(target, C4OWN_CKPT_FOOTER_PAGE))
+        return 1;
+
+    c4own_ckpt_seq += 1u;
+    c4own_ckpt_active_block = (int)target;
+    c4own_ckpt_marked_dirty = false;
+    c4own_map_dirty = false;
+    c4own_read_page_valid = false;
+    return 0;
+}
+
+/* Try to populate the maps from a valid, non-dirty checkpoint. Returns true on
+ * success (mount may skip the full scan); false (with maps reset) otherwise. */
+static bool c4own_ckpt_load(void)
+{
+    int max_block = -1;
+    uint32_t max_seq = 0;
+    uint32_t max_count = 0;
+    uint32_t remaining;
+    uint32_t page_in_block;
+    uint32_t crc;
+    uint32_t ecrc;
+
+    /* Find the highest-seq valid checkpoint footer across both superblock
+     * blocks. seq is globally monotonic, so the highest seq is the most recent
+     * checkpoint. An older (lower-seq) footer is stale BY CONSTRUCTION - it was
+     * dirty-marked before the newer one was written - so it must never be
+     * loaded; only the single latest footer is ever a load candidate. */
+    for (uint32_t b = 0; b < 2u; b++)
+    {
+        unsigned char *f = c4own_ckpt_buf;
+        uint32_t seq;
+        uint32_t count;
+
+        if (c4own_ckpt_read_block_page(b, C4OWN_CKPT_FOOTER_PAGE, f))
+            continue;
+        if (c4own_get32(f + 0) != C4OWN_MAGIC_CKPT ||
+            c4own_get32(f + 4) != C4OWN_VERSION ||
+            c4own_get32(f + 8) != C4OWN_VOLUME_SECTORS ||
+            c4own_get32(f + 12) != C4PRO_OWNED_PBLK_START ||
+            c4own_get32(f + 16) != C4OWN_RUNTIME_PBLK_COUNT ||
+            c4own_get32(f + 20) != C4OWN_PAYLOAD_SECTORS_PER_BLOCK ||
+            c4own_get32(f + 36) != c4own_crc32(f, 36))
+            continue;
+
+        seq = c4own_get32(f + 24);
+        count = c4own_get32(f + 28);
+        if (count > C4OWN_CKPT_MAX_ENTRIES)
+            continue;
+
+        if (max_block < 0 || seq > max_seq)
+        {
+            max_block = (int)b;
+            max_seq = seq;
+            max_count = count;
+        }
+    }
+
+    if (max_block < 0)
+        return false;
+
+    /* Keep the seq counter monotonic across this boot even if we fall through
+     * to a scan: the next checkpoint written must outrank every footer now on
+     * NAND, so a stale survivor can never win selection on a later mount. */
+    c4own_ckpt_seq = max_seq;
+
+    /* The latest checkpoint is usable only if it is clean. Fail CLOSED: if the
+     * dirty-marker page cannot even be read, assume it might be dirty and scan
+     * rather than risk loading a checkpoint that omits committed blocks. */
+    if (c4own_ckpt_read_block_page((uint32_t)max_block, C4OWN_CKPT_DIRTY_PAGE,
+                                   c4own_ckpt_buf))
+        return false;
+    if (c4own_get32(c4own_ckpt_buf + 0) == C4OWN_MAGIC_DIRTY &&
+        c4own_get32(c4own_ckpt_buf + 8) == c4own_crc32(c4own_ckpt_buf, 8) &&
+        c4own_get32(c4own_ckpt_buf + 4) >= max_seq)
+        return false;
+
+    /* Re-read the footer (the dirty read above clobbered the buffer) and load. */
+    if (c4own_ckpt_read_block_page((uint32_t)max_block, C4OWN_CKPT_FOOTER_PAGE,
+                                   c4own_ckpt_buf))
+        return false;
+    if (c4own_get32(c4own_ckpt_buf + 24) != max_seq ||
+        c4own_get32(c4own_ckpt_buf + 28) != max_count ||
+        c4own_get32(c4own_ckpt_buf + 36) != c4own_crc32(c4own_ckpt_buf, 36))
+        return false;
+    ecrc = c4own_get32(c4own_ckpt_buf + 32);
+
+    c4own_reset_maps();
+    remaining = max_count;
+    page_in_block = C4OWN_CKPT_FIRST_PAGE;
+    crc = 0xffffffffu;
+
+    while (remaining > 0)
+    {
+        uint32_t this_page = remaining < C4OWN_CKPT_ENTRIES_PER_PAGE ?
+                             remaining : C4OWN_CKPT_ENTRIES_PER_PAGE;
+
+        if (c4own_ckpt_read_block_page((uint32_t)max_block, page_in_block,
+                                       c4own_ckpt_buf))
+        {
+            c4own_reset_maps();
+            return false;
+        }
+
+        crc = c4own_crc32_cont(crc, c4own_ckpt_buf,
+                               this_page * C4OWN_CKPT_ENTRY_BYTES);
+
+        for (uint32_t i = 0; i < this_page; i++)
+        {
+            unsigned char *ent = c4own_ckpt_buf + i * C4OWN_CKPT_ENTRY_BYTES;
+            uint32_t lg = c4own_get32(ent + 0);
+            uint32_t pb = c4own_get16(ent + 4);
+            uint32_t gn = c4own_get32(ent + 6);
+
+            if (lg >= C4OWN_LOGICAL_BLOCKS || pb >= C4OWN_RUNTIME_PBLK_COUNT ||
+                pb < C4OWN_FIRST_DATA_PBLK)
+            {
+                c4own_reset_maps();
+                return false;
+            }
+
+            c4own_map[lg] = (uint16_t)pb;
+            c4own_gen[lg] = gn;
+            c4own_used[pb] = 1;
+        }
+
+        remaining -= this_page;
+        page_in_block++;
+    }
+    crc ^= 0xffffffffu;
+
+    if (crc != ecrc)
+    {
+        c4own_reset_maps();
+        return false;
+    }
+
+    c4own_ckpt_active_block = max_block;
+    c4own_ckpt_marked_dirty = false;
+    c4own_map_dirty = false;
+    c4own_read_page_valid = false;
+    return true;
 }
 
 static int c4own_mount_scan(void)
@@ -1331,6 +1621,14 @@ static int c4own_mount_scan(void)
 
     if (!c4own_superblock_valid(0) && !c4own_superblock_valid(1))
         return 1;
+
+    /* Fast path: a valid, non-dirty checkpoint reconstructs the map without the
+     * full per-block scan below. On any mismatch c4own_ckpt_load resets the maps
+     * and we fall through to the authoritative scan. */
+    if (c4own_ckpt_load())
+        return 0;
+
+    c4own_reset_maps();
 
     for (uint32_t pblk = C4OWN_FIRST_DATA_PBLK;
          pblk < C4OWN_RUNTIME_PBLK_COUNT; pblk++)
@@ -1376,6 +1674,9 @@ static int c4own_mount_scan(void)
         }
     }
 
+    /* Persist the scan result so the NEXT cold boot mounts via the checkpoint
+     * even without any intervening write activity. Best-effort. */
+    c4own_ckpt_write();
     return 0;
 }
 
@@ -1629,10 +1930,20 @@ static int c4own_write_logical_block(uint32_t logical, uint32_t first,
                                      uint32_t count,
                                      const unsigned char *data)
 {
-    int new_pblk = c4own_alloc_pblk();
+    int new_pblk;
     uint16_t old_pblk;
     uint32_t gen;
 
+    /* Before the first commit after a checkpoint, invalidate it on NAND so a
+     * crash can never leave a clean checkpoint that omits this committed block.
+     * If the marker write fails, abort the write to preserve the invariant. */
+    if (c4own_ckpt_active_block >= 0 && !c4own_ckpt_marked_dirty)
+    {
+        if (c4own_ckpt_mark_dirty())
+            return 1;
+    }
+
+    new_pblk = c4own_alloc_pblk();
     if (new_pblk < 0)
         return 1;
 
@@ -1681,6 +1992,7 @@ static int c4own_write_logical_block(uint32_t logical, uint32_t first,
         c4own_retired[old_pblk] = 1;
     }
 
+    c4own_map_dirty = true;
     return 0;
 
 fail:
@@ -1859,6 +2171,12 @@ static int c4own_format(void)
     c4own_formatting = true;
     c4own_reset_maps();
 
+    /* A format wipes any prior checkpoint (the erase loop clears pblk 0/1); make
+     * sure write_logical_block does not try to dirty-mark a stale one. */
+    c4own_ckpt_active_block = -1;
+    c4own_ckpt_marked_dirty = false;
+    c4own_map_dirty = false;
+
     for (uint32_t pblk = 0; pblk < C4OWN_RUNTIME_PBLK_COUNT; pblk++)
     {
         if (c4own_erase_pblk(pblk))
@@ -1904,6 +2222,11 @@ static int c4own_format(void)
         return 1;
 
     c4own_formatting = false;
+
+    /* Snapshot the freshly-formatted state so the very next cold boot mounts via
+     * the checkpoint instead of scanning. Best-effort: a failure just means the
+     * next mount falls back to the scan. */
+    c4own_ckpt_write();
     return 0;
 }
 
@@ -2168,7 +2491,17 @@ uint32_t ftl_write(uint32_t sector, uint32_t count, const void* buffer)
 uint32_t ftl_sync(void)
 {
 #if defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_ROCKBOX_OWNED_RW)
-    return c4own_flush_cache() ? (uint32_t)-1 : 0;
+    if (c4own_flush_cache())
+        return (uint32_t)-1;
+
+    /* Refresh the mount checkpoint only when the map actually changed since the
+     * last one (keeps NAND wear on the two superblock blocks proportional to
+     * real writes). Best-effort: a failure leaves the prior dirty-marked
+     * checkpoint, so the next mount safely falls back to the full scan. */
+    if (c4own_ready && c4own_map_dirty)
+        c4own_ckpt_write();
+
+    return 0;
 #else
     return 0;
 #endif
