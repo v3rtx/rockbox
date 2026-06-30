@@ -3824,6 +3824,72 @@ static void c4pro_boot_profile_show(const char *where)
 #define C4PRO_PRE_ROOT_MENU_HALT(step) do { } while (0)
 #endif
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_MSC_ENABLE)
+/* Serve the owned volume as USB Mass Storage while the cable is connected.
+ * Factored out of main() so the mount-failure path can reuse it: a freshly
+ * formatted (or otherwise FAT-less) owned volume must still expose the raw
+ * device to the host for formatting instead of dead-looping unreachable.
+ * Returns when the user ejects with MENU (or the cable is pulled). USB is the
+ * only power on a battery-less unit, so usb_detect() (VBUS) never drops while
+ * the cable is in; MENU eject disconnects the USB device but keeps power. */
+static void c4pro_usb_msc_serve(void)
+{
+    /* ~3 consecutive ~20ms ADC reads (~60ms) = a stable MENU press */
+    const int C4PRO_MENU_EJECT_SAMPLES = 3;
+    bool eject = false;
+    int menu_samples = 0;
+
+    c4pro_usb_diag_enter_storage_mode();
+    c4pro_usb_diag_force_reattach();
+    sleep(2 * HZ);
+    c4pro_usb_diag_force_storage_config();
+    c4pro_usb_msc_settle_storage();
+#ifdef C4PRO_USB_MSC_STATUS
+    c4pro_show_usb_msc_status();
+#endif
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "USB Mass Storage");
+    lcd_puts(0, 1, "Connected to PC");
+    lcd_puts(0, 3, "MENU: Rockbox player");
+    lcd_update();
+
+    /* Poll the button ADC directly with a small debounce so MENU ejects on the
+     * first press; the storage keepalive is inlined (non-blocking). */
+    while (!eject && usb_detect() == USB_INSERTED)
+    {
+        c4pro_usb_diag_sample();
+        if (c4pro_usb_diag_setup_count != 0 &&
+            c4pro_usb_diag_core_config == 0)
+        {
+            c4pro_usb_diag_enter_storage_mode();
+            c4pro_usb_diag_force_storage_config();
+        }
+
+        if (button_read_device() == BUTTON_MENU)
+        {
+            if (++menu_samples >= C4PRO_MENU_EJECT_SAMPLES)
+                eject = true;
+        }
+        else
+            menu_samples = 0;
+
+        sleep(HZ / 50);
+    }
+
+    if (eject)
+    {
+        lcd_clear_display();
+        lcd_puts(0, 0, "Ejecting USB...");
+        lcd_update();
+        c4pro_usb_diag_exit_storage_mode();
+        sleep(HZ / 2);
+    }
+}
+#endif
+
 /* main(), and various functions called by main() and init() may be
  * be INIT_ATTR. These functions must not be called after the final call
  * to root_menu() at the end of main()
@@ -3867,71 +3933,7 @@ int main(void)
     usb_start_monitoring();
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_USB_MSC_ENABLE)
-    c4pro_usb_diag_enter_storage_mode();
-    c4pro_usb_diag_force_reattach();
-    sleep(2 * HZ);
-    c4pro_usb_diag_force_storage_config();
-    c4pro_usb_msc_settle_storage();
-#ifdef C4PRO_USB_MSC_STATUS
-    c4pro_show_usb_msc_status();
-#endif
-    /* USB is the only power on a battery-less unit, so usb_detect() (VBUS) never
-     * drops while the cable is in - the unit would be stuck in mass-storage with
-     * no way to reach the player. Stay in storage mode but let MENU eject to the
-     * player: c4pro_usb_diag_exit_storage_mode() disconnects the USB device and
-     * hands the NAND back, while VBUS keeps the unit powered. Re-plug for
-     * storage again. */
-    {
-        /* ~3 consecutive ~20ms ADC reads (~60ms) = a stable MENU press */
-        const int C4PRO_MENU_EJECT_SAMPLES = 3;
-        bool eject = false;
-        int menu_samples = 0;
-
-        lcd_setfont(FONT_SYSFIXED);
-        lcd_clear_display();
-        lcd_puts(0, 0, "USB Mass Storage");
-        lcd_puts(0, 1, "Connected to PC");
-        lcd_puts(0, 3, "MENU: Rockbox player");
-        lcd_update();
-
-        /* Poll the button ADC directly instead of the button queue. The old
-         * loop blocked ~4s per pass in c4pro_usb_msc_settle_storage() and then
-         * did a single button_get_w_tmo() pop tested with exact "==BUTTON_MENU"
-         * -- it missed REPEAT/REL events and the backlight first-keypress
-         * filter, so MENU only worked ~1/20 presses. Sampling button_read_device()
-         * every ~20ms with a small debounce ejects on the first press. The
-         * storage keepalive is inlined (one pass, non-blocking) so it no longer
-         * gates input. */
-        while (!eject && usb_detect() == USB_INSERTED)
-        {
-            c4pro_usb_diag_sample();
-            if (c4pro_usb_diag_setup_count != 0 &&
-                c4pro_usb_diag_core_config == 0)
-            {
-                c4pro_usb_diag_enter_storage_mode();
-                c4pro_usb_diag_force_storage_config();
-            }
-
-            if (button_read_device() == BUTTON_MENU)
-            {
-                if (++menu_samples >= C4PRO_MENU_EJECT_SAMPLES)
-                    eject = true;
-            }
-            else
-                menu_samples = 0;
-
-            sleep(HZ / 50);
-        }
-
-        if (eject)
-        {
-            lcd_clear_display();
-            lcd_puts(0, 0, "Ejecting USB...");
-            lcd_update();
-            c4pro_usb_diag_exit_storage_mode();
-            sleep(HZ / 2);
-        }
-    }
+    c4pro_usb_msc_serve();
 #endif
 #endif
 
@@ -4624,11 +4626,22 @@ static void init(void)
                 c4pro_show_usb_diag_loop();
             }
 #endif
+#if defined(C4PRO_USB_MSC_ENABLE)
+            /* The owned volume mounted in the FTL but carries no FAT yet (e.g.
+             * just reformatted after the v3->v4 ECC migration). Expose the raw
+             * device as USB Mass Storage so the host can lay down a filesystem,
+             * then reboot to mount the new FAT -- instead of dead-looping here,
+             * unreachable, because this branch runs in init() before main()'s
+             * own USB-MSC serving block. */
+            usb_start_monitoring();
+            c4pro_usb_msc_serve();
+#else
             while (1)
             {
                 lcd_update();
                 sleep(HZ / 2);
             }
+#endif
 #elif !defined(USB_NONE)
             usb_start_monitoring();
             while(button_get(true) != SYS_USB_CONNECTED) {};

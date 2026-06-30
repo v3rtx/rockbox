@@ -273,7 +273,12 @@ static inline void usb_slave_mode(bool on)
         /* Entered exclusive mode */
         rc = disk_mount_all();
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_USB_DIAG_EXPORT)
+    (defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE))
+        /* A freshly reformatted (still FAT-less) owned volume legitimately has
+         * no partition until the host finishes writing one. A host bus-reset
+         * during a slow NAND-write stall releases exclusive storage and lands
+         * here mid-format -> rc==0; returning (instead of panicking) lets the
+         * USB-MSC serve loop keep running so the format can complete. */
         if(rc == 0)
             return;
 #endif
@@ -822,6 +827,35 @@ void c4pro_usb_diag_enter_storage_mode(void)
         exclusive_storage_requested = true;
         usb_slave_mode(true);
         exclusive_storage_enabled = true;
+    }
+}
+
+/* Inverse of c4pro_usb_diag_enter_storage_mode(): leave USB mass-storage and
+ * hand the NAND back to the player. The C4 Pro can be run battery-less, so VBUS
+ * never drops while the cable is in; stopping monitoring keeps the player from
+ * re-entering mass-storage on the still-present VBUS. The cable continues to
+ * power the unit. Re-plugging re-runs init() and returns to storage mode. */
+void c4pro_usb_diag_exit_storage_mode(void)
+{
+    /* Flush the owned-FTL write cache + write a fresh mount checkpoint before
+     * disconnecting. A device-side MENU eject bypasses the host's SYNCHRONIZE
+     * CACHE, so any FAT metadata the host wrote during the session would
+     * otherwise sit unflushed in RAM -- lost on the next power cycle, leaving an
+     * inconsistent FAT (empty file browser) and forcing a slow full rescan (or
+     * reformat) on cold boot. ftl_sync() persists it and snapshots the map so
+     * the next cold boot mounts via the checkpoint. */
+    {
+        extern uint32_t ftl_sync(void);
+        ftl_sync();
+    }
+
+    usb_monitor_enabled = false;
+    usb_enable(false);              /* disconnect the USB device; host unmounts */
+    if(exclusive_storage_enabled)
+    {
+        usb_slave_mode(false);      /* remount the NAND for the player */
+        exclusive_storage_enabled = false;
+        exclusive_storage_requested = false;
     }
 }
 #endif
