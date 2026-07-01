@@ -25,8 +25,13 @@
 #include "kernel.h"
 #include "string.h"
 #include "c4pro/c4pro_bch.h"
-#ifdef C4PRO_FTL_ECC_SELFTEST
+#if defined(C4PRO_FTL_ECC_SELFTEST) || defined(C4PRO_NAND_DMA_SELFTEST) || \
+    defined(C4PRO_NAND_DMA_RWTEST) || defined(C4PRO_NAND_DMA_SPEEDTEST) || \
+    defined(C4PRO_NAND_FMWAIT_SWEEP) || defined(C4PRO_NAND_CLKPROBE) || \
+    defined(C4PRO_NAND_DELAY_SWEEP) || defined(C4PRO_NAND_HWECC_TEST) || \
+    defined(C4PRO_NAND_HWECC_ERASED) || defined(C4PRO_NAND_WDELAY_SWEEP)
 #include "lcd.h"
+#include "backlight.h"
 #endif
 #include <stdbool.h>
 
@@ -1229,11 +1234,27 @@ int c4own_diag_corrected;  /* total bits BCH corrected (sum of rc >= 0) */
 static int c4own_read_page_corrected(uint32_t bank, uint32_t page,
                                      unsigned char *out4096)
 {
+#ifdef C4PRO_NAND_HWECC
+    /* Hardware BCH: the controller corrects each sector on read (inline 512+16
+     * layout) and returns the 4096 data bytes directly -- no software BCH decode
+     * (which was the ~355us/sector wall capping FTL reads at ~1.16 MB/s). */
+    return c4pro_nand_read_page_hwecc(bank, page, out4096,
+                                      C4OWN_SECTORS_PER_PAGE);
+#else
     unsigned s;
 
+#ifdef C4PRO_NAND_DMA
+    /* Fast path: buffered PAGE_BUF engine (ECC off) for the 4096 data bytes +
+     * a short PIO spare read, drop-in for the per-byte PIO loop. Same linear
+     * layout, so the software BCH decode below is unchanged. */
+    if (c4pro_nand_read_linear_page_spare_dma(bank, page, out4096,
+                                              c4own_read_spare))
+        return 1;
+#else
     if (c4pro_nand_read_linear_page_spare(bank, page, out4096,
                                           c4own_read_spare))
         return 1;
+#endif
 
     for (s = 0; s < C4OWN_SECTORS_PER_PAGE; s++)
     {
@@ -1245,6 +1266,7 @@ static int c4own_read_page_corrected(uint32_t bank, uint32_t page,
             c4own_diag_corrected += rc;
     }
     return 0;
+#endif /* C4PRO_NAND_HWECC */
 }
 
 static int c4own_read_phys_sector(uint32_t pblk, uint32_t sector, void *buf)
@@ -1309,12 +1331,29 @@ static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
         return 1;
 
     c4own_read_page_valid = false;
+#ifdef C4PRO_NAND_HWECC
+    /* Controller generates BCH-8 parity into the inline spare on program; no
+     * software encode. Reads via c4pro_nand_read_page_hwecc correct in hardware. */
+    return c4pro_nand_write_page_hwecc(c4own_pblk_bank(pblk),
+                                       c4own_pblk_page(pblk) + page_in_block,
+                                       c4own_page_data, C4OWN_SECTORS_PER_PAGE);
+#else
     /* Generate BCH parity for every sector so the hardware engine can correct
      * bit errors on read; the 0xA24 decoder reads this layout back. */
     c4pro_bch_fill_page_spare(c4own_page_data, c4own_page_spare);
+#ifdef C4PRO_NAND_DMA_WRITE
+    /* Experimental engine-assisted program (default off). tPROG-bound, so the
+     * gain is modest; validated only after the read path is byte-for-byte
+     * proven. Same linear layout, so reads (DMA or PIO) are unaffected. */
+    return c4pro_nand_write_page_dma(c4own_pblk_bank(pblk),
+                                     c4own_pblk_page(pblk) + page_in_block,
+                                     c4own_page_data, c4own_page_spare);
+#else
     return c4pro_nand_write_page(c4own_pblk_bank(pblk),
                                  c4own_pblk_page(pblk) + page_in_block,
                                  c4own_page_data, c4own_page_spare);
+#endif
+#endif /* C4PRO_NAND_HWECC */
 }
 
 static int c4own_erase_pblk(uint32_t pblk)
@@ -2342,6 +2381,778 @@ uint32_t ftl_init(void)
     /* Build the libbch decoder tables once before any owned-volume read; reads
      * software-BCH-correct each sector from its spare on the linear layout. */
     c4pro_bch_init();
+#if defined(C4PRO_NAND_DMA) && defined(C4PRO_NAND_DMA_SELFTEST)
+    /* DMA-read bring-up gate (DRAM RAM-run friendly): prove the buffered
+     * PAGE_BUF engine reader returns byte-for-byte identical data to the proven
+     * PIO reader BEFORE the live FTL read path is trusted. Runs read-only on the
+     * live volume and HALTS, so the live c4own_read_page_corrected DMA path is
+     * never reached here.
+     *
+     * It can't rely on finding pre-written data in the linear (4096+128) layout
+     * (the payload is BootROM-formatted, owned blocks are mostly 0xFF after a
+     * format), so it MANUFACTURES the data: erase a scratch block well outside
+     * the firmware image (loader pblk 0, payload <1536, owned 1536..~1672) and
+     * program all 128 pages with a varied per-page pattern via the proven PIO
+     * writer, then compare PIO-read vs engine-read on every page. Done on die 0
+     * AND die 1 so the engine read is proven on real, varied data on two dies.
+     * c4pro_nand_dma_selftest_page() returns 0xffffffff on match, a byte offset
+     * (0..4095 data, 4096..4223 spare) on first mismatch, or the
+     * 0xfffffffe/0xfffffffd PIO/engine read-fail sentinels. */
+    {
+#ifndef C4PRO_NAND_DMA_SELFTEST_PBLK
+#define C4PRO_NAND_DMA_SELFTEST_PBLK 8000u  /* scratch block, mid die, unused */
+#endif
+        static unsigned char dma_st_data[4096];
+        static unsigned char dma_st_spare[128];
+        static unsigned char pioA[4096], pioA_sp[128];
+        static unsigned char pioB[4096], pioB_sp[128];
+        const uint32_t PBASE = C4PRO_NAND_DMA_SELFTEST_PBLK *
+                               C4OWN_PAGES_PER_BLOCK;
+        uint32_t res[2] = { 0xffffffffu, 0xffffffffu };       /* first-bad ret */
+        uint32_t bad_pg[2] = { 0xffffffffu, 0xffffffffu };
+        int dma_pass[2] = { 0, 0 };   /* engine read == PIO read (raw, no ECC) */
+        int ctrl_pass[2] = { 0, 0 };  /* PIO read == PIO read (cell-noise ctrl) */
+        int wr_fail[2] = { 0, 0 };
+        int bank, p, i;
+
+        for (bank = 0; bank < 2; bank++)
+        {
+            if (c4pro_nand_erase_block((uint32_t)bank, PBASE))
+            {
+                wr_fail[bank] = -1;          /* erase failed */
+                continue;
+            }
+            for (p = 0; p < (int)C4OWN_PAGES_PER_BLOCK; p++)
+            {
+                for (i = 0; i < 4096; i++)
+                    dma_st_data[i] = (unsigned char)(p * 7 + i * 13 + 0x5a);
+                for (i = 0; i < 128; i++)
+                    dma_st_spare[i] = (unsigned char)(p * 3 + i * 11 + 0x1d);
+                if (c4pro_nand_write_page((uint32_t)bank,
+                        PBASE + (uint32_t)p, dma_st_data, dma_st_spare))
+                {
+                    wr_fail[bank]++;
+                    continue;
+                }
+                {
+                    uint32_t r = c4pro_nand_dma_selftest_page((uint32_t)bank,
+                            PBASE + (uint32_t)p);
+                    if (r == 0xffffffffu)
+                        dma_pass[bank]++;
+                    else if (bad_pg[bank] == 0xffffffffu)
+                    {
+                        bad_pg[bank] = PBASE + (uint32_t)p;
+                        res[bank] = r;
+                    }
+                }
+                /* control: two independent PIO reads of the SAME page. If these
+                 * disagree, the raw cells are noisy (no ECC applied here) and an
+                 * engine-vs-PIO miss is cell instability, not an engine fault. */
+                if (!c4pro_nand_read_linear_page_spare((uint32_t)bank,
+                        PBASE + (uint32_t)p, pioA, pioA_sp) &&
+                    !c4pro_nand_read_linear_page_spare((uint32_t)bank,
+                        PBASE + (uint32_t)p, pioB, pioB_sp) &&
+                    !memcmp(pioA, pioB, 4096) && !memcmp(pioA_sp, pioB_sp, 128))
+                    ctrl_pass[bank]++;
+            }
+        }
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "NAND DMA SELFTEST");
+        for (bank = 0; bank < 2; bank++)
+        {
+            int row = 1 + bank * 2;
+            lcd_putsf(0, row, "d%d dma%d pio%d wf%d", bank,
+                      dma_pass[bank], ctrl_pass[bank], wr_fail[bank]);
+            if (bad_pg[bank] == 0xffffffffu)
+                lcd_putsf(0, row + 1, "d%d OK (all match)", bank);
+            else
+                lcd_putsf(0, row + 1, "d%d 1stbad pg%lu r%08lx", bank,
+                          (unsigned long)bad_pg[bank],
+                          (unsigned long)res[bank]);
+        }
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();   /* keep the result screen lit past the timeout */
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+#ifdef C4PRO_NAND_WDELAY_SWEEP
+    /* WRITE-delay sweep (DRAM RAM-run): find the fastest program/erase settle
+     * (c4pro_nand_prog_delay_iters) that still writes CORRECTLY. Per candidate:
+     * erase at a safe delay, write the scratch block at the candidate delay,
+     * then read back at a SAFE delay and compare. bad = pages that mis-wrote.
+     * wr = write throughput at that delay. (Caveat: this proves write DATA
+     * integrity vs delay; it cannot reproduce the USB/many-small-files pattern.)
+     * If bad=0 down to 50, writes are correct at 50 and the small-files drop is
+     * USB/pattern, not the delay. */
+    {
+        static unsigned char wbuf[4096], wsp[128], rbuf[4096], rsp[128];
+        const uint32_t PBASE = 8000u * C4OWN_PAGES_PER_BLOCK;
+        const int NP = (int)C4OWN_PAGES_PER_BLOCK;
+        const unsigned long bytes = (unsigned long)NP * 4096u;
+        static const uint32_t cand[] = {
+            10000, 2000, 1000, 500, 200, 100, 50, 20, 10, 2
+        };
+        const int NC = (int)(sizeof(cand) / sizeof(cand[0]));
+        unsigned long kbs[16];
+        int bad[16];
+        int ci, p, i;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "WRITE-DELAY SWEEP");
+        lcd_puts(0, 1, "...");
+        lcd_update();
+
+        c4pro_nand_fmwait = 0x1081;
+        c4pro_nand_delay_iters = 10000;   /* safe reads for verify */
+
+        for (ci = 0; ci < NC; ci++)
+        {
+            long t0, dt;
+            int b = 0;
+
+            lcd_putsf(0, 1, "test %lu ...     ", (unsigned long)cand[ci]);
+            lcd_update();
+
+            c4pro_nand_prog_delay_iters = 10000;   /* safe erase */
+            c4pro_nand_erase_block(0, PBASE);
+
+            c4pro_nand_prog_delay_iters = cand[ci];   /* write at candidate */
+            t0 = current_tick;
+            for (p = 0; p < NP; p++)
+            {
+                for (i = 0; i < 4096; i++)
+                    wbuf[i] = (unsigned char)(p * 7 + i * 13 + 0x5a);
+                for (i = 0; i < 128; i++)
+                    wsp[i] = (unsigned char)(p * 3 + i * 11 + 0x1d);
+                if (c4pro_nand_write_page(0, PBASE + (uint32_t)p, wbuf, wsp))
+                    b++;
+            }
+            dt = current_tick - t0;
+            kbs[ci] = dt > 0 ? (bytes * (unsigned long)HZ) /
+                      ((unsigned long)dt * 1024u) : 0;
+
+            for (p = 0; p < NP; p++)   /* read back at safe delay, verify data */
+            {
+                if (c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p,
+                        rbuf, rsp))
+                { b++; continue; }
+                for (i = 0; i < 4096; i++)
+                    if (rbuf[i] != (unsigned char)(p * 7 + i * 13 + 0x5a))
+                    { b++; break; }
+            }
+            bad[ci] = b;
+        }
+        c4pro_nand_prog_delay_iters = 10000;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "WDELAY  wkb/s  bad");
+        for (ci = 0; ci < NC; ci++)
+            lcd_putsf(0, 1 + ci, "%5lu  %lu  b%d",
+                      (unsigned long)cand[ci], kbs[ci], bad[ci]);
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+#ifdef C4PRO_NAND_HWECC_ERASED
+    /* Erased-page hwecc read probe (DRAM RAM-run): the flashed hwecc build hung
+     * under real host format/copy; suspect the hwecc read (0xA24) of ERASED /
+     * non-hwecc pages that the FTL touches during mount-scan and copy-on-write.
+     * Read an all-erased block via hwecc and see if it hangs, faults, or returns
+     * cleanly -- and capture BCHST for erased vs written so the uncorrectable
+     * bit is known (that's how the fix will detect erased pages). The "reading
+     * erased..." line is painted BEFORE the loop so a hang is visible. */
+    {
+        static unsigned char rbuf[4096], wbuf[4096];
+        const uint32_t PBASE = 8000u * C4OWN_PAGES_PER_BLOCK;
+        const int NP = (int)C4OWN_PAGES_PER_BLOCK;
+        uint32_t bchst_erased = 0xffffffffu, bchst_written = 0xffffffffu;
+        int er_ok = 0, er_err = 0, er_nonff = 0, p, i;
+        uint32_t rc;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "ERASED HWECC");
+        lcd_puts(0, 1, "erase...");
+        lcd_update();
+
+        c4pro_nand_delay_iters = 50;
+        c4pro_nand_erase_block(0, PBASE);
+
+        lcd_puts(0, 1, "read erased pg1..");
+        lcd_update();
+        /* single erased page first (pages 1..NP-1 stay erased; page 0 written) */
+        rc = c4pro_nand_read_page_hwecc(0, PBASE + 1u, rbuf, 8);
+        bchst_erased = c4pro_nand_last_bchst;
+
+        lcd_puts(0, 1, "write+read pg0.. ");
+        lcd_update();
+        for (i = 0; i < 4096; i++)
+            wbuf[i] = (unsigned char)(i * 13 + 0x5a);
+        c4pro_nand_write_page_hwecc(0, PBASE, wbuf, 8);
+        c4pro_nand_read_page_hwecc(0, PBASE, rbuf, 8);
+        bchst_written = c4pro_nand_last_bchst;
+
+        lcd_puts(0, 1, "sweep erased...  ");
+        lcd_update();
+        for (p = 1; p < NP; p++)   /* all still-erased pages */
+        {
+            if (c4pro_nand_read_page_hwecc(0, PBASE + (uint32_t)p, rbuf, 8))
+                er_err++;
+            else
+            {
+                er_ok++;
+                for (i = 0; i < 4096; i++)
+                    if (rbuf[i] != 0xff) { er_nonff++; break; }
+            }
+        }
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "ERASED HWECC");
+        lcd_putsf(0, 1, "rc1=%lu", (unsigned long)rc);
+        lcd_putsf(0, 2, "bchstE %08lx", (unsigned long)bchst_erased);
+        lcd_putsf(0, 3, "bchstW %08lx", (unsigned long)bchst_written);
+        lcd_putsf(0, 4, "erOK%d er%d", er_ok, er_err);
+        lcd_putsf(0, 5, "nonFF%d", er_nonff);
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+#ifdef C4PRO_NAND_HWECC_TEST
+    /* Hardware-ECC round-trip (DRAM RAM-run): prove the controller BCH-8 write
+     * (c4pro_nand_write_page_hwecc) + read (nand_read_page, 0xA24) is byte-exact
+     * with ZERO software BCH -- the primitive for the layout rewrite. Writes a
+     * scratch block with hw ECC, reads back hardware-corrected, verifies, and
+     * times the read (should be ~6.7 MB/s, unlike the software-BCH 1.16). */
+    {
+        static unsigned char wbuf[4096];
+        static unsigned char rbuf[4096], rsp[128];
+        const uint32_t PBASE = 8000u * C4OWN_PAGES_PER_BLOCK;
+        const int NP = (int)C4OWN_PAGES_PER_BLOCK;
+        const int PASSES = 6;
+        const unsigned long bytes = (unsigned long)PASSES * NP * 4096u;
+        int wr_fail = 0, mism = 0, badpage = -1, p, pass, i;
+        int page0_raw_off = -1, page0_ecc_off = -1, page0_spare0 = -1;
+        long t0, dt;
+        unsigned long rd_kbs = 0;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "HW-ECC ROUNDTRIP");
+        lcd_puts(0, 1, "erase+write...");
+        lcd_update();
+
+        c4pro_nand_fmwait = 0x1081;
+        c4pro_nand_delay_iters = 50;
+        c4pro_nand_erase_block(0, PBASE);
+        for (p = 0; p < NP; p++)
+        {
+            for (i = 0; i < 4096; i++)
+                wbuf[i] = (unsigned char)(p * 7 + i * 13 + 0x5a);
+            if (c4pro_nand_write_page_hwecc(0, PBASE + (uint32_t)p, wbuf, 8))
+                wr_fail++;
+        }
+
+        lcd_puts(0, 1, "read+verify...  ");
+        lcd_update();
+
+        /* page-0 layout probe: raw (no-ECC) read tells us where the DATA bytes
+         * landed (offset 512 => inline 528/sector; 0/match => linear/garbage);
+         * ECC read (nand_read_page) tells us if hardware correction reproduces
+         * the pattern. rawsp[0..15] = first sector's on-NAND spare (parity?). */
+        {
+            static unsigned char rawbuf[4096], rawsp[128];
+            page0_raw_off = -1;
+            page0_ecc_off = -1;
+            page0_spare0 = -1;
+            if (c4pro_nand_read_linear_page_spare(0, PBASE, rawbuf, rawsp))
+                page0_raw_off = -2;
+            else
+            {
+                page0_spare0 = rawsp[0];
+                for (i = 0; i < 4096; i++)
+                    if (rawbuf[i] != (unsigned char)(i * 13 + 0x5a))
+                    { page0_raw_off = i; break; }
+            }
+            if (c4pro_nand_read_page_hwecc(0, PBASE, rbuf, 8))
+                page0_ecc_off = -2;
+            else
+                for (i = 0; i < 4096; i++)
+                    if (rbuf[i] != (unsigned char)(i * 13 + 0x5a))
+                    { page0_ecc_off = i; break; }
+        }
+
+        for (p = 0; p < NP; p++)
+        {
+            if (c4pro_nand_read_page_hwecc(0, PBASE + (uint32_t)p, rbuf, 8))
+            { mism++; if (badpage < 0) badpage = p; continue; }
+            for (i = 0; i < 4096; i++)
+                if (rbuf[i] != (unsigned char)(p * 7 + i * 13 + 0x5a))
+                { mism++; if (badpage < 0) badpage = p; break; }
+        }
+
+        t0 = current_tick;
+        for (pass = 0; pass < PASSES; pass++)
+            for (p = 0; p < NP; p++)
+                c4pro_nand_read_page_hwecc(0, PBASE + (uint32_t)p, rbuf, 8);
+        dt = current_tick - t0;
+        rd_kbs = dt > 0 ? (bytes * (unsigned long)HZ) /
+                 ((unsigned long)dt * 1024u) : 0;
+        c4pro_nand_delay_iters = 50;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "HW-ECC ROUNDTRIP");
+        lcd_putsf(0, 1, "wf%d mism%d", wr_fail, mism);
+        lcd_putsf(0, 2, "raw1stdiff %d", page0_raw_off);
+        lcd_putsf(0, 3, "ecc1stdiff %d", page0_ecc_off);
+        lcd_putsf(0, 4, "spare0 %d rd%lu", page0_spare0, rd_kbs);
+        lcd_putsf(0, 5, (mism == 0 && wr_fail == 0) ? "HW-ECC OK" : "HW-ECC FAIL");
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+#ifdef C4PRO_NAND_DELAY_SWEEP
+    /* nand_delay sweep (DRAM RAM-run): the clock probe showed dropping the
+     * post-command busy-wait from 10000 to 50 iters took reads 1462->5206 KB/s.
+     * Find the fastest value that still reads CORRECTLY (bad=0). Scratch is
+     * written at the safe 10000; only the READ delay is swept. bad = pages that
+     * errored or mis-compared. Pick the lowest-bad0 delay for the read path. */
+    {
+        static unsigned char wbuf[4096], wsp[128], rbuf[4096], rsp[128];
+        const uint32_t PBASE = 8000u * C4OWN_PAGES_PER_BLOCK;
+        const int NP = (int)C4OWN_PAGES_PER_BLOCK;
+        const int PASSES = 6;
+        const unsigned long bytes = (unsigned long)PASSES * NP * 4096u;
+        static const uint32_t cand[] = {
+            10000, 1000, 200, 100, 50, 20, 10, 5, 2, 0
+        };
+        const int NC = (int)(sizeof(cand) / sizeof(cand[0]));
+        unsigned long kbs[16];
+        int bad[16];
+        int ci, p, pass, i;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "DELAY SWEEP");
+        lcd_puts(0, 1, "prep...");
+        lcd_update();
+
+        c4pro_nand_fmwait = 0x1081;
+        c4pro_nand_delay_iters = 10000;
+        c4pro_nand_erase_block(0, PBASE);
+        for (p = 0; p < NP; p++)
+        {
+            for (i = 0; i < 4096; i++)
+                wbuf[i] = (unsigned char)(p * 7 + i * 13 + 0x5a);
+            for (i = 0; i < 128; i++)
+                wsp[i] = (unsigned char)(p * 3 + i * 11 + 0x1d);
+            c4pro_nand_write_page(0, PBASE + (uint32_t)p, wbuf, wsp);
+        }
+
+        for (ci = 0; ci < NC; ci++)
+        {
+            long t0, dt;
+            int b = 0;
+
+            lcd_putsf(0, 1, "test %lu ...     ", (unsigned long)cand[ci]);
+            lcd_update();
+            c4pro_nand_delay_iters = cand[ci];
+
+            t0 = current_tick;
+            for (pass = 0; pass < PASSES; pass++)
+                for (p = 0; p < NP; p++)
+                    c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p,
+                                                      rbuf, rsp);
+            dt = current_tick - t0;
+            kbs[ci] = dt > 0 ? (bytes * (unsigned long)HZ) /
+                      ((unsigned long)dt * 1024u) : 0;
+
+            for (p = 0; p < NP; p++)
+            {
+                if (c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p,
+                        rbuf, rsp))
+                { b++; continue; }
+                for (i = 0; i < 4096; i++)
+                    if (rbuf[i] != (unsigned char)(p * 7 + i * 13 + 0x5a))
+                    { b++; break; }
+            }
+            bad[ci] = b;
+        }
+        c4pro_nand_delay_iters = 10000;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "DELAY  kb/s  bad");
+        for (ci = 0; ci < NC; ci++)
+            lcd_putsf(0, 1 + ci, "%5lu  %lu  b%d",
+                      (unsigned long)cand[ci], kbs[ci], bad[ci]);
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+#ifdef C4PRO_NAND_CLKPROBE
+    /* Decisive clock probe (DRAM RAM-run): is the ~1.4 MB/s read floor measured
+     * at stock's 100 MHz AHB HCLK (PLL up) or a slow pre-PLL clock? Print the
+     * live PLL/divider/clkcfg, and measure read speed at the full nand_delay vs
+     * a tiny one to size the nand_delay overhead. At CPUFREQ_MAX stock sets
+     * DIVCON1 bits[4:3]=01 (=0x08..0x18 in low byte) and PLLCON1=0x01a80531-ish;
+     * if our DIVCON1 low byte shows that, we're already at stock's clock and the
+     * gap is structural, not clock. */
+    {
+        static unsigned char wbuf[4096], wsp[128], rbuf[4096], rsp[128];
+        const uint32_t PBASE = 8000u * C4OWN_PAGES_PER_BLOCK;
+        const int NP = (int)C4OWN_PAGES_PER_BLOCK;
+        const int PASSES = 6;
+        const unsigned long bytes = (unsigned long)PASSES * NP * 4096u;
+        uint32_t clk[4];
+        long t0, dt;
+        unsigned long kbs_slow = 0, kbs_fast = 0;
+        int p, pass, i;
+
+        c4pro_nand_clock_regs(clk);
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "CLK PROBE");
+        lcd_puts(0, 1, "prep...");
+        lcd_update();
+
+        c4pro_nand_fmwait = 0x1081;
+        c4pro_nand_delay_iters = 10000;
+        c4pro_nand_erase_block(0, PBASE);
+        for (p = 0; p < NP; p++)
+        {
+            for (i = 0; i < 4096; i++)
+                wbuf[i] = (unsigned char)(p * 7 + i * 13 + 0x5a);
+            for (i = 0; i < 128; i++)
+                wsp[i] = (unsigned char)(p * 3 + i * 11 + 0x1d);
+            c4pro_nand_write_page(0, PBASE + (uint32_t)p, wbuf, wsp);
+        }
+
+        c4pro_nand_delay_iters = 10000;
+        t0 = current_tick;
+        for (pass = 0; pass < PASSES; pass++)
+            for (p = 0; p < NP; p++)
+                c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p,
+                                                  rbuf, rsp);
+        dt = current_tick - t0;
+        kbs_slow = dt > 0 ? (bytes * (unsigned long)HZ) /
+                   ((unsigned long)dt * 1024u) : 0;
+
+        c4pro_nand_delay_iters = 50;
+        t0 = current_tick;
+        for (pass = 0; pass < PASSES; pass++)
+            for (p = 0; p < NP; p++)
+                c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p,
+                                                  rbuf, rsp);
+        dt = current_tick - t0;
+        kbs_fast = dt > 0 ? (bytes * (unsigned long)HZ) /
+                   ((unsigned long)dt * 1024u) : 0;
+        c4pro_nand_delay_iters = 10000;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "CLK PROBE");
+        lcd_putsf(0, 1, "PLL %08lx", (unsigned long)clk[0]);
+        lcd_putsf(0, 2, "DIV %08lx", (unsigned long)clk[1]);
+        lcd_putsf(0, 3, "CLK %08lx", (unsigned long)clk[2]);
+        lcd_putsf(0, 4, "rd d10k %lu", kbs_slow);
+        lcd_putsf(0, 5, "rd d50  %lu", kbs_fast);
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+#ifdef C4PRO_NAND_FMWAIT_SWEEP
+    /* Empirical NAND timing sweep (DRAM RAM-run): all read methods cluster at
+     * ~1.4 MB/s while stock does ~6.7, so the bottleneck is the shared FMWAIT
+     * wait-state timing, not the transfer method. Write a scratch block at the
+     * safe 0x1081, then read it back via PIO at progressively tighter FMWAIT
+     * values, recording throughput AND correctness (bad = pages that errored or
+     * mis-compared). The fastest value with bad=0 is the new safe timing. */
+    {
+        static unsigned char wbuf[4096], wsp[128];
+        static unsigned char rbuf[4096], rsp[128];
+        const uint32_t PBASE = 8000u * C4OWN_PAGES_PER_BLOCK;
+        const int NP = (int)C4OWN_PAGES_PER_BLOCK;
+        const int PASSES = 6;
+        const unsigned long bytes = (unsigned long)PASSES * NP * 4096u;
+        static const uint32_t cand[] = {
+            0x1081, 0x1041, 0x1021, 0x1011, 0x0821, 0x0421,
+            0x0221, 0x0121, 0x0061, 0x0031, 0x0021, 0x0011
+        };
+        const int NC = (int)(sizeof(cand) / sizeof(cand[0]));
+        unsigned long kbs[16];
+        int bad[16];
+        int ci, p, pass, i;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "FMWAIT SWEEP");
+        lcd_puts(0, 1, "prep...");
+        lcd_update();
+
+        c4pro_nand_fmwait = 0x1081;
+        c4pro_nand_erase_block(0, PBASE);
+        for (p = 0; p < NP; p++)
+        {
+            for (i = 0; i < 4096; i++)
+                wbuf[i] = (unsigned char)(p * 7 + i * 13 + 0x5a);
+            for (i = 0; i < 128; i++)
+                wsp[i] = (unsigned char)(p * 3 + i * 11 + 0x1d);
+            c4pro_nand_write_page(0, PBASE + (uint32_t)p, wbuf, wsp);
+        }
+
+        for (ci = 0; ci < NC; ci++)
+        {
+            long t0, dt;
+            int b = 0;
+
+            lcd_putsf(0, 1, "test %04lx ...   ", (unsigned long)cand[ci]);
+            lcd_update();
+            c4pro_nand_fmwait = cand[ci];
+
+            t0 = current_tick;
+            for (pass = 0; pass < PASSES; pass++)
+                for (p = 0; p < NP; p++)
+                    c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p,
+                                                      rbuf, rsp);
+            dt = current_tick - t0;
+            kbs[ci] = dt > 0 ? (bytes * (unsigned long)HZ) /
+                      ((unsigned long)dt * 1024u) : 0;
+
+            for (p = 0; p < NP; p++)
+            {
+                if (c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p,
+                        rbuf, rsp))
+                { b++; continue; }
+                for (i = 0; i < 4096; i++)
+                    if (rbuf[i] != (unsigned char)(p * 7 + i * 13 + 0x5a))
+                    { b++; break; }
+            }
+            bad[ci] = b;
+        }
+        c4pro_nand_fmwait = 0x1081;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "FMWAIT  kb/s  bad");
+        for (ci = 0; ci < NC; ci++)
+            lcd_putsf(0, 1 + ci, "%04lx  %lu  b%d",
+                      (unsigned long)cand[ci], kbs[ci], bad[ci]);
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+#ifdef C4PRO_NAND_DMA_RWTEST
+    /* Focused, fast end-to-end gate with live progress (read backend = whatever
+     * the FTL is built with: PIO, DMA engine, or hardware ECC) (so a long run
+     * can never be confused with a white-screen hang). Writes a known pattern
+     * through the real FTL write path (software-BCH-encoded), syncs, REMOUNTS to
+     * drop the page cache and force fresh NAND reads, then reads every sector
+     * back through c4own_read_sector_internal -- which under C4PRO_NAND_DMA is
+     * the buffered-engine reader + software BCH correction. This proves the
+     * engine read is correct in the way that matters (BCH absorbs the raw cell
+     * noise the raw selftest exposed). Reports written/read/mismatch counts,
+     * first bad sector, and the FTL uncorrectable counter. Halts. */
+    {
+        static unsigned char bw[512];
+        static unsigned char br[512];
+        const uint32_t PN = 1024u;          /* pattern = sectors 0..PN-1 (512KB) */
+        int fmt_rc, mism = 0, rd_err = 0, badsec = -1, i;
+        uint32_t s;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "DMA RW TEST");
+        lcd_puts(0, 1, "format + write...");
+        lcd_update();
+
+        fmt_rc = (int)c4own_format();
+        c4own_mount_scan();
+
+        for (s = 0; s < PN; s++)
+        {
+            for (i = 0; i < 512; i++)
+                bw[i] = (unsigned char)(s * 7u + (unsigned)i * 13u + 0x5au);
+            c4own_write_internal(s, 1u, bw);
+        }
+        ftl_sync();
+
+        lcd_puts(0, 1, "remount + read...   ");
+        lcd_update();
+
+        c4own_mount_scan();                 /* drop cache -> reads hit NAND */
+        c4own_diag_uncorr = 0;
+
+        for (s = 0; s < PN; s++)
+        {
+            if (c4own_read_sector_internal(s, br))
+            {
+                rd_err++;
+                if (badsec < 0) badsec = (int)s;
+                continue;
+            }
+            for (i = 0; i < 512; i++)
+                bw[i] = (unsigned char)(s * 7u + (unsigned)i * 13u + 0x5au);
+            if (memcmp(br, bw, 512))
+            {
+                mism++;
+                if (badsec < 0) badsec = (int)s;
+            }
+        }
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "DMA RW TEST");
+        lcd_putsf(0, 1, "fmt=%d wrote=%lu", fmt_rc, (unsigned long)PN);
+        lcd_putsf(0, 2, "mism=%d rderr=%d", mism, rd_err);
+        lcd_putsf(0, 3, "badsec=%d", badsec);
+        lcd_putsf(0, 4, "uncorr=%d", c4own_diag_uncorr);
+        lcd_putsf(0, 5, (mism == 0 && rd_err == 0) ? "DMA READ OK" : "DMA READ FAIL");
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+#if defined(C4PRO_NAND_DMA) && defined(C4PRO_NAND_DMA_SPEEDTEST)
+    /* Throughput comparison (DRAM RAM-run): time reading the same data three
+     * ways so the buffered-engine win is quantified, not assumed.
+     *  PIO  = c4pro_nand_read_linear_page_spare  (byte-serial FLASH_DATA loop)
+     *  ENG  = c4pro_nand_read_linear_page_spare_dma (PAGE_BUF burst + word copy)
+     *  FTL  = c4own_read_sector_internal (ENG + per-sector software BCH decode)
+     * The FTL number is what the user actually gets; BCH decode is CPU-heavy and
+     * may itself cap throughput, so it is measured separately from raw transfer.
+     * Reads are uncached (raw funcs hit NAND every call). Halts. */
+    {
+        static unsigned char sd[4096], ss[128];
+        const uint32_t PBASE = 8000u * C4OWN_PAGES_PER_BLOCK; /* scratch block */
+        const int NP = (int)C4OWN_PAGES_PER_BLOCK;            /* 128 pages */
+        const int PASSES = 8;
+        unsigned long bytes = (unsigned long)PASSES * NP * 4096u;
+        long t0, dt_pio, dt_eng, dt_nat, dt_ftl;
+        unsigned long pio_kbs, eng_kbs, nat_kbs, ftl_kbs;
+        int pass, p;
+        uint32_t s;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "NAND SPEED");
+        lcd_puts(0, 1, "prep...");
+        lcd_update();
+
+        /* scratch data for the raw (non-FTL) reads */
+        c4pro_nand_erase_block(0, PBASE);
+        for (p = 0; p < NP; p++)
+        {
+            for (s = 0; s < 4096; s++)
+                sd[s] = (unsigned char)(p * 7u + s * 13u + 0x5au);
+            for (s = 0; s < 128; s++)
+                ss[s] = (unsigned char)(p * 3u + s * 11u + 0x1du);
+            c4pro_nand_write_page(0, PBASE + (uint32_t)p, sd, ss);
+        }
+
+        lcd_puts(0, 1, "PIO read...     ");
+        lcd_update();
+        t0 = current_tick;
+        for (pass = 0; pass < PASSES; pass++)
+            for (p = 0; p < NP; p++)
+                c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p, sd, ss);
+        dt_pio = current_tick - t0;
+
+        lcd_puts(0, 1, "ENG read...     ");
+        lcd_update();
+        t0 = current_tick;
+        for (pass = 0; pass < PASSES; pass++)
+            for (p = 0; p < NP; p++)
+                c4pro_nand_read_linear_page_spare_dma(0, PBASE + (uint32_t)p,
+                                                      sd, ss);
+        dt_eng = current_tick - t0;
+
+        /* native-streaming ceiling (wrong data, timing only): what the engine
+         * would do on a stock 528-byte inline layout, no per-sector reposition */
+        lcd_puts(0, 1, "NAT read...     ");
+        lcd_update();
+        t0 = current_tick;
+        for (pass = 0; pass < PASSES; pass++)
+            for (p = 0; p < NP; p++)
+                c4pro_nand_read_native_stream_dma(0, PBASE + (uint32_t)p, sd);
+        dt_nat = current_tick - t0;
+
+        /* FTL end-to-end (engine + BCH): write a region, remount, time reads */
+        lcd_puts(0, 1, "FTL prep...     ");
+        lcd_update();
+        c4own_format();
+        c4own_mount_scan();
+        for (s = 0; s < (uint32_t)NP * 8u; s++)   /* NP pages worth of sectors */
+        {
+            for (p = 0; p < 512; p++)
+                sd[p] = (unsigned char)(s * 7u + (unsigned)p * 13u + 0x5au);
+            c4own_write_internal(s, 1u, sd);
+        }
+        ftl_sync();
+        c4own_mount_scan();
+        lcd_puts(0, 1, "FTL read...     ");
+        lcd_update();
+        t0 = current_tick;
+        for (pass = 0; pass < PASSES; pass++)
+            for (s = 0; s < (uint32_t)NP * 8u; s++)
+                c4own_read_sector_internal(s, sd);
+        dt_ftl = current_tick - t0;
+
+        pio_kbs = dt_pio > 0 ? (bytes * (unsigned long)HZ) /
+                  ((unsigned long)dt_pio * 1024u) : 0;
+        eng_kbs = dt_eng > 0 ? (bytes * (unsigned long)HZ) /
+                  ((unsigned long)dt_eng * 1024u) : 0;
+        nat_kbs = dt_nat > 0 ? (bytes * (unsigned long)HZ) /
+                  ((unsigned long)dt_nat * 1024u) : 0;
+        ftl_kbs = dt_ftl > 0 ? (bytes * (unsigned long)HZ) /
+                  ((unsigned long)dt_ftl * 1024u) : 0;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "NAND SPEED (KB/s)");
+        lcd_putsf(0, 1, "PIO %lu", pio_kbs);
+        lcd_putsf(0, 2, "ENG(crc) %lu", eng_kbs);
+        lcd_putsf(0, 3, "NAT(528) %lu", nat_kbs);
+        lcd_putsf(0, 4, "FTL %lu", ftl_kbs);
+        lcd_putsf(0, 5, "NAT x%lu.%02lu vs PIO",
+                  pio_kbs ? nat_kbs / pio_kbs : 0,
+                  pio_kbs ? (nat_kbs * 100u / pio_kbs) % 100u : 0);
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
 #ifdef C4PRO_FTL_ECC_SELFTEST
     /* Multi-cycle persistence test: single write->sync->remount passes
      * (mism=0), but real use shows data degrading across MULTIPLE cold boots
@@ -2405,7 +3216,12 @@ uint32_t ftl_init(void)
         lcd_putsf(0, 3, "badsec=%d", badsec);
         lcd_putsf(0, 4, "uncorr=%d", c4own_diag_uncorr);
         lcd_update();
-        while (1) sleep(HZ);
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();   /* keep the result screen lit past the timeout */
+#endif
+            sleep(HZ);
+        }
     }
 #endif
 #ifdef C4PRO_FTL_ROCKBOX_OWNED_RW

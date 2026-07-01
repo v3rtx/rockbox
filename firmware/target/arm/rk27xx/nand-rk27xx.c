@@ -170,7 +170,7 @@ void flash_init(void)
     flash_pend_cmd.valid = 0;
     flash_read_status_cmd = CMD_READ_STATUS;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     for (i=0; i< MAX_FLASH_NUM; i++)
@@ -445,11 +445,54 @@ static const struct nand_device_info_type c4pro_micron_2cd9d53e88 =
 
 static long last_activity = 0;
 
+/* NAND interface wait-state timing (AHB0_NANDC+0x04). 0x1081 is the original
+ * conservative value; every read/write programs it from here so a DRAM sweep
+ * can find the fastest value the NAND still reads correctly at (stock runs
+ * tighter timing -> ~6.7 MB/s vs our ~1.4). Lower = faster but risks errors. */
+uint32_t c4pro_nand_fmwait = 0x1081;
+
+/* Post-command settle busy-wait. The original 10000 iters (~150-250us) ran
+ * several times per page ON TOP of the real nand_wait_ready() FM_RDY poll and
+ * was the dominant per-page cost: on-device a DRAM sweep read correctly (bad=0)
+ * at every value down to 0, and dropping 10000->~2 took reads 1462->5389 KB/s
+ * (3.7x, ~80% of stock's 6.7 MB/s). 50 is the conservative default: ~5.2 MB/s
+ * with 200x margin over the verified-safe floor for the (unswept) program/erase
+ * path. Tunable so it can be retuned per phase. */
+uint32_t c4pro_nand_delay_iters = 50;
+
+/* Separate settle for the PROGRAM/ERASE path. On-device write-delay sweep wrote
+ * byte-correct (bad=0) down to 2 iters, so writes need no extra settle; 100 is a
+ * comfortable margin at negligible cost (writes are tPROG-bound, so the settle
+ * is a tiny fraction of program time). The many-small-files copy drop is a USB/
+ * copy-on-write pattern issue, NOT this delay. */
+uint32_t c4pro_nand_prog_delay_iters = 100;
+static void nand_prog_delay(void)
+{
+    volatile uint32_t i;
+    for (i = 0; i < c4pro_nand_prog_delay_iters; i++)
+        ;
+}
+
+/* Last BCH status (BCHST) OR'd across a hardware-ECC read's sectors -- exposes
+ * the uncorrectable bit so erased/non-hwecc pages can be detected, not choked. */
+uint32_t c4pro_nand_last_bchst = 0;
+
+/* Capture the live clock state so a DRAM probe can tell whether NAND reads run
+ * at stock's 100 MHz AHB HCLK (PLL up) or a slow pre-PLL clock. out[0]=PLLCON1,
+ * out[1]=DIVCON1 (bits[4:3]=ARM:AHB ratio), out[2]=CLKCFG, out[3]=STATUS. */
+void c4pro_nand_clock_regs(uint32_t out[4])
+{
+    out[0] = SCU_PLLCON1;
+    out[1] = SCU_DIVCON1;
+    out[2] = SCU_CLKCFG;
+    out[3] = SCU_STATUS;
+}
+
 static void nand_delay(void)
 {
-    volatile int i;
+    volatile uint32_t i;
 
-    for (i = 0; i < 10000; i++)
+    for (i = 0; i < c4pro_nand_delay_iters; i++)
         ;
 }
 
@@ -525,7 +568,7 @@ static bool nand_read_id(uint32_t bank, unsigned char id[5])
 {
     int i;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     nand_select(bank);
@@ -581,7 +624,7 @@ uint32_t nand_read_page(uint32_t bank, uint32_t page, void* databuffer,
     if (bank > 3 || (!data && !spare))
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     nand_select(bank);
@@ -675,7 +718,7 @@ uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
     if (bank > 3 || sector >= 8 || (!data && !spare))
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     nand_select(bank);
@@ -748,7 +791,7 @@ uint32_t c4pro_nand_read_linear_sector(uint32_t bank, uint32_t page,
     if (bank > 3 || sector >= 8 || !data)
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     nand_select(bank);
@@ -794,7 +837,7 @@ uint32_t c4pro_nand_read_linear_page(uint32_t bank, uint32_t page,
     if (bank > 3 || !data)
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     nand_select(bank);
@@ -844,7 +887,7 @@ uint32_t c4pro_nand_read_linear_page_spare(uint32_t bank, uint32_t page,
     if (bank > 3 || !data || !spare)
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     nand_select(bank);
@@ -896,7 +939,7 @@ uint32_t c4pro_nand_read_page_flctl(uint32_t bank, uint32_t page,
     if (bank > 3 || !data)
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
     nand_select(bank);
     nand_delay();
@@ -947,6 +990,341 @@ uint32_t c4pro_nand_read_page_flctl(uint32_t bank, uint32_t page,
     return 0;
 }
 
+#ifdef C4PRO_NAND_DMA
+/*
+ * Fast owned-FTL page read via the hardware buffered PAGE_BUF engine, replacing
+ * the per-byte FLASH_DATA PIO loop in c4pro_nand_read_linear_page_spare().
+ *
+ * Why this is the chosen fast path (see docs/c4-nand-dma-speed-design.md):
+ *  - The throughput bottleneck is the byte-serial FLASH_DATA port: the PIO
+ *    reader issues one CPU-gated AHB/NAND access per byte for 4096+128 bytes,
+ *    which measures ~1 MB/s (~4 ms/page). The buffered engine sequences the
+ *    NAND->on-chip-SRAM transfer in hardware and the CPU only does a word-wide
+ *    copy out of PAGE_BUF, removing ~4096 byte-serial round trips per page.
+ *  - The RK27xx NANDC has NO DRAM-master DMA of its own; the only "DMA" blocks
+ *    on this SoC are the UDC scatter-gather engine (0x180a0000, mutually
+ *    exclusive with USB-MSC) and the generic HDMA/DWDMA mem-to-mem engines,
+ *    none of which shorten the NAND->buffer leg that dominates here. The
+ *    buffered PAGE_BUF engine IS the NAND-dedicated fast path.
+ *
+ * Layout compatibility: the owned FTL writes a *linear* page (4096 contiguous
+ * data bytes at column 0, then 128 contiguous software-BCH spare bytes at
+ * column 4096). The buffered engine's hardware-ECC mode (FLCTL=0xA24) assumes
+ * an *inline* 512-data+16-spare (528-byte) sector stride and would both
+ * mis-sample the data and mis-correct against the wrong spare. We therefore run
+ * the engine with hardware correction OFF (C4PRO_NAND_DMA_FLCTL_BASE=0x224): it
+ * advances exactly 512 data bytes/sector, reproducing the contiguous data, and
+ * the existing software BCH still corrects each sector from the spare. The 128
+ * spare bytes are read with a short PIO burst from column 4096 (3% of the page)
+ * because the engine's auto-spare offset does not match the linear layout.
+ */
+#ifndef C4PRO_NAND_DMA_FLCTL_BASE
+#define C4PRO_NAND_DMA_FLCTL_BASE 0x224u /* buffered transfer, hardware ECC OFF */
+#endif
+/* tCCS settle iterations after a change-read-column (0x05/0xE0) before the
+ * engine samples the new column. Start small; raise if reads corrupt, lower
+ * toward 0 once a safe minimum is found (it is paid 8x per page). */
+#ifndef C4PRO_NAND_DMA_CRC_DELAY
+#define C4PRO_NAND_DMA_CRC_DELAY 64
+#endif
+
+uint32_t c4pro_nand_read_linear_page_spare_dma(uint32_t bank, uint32_t page,
+                                               void* databuffer,
+                                               void* sparebuffer)
+{
+    unsigned i;
+    unsigned sector;
+    unsigned char *data = databuffer;
+    unsigned char *spare = sparebuffer;
+
+    if (bank > 3 || !data || !spare)
+        return 1;
+
+    FMWAIT = c4pro_nand_fmwait;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    BCHCTL = 1;
+
+    /* Data phase: 8 linear 512-byte sectors via the buffered PAGE_BUF engine.
+     * The engine advances the NAND output by the stock 528-byte sector stride
+     * (512 data + 16 inline ECC) per FLCTL trigger -- even with ECC correction
+     * off (0x224 vs 0xA24) -- so it cannot stream our linear (4096 contiguous)
+     * layout sequentially. Re-issuing a full read command (with tR latency) per
+     * sector fixes the address but is ~4x SLOWER than byte PIO (8 tR/page).
+     * Instead: ONE full page read latches the page (single tR), then for each
+     * sector use CHANGE READ COLUMN (0x05 + col + 0xE0) to reposition the NAND
+     * output pointer to the exact linear offset (sector*512) WITHOUT re-reading
+     * the array, and trigger the engine burst. One tR/page + cheap column moves
+     * + word-wide PAGE_BUF copy -> the actual speedup. */
+    FLASH_CMD(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;            /* column 0 (low) */
+    FLASH_ADDR(bank) = 0x00;            /* column 0 (high) */
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+    FLASH_CMD(bank) = 0x30;
+
+    nand_delay();
+    if (!nand_wait_ready())            /* the single tR for the whole page */
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    for (sector = 0; sector < 8; sector++)
+    {
+        unsigned column = sector * 512;
+        const volatile uint32_t *src;
+        uint32_t *dst;
+
+        /* change read column to the linear sector offset (no array re-read) */
+        FLASH_CMD(bank) = 0x05;
+        FLASH_ADDR(bank) = column & 0xff;
+        FLASH_ADDR(bank) = (column >> 8) & 0xff;
+        FLASH_CMD(bank) = 0xE0;
+        /* tCCS: short settle before the engine samples the new column */
+        {
+            volatile int d;
+            for (d = 0; d < C4PRO_NAND_DMA_CRC_DELAY; d++)
+                ;
+        }
+
+        FLCTL = C4PRO_NAND_DMA_FLCTL_BASE | ((sector & 3) << 3);
+        if (!nand_wait_fl_ready())
+        {
+            nand_deselect();
+            return 2;
+        }
+
+        src = (const volatile uint32_t *)
+              ((volatile unsigned char *)&PAGE_BUF + ((sector & 3) << 9));
+        dst = (uint32_t *)(data + sector * 512);
+        for (i = 0; i < 512 / 4; i++)
+            dst[i] = src[i];
+    }
+
+    /* Spare phase: 128 contiguous software-BCH bytes at column 4096, PIO. */
+    FLASH_CMD(bank) = 0x00;
+    FLASH_ADDR(bank) = 4096 & 0xff;
+    FLASH_ADDR(bank) = (4096 >> 8) & 0xff;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+    FLASH_CMD(bank) = 0x30;
+
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    for (i = 0; i < 128; i++)
+        spare[i] = FLASH_DATA(bank);
+
+    nand_deselect();
+    last_activity = current_tick;
+    return 0;
+}
+
+/* SPEED-CEILING PROBE ONLY (data is WRONG on our linear layout): read a page in
+ * the engine's NATIVE streaming mode -- one read command per 2048-byte half, 4
+ * sequential PAGE_BUF bursts each, NO per-sector change-column. This is exactly
+ * how the engine would run on a stock 528-byte inline layout, so its timing is
+ * the ceiling a 528-layout rewrite could reach. Returns the same 4096 bytes
+ * nand_read_page would, but mis-aligned for our layout -- use for timing, not
+ * content. */
+uint32_t c4pro_nand_read_native_stream_dma(uint32_t bank, uint32_t page,
+                                           void* databuffer)
+{
+    unsigned i, sector, half;
+    unsigned char *data = databuffer;
+
+    if (bank > 3 || !data)
+        return 1;
+
+    FMWAIT = c4pro_nand_fmwait;
+    FLCTL = FL_RST;
+    nand_select(bank);
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+    BCHCTL = 1;
+
+    for (half = 0; half < 2; half++)
+    {
+        unsigned column = half * 2048;
+
+        FLASH_CMD(bank) = 0x00;
+        FLASH_ADDR(bank) = column & 0xff;
+        FLASH_ADDR(bank) = (column >> 8) & 0xff;
+        FLASH_ADDR(bank) = page & 0xff;
+        FLASH_ADDR(bank) = (page >> 8) & 0xff;
+        FLASH_ADDR(bank) = (page >> 16) & 0xff;
+        FLASH_CMD(bank) = 0x30;
+
+        nand_delay();
+        if (!nand_wait_ready())
+        {
+            nand_deselect();
+            return 1;
+        }
+
+        for (sector = 0; sector < 4; sector++)
+        {
+            unsigned out_sector = half * 4 + sector;
+            const volatile uint32_t *src;
+            uint32_t *dst;
+
+            FLCTL = C4PRO_NAND_DMA_FLCTL_BASE | ((sector & 3) << 3);
+            if (!nand_wait_fl_ready())
+            {
+                nand_deselect();
+                return 2;
+            }
+            src = (const volatile uint32_t *)
+                  ((volatile unsigned char *)&PAGE_BUF + ((sector & 3) << 9));
+            dst = (uint32_t *)(data + out_sector * 512);
+            for (i = 0; i < 512 / 4; i++)
+                dst[i] = src[i];
+        }
+    }
+
+    nand_deselect();
+    last_activity = current_tick;
+    return 0;
+}
+
+/* Validation helper for the staged on-device bring-up: read one page both ways
+ * (PIO reference vs engine) and return the first byte offset where they differ
+ * (0..4095 = data, 4096..4223 = spare), or 0xffffffff if identical. Distinct
+ * error sentinels: 0xfffffffe = PIO read failed, 0xfffffffd = engine read
+ * failed. Lets the human prove the engine read on die 1 before switching the
+ * FTL read path over. */
+static unsigned char c4pro_dma_test_pio_data[4096];
+static unsigned char c4pro_dma_test_pio_spare[128];
+static unsigned char c4pro_dma_test_dma_data[4096];
+static unsigned char c4pro_dma_test_dma_spare[128];
+
+uint32_t c4pro_nand_dma_selftest_page(uint32_t bank, uint32_t page)
+{
+    unsigned i;
+
+    if (c4pro_nand_read_linear_page_spare(bank, page,
+            c4pro_dma_test_pio_data, c4pro_dma_test_pio_spare))
+        return 0xfffffffeu;
+    if (c4pro_nand_read_linear_page_spare_dma(bank, page,
+            c4pro_dma_test_dma_data, c4pro_dma_test_dma_spare))
+        return 0xfffffffdu;
+
+    for (i = 0; i < 4096; i++)
+        if (c4pro_dma_test_pio_data[i] != c4pro_dma_test_dma_data[i])
+            return i;
+    for (i = 0; i < 128; i++)
+        if (c4pro_dma_test_pio_spare[i] != c4pro_dma_test_dma_spare[i])
+            return 4096u + i;
+
+    return 0xffffffffu;
+}
+#endif /* C4PRO_NAND_DMA */
+
+#ifdef C4PRO_NAND_DMA_WRITE
+/*
+ * Experimental engine-assisted page program (default OFF, validate only AFTER
+ * the read path is byte-for-byte proven). Streams the 4096 data bytes from
+ * PAGE_BUF through the buffered engine (ECC OFF, FL_WR) and PIO-writes the 128
+ * contiguous spare bytes, preserving the exact linear data+spare layout that
+ * the PIO writer and the software BCH expect.
+ *
+ * Caveat: MLC tPROG (~1-3 ms/page) dominates program time, so the realistic
+ * gain over the proven PIO writer is modest, and a full page program must be a
+ * single uninterrupted 0x80..0x10 input stream (it cannot re-address per half
+ * like the read path). Whether the engine streams all 8 sectors contiguously
+ * with ECC off is the exact thing the read-after-write validation must confirm
+ * on a sacrificial block before this is trusted. The PIO writer remains the
+ * default; this is only used when C4PRO_NAND_DMA_WRITE is explicitly defined.
+ */
+uint32_t c4pro_nand_write_page_dma(uint32_t bank, uint32_t page,
+                                   const void* databuffer,
+                                   const void* sparebuffer)
+{
+    unsigned i;
+    unsigned sector;
+    const unsigned char *data = databuffer;
+    const unsigned char *spare = sparebuffer;
+
+    if (bank > 3 || !data || !spare)
+        return 1;
+
+    FMWAIT = c4pro_nand_fmwait;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x80;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+
+    BCHCTL = 1;
+
+    for (sector = 0; sector < 8; sector++)
+    {
+        volatile uint32_t *dstbuf;
+        const uint32_t *srcw;
+
+        dstbuf = (volatile uint32_t *)
+                 ((volatile unsigned char *)&PAGE_BUF + ((sector & 3) << 9));
+        srcw = (const uint32_t *)(data + sector * 512);
+        for (i = 0; i < 512 / 4; i++)
+            dstbuf[i] = srcw[i];
+
+        FLCTL = C4PRO_NAND_DMA_FLCTL_BASE | FL_WR | ((sector & 3) << 3);
+        if (!nand_wait_fl_ready())
+        {
+            nand_deselect();
+            return 2;
+        }
+    }
+
+    for (i = 0; i < 128; i++)
+        FLASH_DATA(bank) = spare[i];
+
+    FLASH_CMD(bank) = 0x10;
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    FLASH_CMD(bank) = 0x70;
+    i = FLASH_DATA(bank);
+    nand_deselect();
+    last_activity = current_tick;
+
+    return (i & 1) ? 1 : 0;
+}
+#endif /* C4PRO_NAND_DMA_WRITE */
+
 uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
                                const void* databuffer,
                                const void* sparebuffer)
@@ -958,11 +1336,11 @@ uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
     if (bank > 3 || !data || !spare)
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     nand_select(bank);
-    nand_delay();
+    nand_prog_delay();
 
     if (!nand_wait_ready())
     {
@@ -999,6 +1377,149 @@ uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
     return (i & 1) ? 1 : 0;
 }
 
+/* Hardware-ECC page program (mirror of nand_read_page's 0xA24 read). The
+ * controller's BCH-8 engine generates 13 parity bytes/sector into the spare
+ * SRAM and streams data+parity to the NAND, so NO software BCH encode is needed
+ * and reads via nand_read_page() come back hardware-corrected. Layout is inline
+ * 512-data + 16-spare per sector. `data` is nsec*512 bytes; the 3 free spare
+ * bytes/sector are written 0xFF (parity fills the rest). Deltas vs the read
+ * trigger: FLCTL 0xA24->0xA26 (FL_WR), BCHCTL |1 -> |3 (generate direction). */
+uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
+                                     const void* databuffer, uint32_t nsec)
+{
+    unsigned s, i;
+    const unsigned char *data = databuffer;
+    unsigned status;
+
+    if (bank > 3 || !data || nsec == 0 || nsec > 8)
+        return 1;
+
+    FMWAIT = c4pro_nand_fmwait;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_prog_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    BCHCTL = 1;   /* strength-8 preset leaves bit13=0 */
+
+    /* serial data input: 0x80 + col=0 + 3 row bytes */
+    FLASH_CMD(bank) = 0x80;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+
+    for (s = 0; s < nsec; s++)
+    {
+        volatile unsigned char *pb =
+            (volatile unsigned char *)&PAGE_BUF + ((s & 3) << 9);
+        volatile unsigned char *sb =
+            (volatile unsigned char *)&SPARE_BUF + ((s & 3) << 4);
+
+        for (i = 0; i < 512; i++)
+            pb[i] = data[s * 512 + i];
+        for (i = 0; i < 16; i++)
+            sb[i] = 0xff;
+
+        FLCTL = FL_RST;
+        BCHCTL = (BCHCTL & ~0x1C03u) | 1u | 2u | ((bank & 3u) << 10);
+        /* FL_WR|FL_START|(1 sector)|FL_XFER_EN|FL_COR_EN + start-sector */
+        FLCTL = 0xA26u | ((s & 3u) << 3);
+        if (!nand_wait_fl_ready())
+        {
+            nand_deselect();
+            return 2;
+        }
+    }
+
+    FLASH_CMD(bank) = 0x10;   /* program confirm */
+
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 3;
+    }
+
+    FLASH_CMD(bank) = 0x70;
+    status = FLASH_DATA(bank);
+    nand_deselect();
+    last_activity = current_tick;
+
+    return (status & 0x01) ? 4 : 0;   /* bit0 = program FAIL */
+}
+
+/* Hardware-ECC page read, matching c4pro_nand_write_page_hwecc's inline
+ * 512+16-per-sector layout. Unlike nand_read_page() (which re-seeks half 1 at
+ * column 2048 -- wrong for the 528-byte inline stride, breaks sectors 4-7),
+ * this issues ONE 0x00/0x30 and lets the controller auto-advance through all
+ * nsec sectors, draining each PAGE_BUF slot per trigger. Data comes back
+ * hardware-BCH-corrected; no software BCH. */
+uint32_t c4pro_nand_read_page_hwecc(uint32_t bank, uint32_t page,
+                                    void* databuffer, uint32_t nsec)
+{
+    unsigned s, i;
+    unsigned char *data = databuffer;
+
+    if (bank > 3 || !data || nsec == 0 || nsec > 8)
+        return 1;
+
+    FMWAIT = c4pro_nand_fmwait;
+    FLCTL = FL_RST;
+
+    nand_select(bank);
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    BCHCTL = 1;
+
+    FLASH_CMD(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = page & 0xff;
+    FLASH_ADDR(bank) = (page >> 8) & 0xff;
+    FLASH_ADDR(bank) = (page >> 16) & 0xff;
+    FLASH_CMD(bank) = 0x30;
+
+    nand_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        return 1;
+    }
+
+    c4pro_nand_last_bchst = 0;
+    for (s = 0; s < nsec; s++)
+    {
+        volatile unsigned char *pb =
+            (volatile unsigned char *)&PAGE_BUF + ((s & 3) << 9);
+
+        BCHCTL = (BCHCTL & ~0x1C03u) | 1u | ((bank & 3u) << 10);
+        FLCTL = 0xA24u | ((s & 3u) << 3);
+        if (!nand_wait_fl_ready())
+        {
+            nand_deselect();
+            return 2;
+        }
+        c4pro_nand_last_bchst |= BCHST;   /* OR of every sector's BCH status */
+        for (i = 0; i < 512; i++)
+            data[s * 512 + i] = pb[i];
+    }
+
+    nand_deselect();
+    last_activity = current_tick;
+    return 0;
+}
+
 uint32_t c4pro_nand_program_bytes(uint32_t bank, uint32_t page,
                                   uint32_t column,
                                   const void* databuffer,
@@ -1011,7 +1532,7 @@ uint32_t c4pro_nand_program_bytes(uint32_t bank, uint32_t page,
         count > 4224 - column)
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     nand_select(bank);
@@ -1056,11 +1577,11 @@ uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page)
     if (bank > 3)
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
     nand_select(bank);
-    nand_delay();
+    nand_prog_delay();
 
     if (!nand_wait_ready())
     {
@@ -1120,7 +1641,7 @@ uint32_t nand_reset(uint32_t bank)
     if (bank > 3)
         return 1;
 
-    FMWAIT = 0x1081;
+    FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
     nand_select(bank);
     FLASH_CMD(bank) = 0xff;

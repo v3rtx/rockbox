@@ -55,9 +55,31 @@ uint32_t c4pro_nand_read_linear_page_spare(uint32_t bank, uint32_t page,
                                            void* databuffer, void* sparebuffer);
 uint32_t c4pro_nand_read_page_flctl(uint32_t bank, uint32_t page,
                                     void* databuffer, uint32_t flctl_base);
+extern uint32_t c4pro_nand_fmwait;        /* tunable NAND wait-state timing */
+extern uint32_t c4pro_nand_delay_iters;        /* read-path settle busy-wait */
+extern uint32_t c4pro_nand_prog_delay_iters;   /* program/erase settle busy-wait */
+void c4pro_nand_clock_regs(uint32_t out[4]);   /* live PLL/divider/clkcfg snapshot */
+extern uint32_t c4pro_nand_last_bchst;         /* BCHST OR from last hwecc read */
+#ifdef C4PRO_NAND_DMA
+uint32_t c4pro_nand_read_linear_page_spare_dma(uint32_t bank, uint32_t page,
+                                               void* databuffer,
+                                               void* sparebuffer);
+uint32_t c4pro_nand_dma_selftest_page(uint32_t bank, uint32_t page);
+uint32_t c4pro_nand_read_native_stream_dma(uint32_t bank, uint32_t page,
+                                           void* databuffer);
+#endif
+#ifdef C4PRO_NAND_DMA_WRITE
+uint32_t c4pro_nand_write_page_dma(uint32_t bank, uint32_t page,
+                                   const void* databuffer,
+                                   const void* sparebuffer);
+#endif
 uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
                                const void* databuffer,
                                const void* sparebuffer);
+uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
+                                     const void* databuffer, uint32_t nsec);
+uint32_t c4pro_nand_read_page_hwecc(uint32_t bank, uint32_t page,
+                                    void* databuffer, uint32_t nsec);
 uint32_t c4pro_nand_program_bytes(uint32_t bank, uint32_t page,
                                   uint32_t column,
                                   const void* databuffer,
