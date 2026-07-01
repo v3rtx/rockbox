@@ -29,7 +29,8 @@
     defined(C4PRO_NAND_DMA_RWTEST) || defined(C4PRO_NAND_DMA_SPEEDTEST) || \
     defined(C4PRO_NAND_FMWAIT_SWEEP) || defined(C4PRO_NAND_CLKPROBE) || \
     defined(C4PRO_NAND_DELAY_SWEEP) || defined(C4PRO_NAND_HWECC_TEST) || \
-    defined(C4PRO_NAND_HWECC_ERASED) || defined(C4PRO_NAND_WDELAY_SWEEP)
+    defined(C4PRO_NAND_HWECC_ERASED) || defined(C4PRO_NAND_WDELAY_SWEEP) || \
+    defined(C4PRO_NAND_HWECC_MULTIDIE)
 #include "lcd.h"
 #include "backlight.h"
 #endif
@@ -2283,11 +2284,86 @@ static int c4own_format(void)
     c4own_ckpt_marked_dirty = false;
     c4own_map_dirty = false;
 
+#ifdef C4PRO_NAND_FAST_FORMAT
+    /* Multi-die concurrent erase. The owned pblk range maps monotonically onto
+     * the dies (bank = (START + pblk) / blocks_per_die), so each die owns a
+     * contiguous pblk sub-range. We walk those sub-ranges in lockstep: gather
+     * one pblk from each still-active die into a batch and erase the whole batch
+     * concurrently via c4pro_nand_erase_blocks_multi(). This overlaps up to 4
+     * tERASE windows, cutting format time ~= (#active dies)x. It is a pure
+     * scheduling change over the same set of erases the serial path performs;
+     * the on-disk result is byte-for-byte identical, so there is no
+     * data-integrity risk vs. the default full-erase path. */
+    {
+        uint32_t total = C4OWN_RUNTIME_PBLK_COUNT;
+        uint32_t blocks = ftl_nand_type ? ftl_nand_type->blocks : 0u;
+        uint32_t nb = ftl_banks < 4u ? ftl_banks : 4u;
+        uint32_t cur[4];
+        uint32_t end[4];
+
+        if (blocks == 0u || nb == 0u)
+        {
+            /* Geometry not established; fall back to the proven serial erase. */
+            for (uint32_t pblk = 0; pblk < total; pblk++)
+                if (c4own_erase_pblk(pblk))
+                    c4own_retired[pblk] = 1;
+        }
+        else
+        {
+            for (uint32_t b = 0; b < nb; b++)
+            {
+                /* Signed math so a die whose blocks start below the owned
+                 * region's START clamps to the owned window without underflow. */
+                int64_t lo = (int64_t)b * (int64_t)blocks -
+                             (int64_t)C4PRO_OWNED_PBLK_START;
+                int64_t hi = (int64_t)(b + 1u) * (int64_t)blocks -
+                             (int64_t)C4PRO_OWNED_PBLK_START;
+                if (lo < 0) lo = 0;
+                if (hi < 0) hi = 0;
+                if (lo > (int64_t)total) lo = total;
+                if (hi > (int64_t)total) hi = total;
+                cur[b] = (uint32_t)lo;
+                end[b] = (uint32_t)hi;
+            }
+
+            for (;;)
+            {
+                uint32_t banks[4];
+                uint32_t pages[4];
+                uint32_t slot_pblk[4];
+                uint32_t n = 0;
+                uint32_t fail;
+
+                for (uint32_t b = 0; b < nb; b++)
+                {
+                    if (cur[b] < end[b])
+                    {
+                        uint32_t pblk = cur[b]++;
+                        slot_pblk[n] = pblk;
+                        banks[n] = c4own_pblk_bank(pblk);
+                        pages[n] = c4own_pblk_page(pblk);
+                        n++;
+                    }
+                }
+
+                if (n == 0)
+                    break;
+
+                c4own_read_page_valid = false;
+                fail = c4pro_nand_erase_blocks_multi(banks, pages, n);
+                for (uint32_t i = 0; i < n; i++)
+                    if (fail & (1u << i))
+                        c4own_retired[slot_pblk[i]] = 1;
+            }
+        }
+    }
+#else
     for (uint32_t pblk = 0; pblk < C4OWN_RUNTIME_PBLK_COUNT; pblk++)
     {
         if (c4own_erase_pblk(pblk))
             c4own_retired[pblk] = 1;
     }
+#endif
 
     if (c4own_write_superblock(0) || c4own_write_superblock(1))
         return 1;
@@ -2622,6 +2698,110 @@ uint32_t ftl_init(void)
         lcd_putsf(0, 3, "bchstW %08lx", (unsigned long)bchst_written);
         lcd_putsf(0, 4, "erOK%d er%d", er_ok, er_err);
         lcd_putsf(0, 5, "nonFF%d", er_nonff);
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+#ifdef C4PRO_NAND_HWECC_MULTIDIE
+    /* Multi-die hardware-ECC round-trip (DRAM RAM-run): the hwecc primitives put
+     * the die index into BCHCTL bits 10-11 as ((bank&3)<<10) and select the die
+     * via nand_select(bank) (FMCTL low nibble = 1<<bank). This was only ever
+     * proven on die 0 (bits=0). Before scaling the owned volume across all four
+     * dies we MUST prove that hardware BCH generate (write) and correct (read)
+     * work with the die bits set to 1/2/3 -- and that a write/read to die N does
+     * not silently alias onto die 0.
+     *
+     * Method: write a *die-distinguishing* pattern to one scratch block on EACH
+     * die (the pattern byte folds in the bank index), reading nothing yet; THEN
+     * read every die back and verify byte-exact against that die's own pattern.
+     * Writing all dies before reading any means a stuck die-select (all accesses
+     * landing on die 0) shows up as a mismatch on dies 1-3, because die 0's block
+     * would hold whichever pattern was written last, not die N's. Per die we
+     * report: write failures (wf), read/compare mismatches (mism), and the OR of
+     * the hardware BCH status word (st) so an uncorrectable/large-correction flag
+     * is visible even when the bytes happen to match. PASS requires wf==0 &&
+     * mism==0 on every detected die.
+     *
+     * Scratch block is high in each die (SB) and destructive; run this on a
+     * throwaway/pre-format device, exactly like the die-0 HWECC harness. */
+    {
+        static unsigned char wbuf[4096];
+        static unsigned char rbuf[4096];
+        const uint32_t SB = 16000u;                 /* in-die scratch block */
+        const uint32_t PBASE = SB * C4OWN_PAGES_PER_BLOCK;
+        const int NP = (int)C4OWN_PAGES_PER_BLOCK;
+        const uint32_t NDIE = (ftl_banks < 4u) ? ftl_banks : 4u;
+        int wf[4] = {0, 0, 0, 0};
+        int mism[4] = {0, 0, 0, 0};
+        int badpage[4] = {-1, -1, -1, -1};
+        uint32_t st[4] = {0, 0, 0, 0};
+        uint32_t d;
+        int p, i;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "HWECC MULTIDIE");
+        lcd_puts(0, 1, "write all dies...");
+        lcd_update();
+
+        c4pro_nand_fmwait = 0x1081;
+        c4pro_nand_delay_iters = 50;
+
+        /* Phase 1: erase + hwecc-write a bank-tagged pattern on every die. */
+        for (d = 0; d < NDIE; d++)
+        {
+            c4pro_nand_erase_block(d, PBASE);
+            for (p = 0; p < NP; p++)
+            {
+                for (i = 0; i < 4096; i++)
+                    wbuf[i] = (unsigned char)(d * 0x51u + p * 7 + i * 13 + 0x5a);
+                if (c4pro_nand_write_page_hwecc(d, PBASE + (uint32_t)p, wbuf, 8))
+                    wf[d]++;
+            }
+        }
+
+        lcd_puts(0, 1, "read+verify...   ");
+        lcd_update();
+
+        /* Phase 2: hwecc-read every die back, verify against ITS OWN pattern. */
+        for (d = 0; d < NDIE; d++)
+        {
+            for (p = 0; p < NP; p++)
+            {
+                if (c4pro_nand_read_page_hwecc(d, PBASE + (uint32_t)p, rbuf, 8))
+                {
+                    mism[d]++;
+                    if (badpage[d] < 0) badpage[d] = p;
+                    st[d] |= c4pro_nand_last_bchst;
+                    continue;
+                }
+                st[d] |= c4pro_nand_last_bchst;
+                for (i = 0; i < 4096; i++)
+                    if (rbuf[i] !=
+                        (unsigned char)(d * 0x51u + p * 7 + i * 13 + 0x5a))
+                    {
+                        mism[d]++;
+                        if (badpage[d] < 0) badpage[d] = p;
+                        break;
+                    }
+            }
+        }
+
+        lcd_clear_display();
+        lcd_putsf(0, 0, "HWECC MDIE nb%lu", (unsigned long)NDIE);
+        for (d = 0; d < 4u; d++)
+            lcd_putsf(0, 1 + (int)d, "d%lu w%d m%d s%08lx",
+                      (unsigned long)d, wf[d], mism[d], (unsigned long)st[d]);
+        {
+            int all_ok = 1;
+            for (d = 0; d < NDIE; d++)
+                if (wf[d] || mism[d]) all_ok = 0;
+            lcd_putsf(0, 5, all_ok ? "MULTIDIE OK" : "MULTIDIE FAIL");
+        }
         lcd_update();
         while (1) {
 #ifdef HAVE_BACKLIGHT

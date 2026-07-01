@@ -85,6 +85,12 @@ uint32_t c4pro_nand_program_bytes(uint32_t bank, uint32_t page,
                                   const void* databuffer,
                                   uint32_t count);
 uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page);
+/* Multi-die concurrent block erase: issues the erase command to up to 4 dies
+ * (one block each) and only then polls every die's R/B# to completion, so the
+ * per-die tERASE windows overlap. banks[i]/pages[i] describe block i; n<=4.
+ * Returns a bitmask where bit i is set if block i failed to erase. */
+uint32_t c4pro_nand_erase_blocks_multi(const uint32_t *banks,
+                                       const uint32_t *pages, uint32_t n);
 #endif
 uint32_t nand_write_page(uint32_t bank, uint32_t page, void* databuffer,
                          void* sparebuffer, uint32_t doecc);

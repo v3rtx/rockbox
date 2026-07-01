@@ -1608,6 +1608,85 @@ uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page)
 
     return (status & 1) ? 1 : 0;
 }
+
+uint32_t c4pro_nand_erase_blocks_multi(const uint32_t *banks,
+                                       const uint32_t *pages, uint32_t n)
+{
+    uint32_t fail = 0;
+    uint32_t i;
+
+    if (n == 0 || n > 4 || !banks || !pages)
+        return 0xfu;
+
+    FMWAIT = c4pro_nand_fmwait;
+    FLCTL = FL_RST;
+
+    /* Phase 1: fire the erase command (0x60 + row + 0xD0) at every die WITHOUT
+     * blocking on completion. Deasserting CE# (nand_deselect) does not abort an
+     * in-progress internal erase, so each die keeps erasing while we issue to
+     * the next one; the tERASE windows overlap across dies. The pre-issue
+     * nand_wait_ready() confirms the target die is idle before we command it. */
+    for (i = 0; i < n; i++)
+    {
+        uint32_t bank = banks[i];
+        uint32_t page = pages[i];
+
+        if (bank > 3)
+        {
+            fail |= 1u << i;
+            continue;
+        }
+
+        nand_select(bank);
+        nand_prog_delay();
+
+        if (!nand_wait_ready())
+        {
+            nand_deselect();
+            fail |= 1u << i;
+            continue;
+        }
+
+        FLASH_CMD(bank) = 0x60;
+        FLASH_ADDR(bank) = page & 0xff;
+        FLASH_ADDR(bank) = (page >> 8) & 0xff;
+        FLASH_ADDR(bank) = (page >> 16) & 0xff;
+        FLASH_CMD(bank) = 0xd0;
+        nand_deselect();
+    }
+
+    /* Phase 2: now wait each die to signal ready and read its erase status. By
+     * the time we poll die N, dies 0..N-1 have already been erasing, so total
+     * wall time approaches one tERASE plus per-die command overhead rather than
+     * n * tERASE. */
+    for (i = 0; i < n; i++)
+    {
+        uint32_t bank = banks[i];
+        unsigned status;
+
+        if (fail & (1u << i))
+            continue;
+
+        nand_select(bank);
+
+        if (!nand_wait_ready_erase())
+        {
+            nand_deselect();
+            fail |= 1u << i;
+            continue;
+        }
+
+        FLASH_CMD(bank) = 0x70;
+        status = FLASH_DATA(bank);
+        nand_deselect();
+
+        if (status & 1)
+            fail |= 1u << i;
+    }
+
+    last_activity = current_tick;
+    return fail;
+}
 #endif
 
 uint32_t nand_write_page(uint32_t bank, uint32_t page, void* databuffer,
