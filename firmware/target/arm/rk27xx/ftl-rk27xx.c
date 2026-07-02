@@ -1091,6 +1091,17 @@ static bool c4own_read_page_valid;
 #define C4OWN_CACHE_SLOTS 8u
 #endif
 
+/* Pipelined incremental flush high-water mark: keep this many most-recently-used
+ * dirty blocks buffered before flushing the oldest. >1 gives the USB bulk-OUT
+ * receive slack to run ahead of the NAND program (speed) and keeps hot metadata
+ * (FAT/dir) resident so it isn't thrash-flushed against the data block; small
+ * enough that the end-of-file SYNCHRONIZE_CACHE flush stays short (<= this many
+ * blocks) and never trips the host's command timeout -> no USB link reset. Must
+ * be < C4OWN_CACHE_SLOTS. Tunable via -DC4PRO_FTL_FLUSH_KEEP=N for A/B. */
+#ifndef C4PRO_FTL_FLUSH_KEEP
+#define C4PRO_FTL_FLUSH_KEEP 3u
+#endif
+
 static unsigned char c4own_cache_data[C4OWN_CACHE_SLOTS][C4OWN_PAYLOAD_SECTORS_PER_BLOCK * 512u];
 static uint32_t c4own_cache_logical[C4OWN_CACHE_SLOTS];
 static uint32_t c4own_cache_age[C4OWN_CACHE_SLOTS];
@@ -1326,8 +1337,32 @@ static int c4own_read_phys_sector_uncached(uint32_t pblk, uint32_t sector,
     return 0;
 }
 
+#if defined(C4PRO_BOOT_HEARTBEAT) || defined(C4PRO_FAULT_VISIBLE)
+/* Write-path phase marker for the heartbeat freeze localizer (also read by the
+ * visible-fault handler to tag WHICH stage faulted). Set at entry of each
+ * sustained-write stage (all run in usb-thread context, so no IRQ race). On a
+ * silent freeze the frozen value = the innermost stage the usb thread reached:
+ *   1  USB (usb_storage, between/after a write)   2  usb_storage write dispatch
+ *   3  c4own_write_logical_block                  4  superblock/checkpoint flush
+ *   5  c4own_write_page (NAND hwecc program)      6  c4own_erase_pblk (erase)
+ *   10 send_csw (about to send CSW)               11 bulk-IN sync sender (CSW DMA)
+ *   12 CSW sent, arming next-command receive     13 armed, waiting for host
+ *                                                    bulk-OUT WRITE data (the
+ *                                                    exact state usbmon
+ *                                                    caught wedged 2026-07-02,
+ *                                                    see freeze doc s5.1/5.2) */
+volatile uint32_t c4pro_hb_phase;
+#endif
+
+#ifdef C4PRO_BOOT_HEARTBEAT
+#define C4PRO_SET_PHASE(n) do { c4pro_hb_phase = (n); } while (0)
+#else
+#define C4PRO_SET_PHASE(n) do { } while (0)
+#endif
+
 static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
 {
+    C4PRO_SET_PHASE(5);
     if (!c4own_pblk_valid(pblk) || page_in_block >= C4OWN_PAGES_PER_BLOCK)
         return 1;
 
@@ -1359,6 +1394,7 @@ static int c4own_write_page(uint32_t pblk, uint32_t page_in_block)
 
 static int c4own_erase_pblk(uint32_t pblk)
 {
+    C4PRO_SET_PHASE(6);
     if (!c4own_pblk_valid(pblk))
         return 1;
 
@@ -1455,6 +1491,7 @@ static bool c4own_superblock_valid(uint32_t pblk)
 
 static void c4own_fill_superblock_page(void)
 {
+    C4PRO_SET_PHASE(4);
     memset(c4own_page_data, 0xff, sizeof(c4own_page_data));
     c4own_put32(c4own_page_data + 0, C4OWN_MAGIC_SB);
     c4own_put32(c4own_page_data + 4, C4OWN_VERSION);
@@ -2041,6 +2078,8 @@ static int c4own_write_logical_block(uint32_t logical, uint32_t first,
     uint16_t old_pblk;
     uint32_t gen;
 
+    C4PRO_SET_PHASE(3);
+
     /* Before the first commit after a checkpoint, invalidate it on NAND so a
      * crash can never leave a clean checkpoint that omits this committed block.
      * If the marker write fails, abort the write to preserve the invariant. */
@@ -2155,6 +2194,57 @@ static int c4own_write_internal(uint32_t sector, uint32_t count,
         count -= n;
         in += n * 512u;
     }
+
+#ifdef C4PRO_FTL_EAGER_FLUSH
+    /* Pipelined incremental flush: keep the C4PRO_FTL_FLUSH_KEEP most-recently-
+     * used dirty blocks buffered and flush only the OLDEST (LRU) dirty block
+     * whenever more than that many are dirty. This spreads the NAND programs
+     * across the transfer (so the end-of-file SYNCHRONIZE_CACHE flush is only
+     * <= KEEP blocks -> short -> no host timeout/reset) WITHOUT the pathology of
+     * the earlier keep-only-the-tail policy: keeping >1 block leaves the USB
+     * bulk-OUT receive slack to run ahead of the NAND program (restoring speed)
+     * and keeps hot metadata (FAT/dir) resident, so an interleaved FAT update no
+     * longer thrash-flushes the data block (that write-amplification was the ~4x
+     * slowdown). Uses c4own_cache_age (LRU tick) to pick the oldest dirty slot.
+     * Skipped during format (which drives its own write+flush sequence). */
+    if (first_count > 0 && !c4own_formatting)
+    {
+        /* Bounded by construction: each successful c4own_flush_cache_slot clears
+         * exactly one dirty slot (dirty--), a failed one returns, and ages are
+         * unique so the oldest never repeats -> at most C4OWN_CACHE_SLOTS passes.
+         * The guard is a belt-and-suspenders cap so this can NEVER spin (the
+         * masked-IRQ hang we are hunting), even if a flush ever returned success
+         * without clearing dirty; on the cap we leave the blocks for the next
+         * flush/sync. */
+        unsigned guard = C4OWN_CACHE_SLOTS + 1u;
+
+        while (guard--)
+        {
+            uint32_t dirty = 0;
+            int oldest = -1;
+            uint32_t oldest_age = 0xffffffffu;
+
+            for (uint32_t slot = 0; slot < C4OWN_CACHE_SLOTS; slot++)
+            {
+                if (c4own_cache_valid[slot] && c4own_cache_dirty[slot])
+                {
+                    dirty++;
+                    if (c4own_cache_age[slot] < oldest_age)
+                    {
+                        oldest_age = c4own_cache_age[slot];
+                        oldest = (int)slot;
+                    }
+                }
+            }
+
+            if (dirty <= C4PRO_FTL_FLUSH_KEEP || oldest < 0)
+                break;
+
+            if (c4own_flush_cache_slot((uint32_t)oldest))
+                return 1;   /* result already set to 3 by the slot flush */
+        }
+    }
+#endif
 
     if (first_count > 0 &&
         c4own_read_sector_internal(first_sector, verify) == 0)
@@ -2414,8 +2504,17 @@ static int c4own_format(void)
 
 #endif
 
+#ifdef C4PRO_INTC_PROBE
+/* Set at ftl_init entry so the INTC probe (apps/main.c) can show whether boot
+ * reached storage init (ftl=5A) or not (ftl=00). */
+volatile unsigned long c4pro_intc_ftl_mark;
+#endif
+
 uint32_t ftl_init(void)
 {
+#ifdef C4PRO_INTC_PROBE
+    c4pro_intc_ftl_mark = 0x5au;
+#endif
     if (nand_device_init())
         return 1;
 

@@ -1279,6 +1279,21 @@ static void do_bus_reset(void) {
     have_pending_request = false;
 }
 
+#if defined(COLORFLY_C4_PRO)
+/* True from the moment a host bus reset is signalled until the reset has been
+ * fully processed (do_bus_reset()) - in the usb thread when the device is
+ * configured (usb_config != 0), or inline for the unconfigured case. The rk27xx
+ * driver's in_intr()/out_intr() use this to DROP data-endpoint completions that
+ * were latched in flight around the reset: processing such a stale completion
+ * re-arms a DMA (ep_read) or posts a completion for a transfer the thread has
+ * already torn down -> AHB/endpoint-state race -> masked-IRQ busy-spin (the
+ * X=0x100 freeze after a reset storm). EP0/control is never gated. */
+bool usb_core_bus_reset_pending(void)
+{
+    return bus_reset_pending;
+}
+#endif
+
 /* called by usb_drv_int() */
 void usb_core_bus_reset(void)
 {

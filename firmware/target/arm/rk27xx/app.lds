@@ -92,6 +92,13 @@ SECTIONS
      _fiqstackbegin = .;
      . += 0x400;
      _fiqstackend = .;
+     /* Dedicated ABORT/UNDEF-mode stack (crt0.S). The fault handler UIE runs in
+      * abort mode and paints the fault frame; sharing the 1 KB IRQ stack (which
+      * already holds the interrupted IRQ frames) overflowed and double-faulted,
+      * so give it its own 4 KB. */
+     _abortstackbegin = .;
+     . += 0x1000;
+     _abortstackend = .;
   } > DRAM
 
   .bss (NOLOAD) : {

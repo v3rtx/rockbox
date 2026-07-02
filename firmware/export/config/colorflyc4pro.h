@@ -127,6 +127,127 @@
 /* enable these for the experimental usb stack */
 #define HAVE_USBSTACK
 
+/* Default-ON crash fix (active only in the USB-MSC build): if a stray INT_UDC
+ * reaches UIRQ during the FTL sync-flush of a sustained copy, ACK it instead of
+ * panicking (see UIRQ in system-rk27xx.c). Define C4PRO_USB_NO_UDC_IRQ_FIX to
+ * A/B it off. */
+#ifndef C4PRO_USB_NO_UDC_IRQ_FIX
+#define C4PRO_USB_UDC_IRQ_FIX
+#endif
+
+/* Default-ON crash guard (active only in the USB-MSC build): when a host USB
+ * link-reset lands between commands, INT_UDC finishes the re-init and acks
+ * WITHOUT processing stale endpoint completions latched in the same interrupt
+ * (which would data-abort on reset-cleared state). See INT_UDC in
+ * usb-drv-rk27xx.c. Define C4PRO_USB_NO_RESET_GUARD to A/B it off. */
+#ifndef C4PRO_USB_NO_RESET_GUARD
+#define C4PRO_USB_RESET_GUARD
+#endif
+
+/* Default-ON companion to the reset guard: on every host USBRST, ABORT any
+ * in-flight UDC DMA engine (clear DMA_START on all TX/RX DMA control registers)
+ * and flush the per-endpoint FIFOs (TXCLR/RXCLR) BEFORE re-init. A link reset
+ * that lands while a bulk-OUT receive or bulk-IN send DMA is mid-burst leaves
+ * DMA_START stuck (the link died, so it never self-clears) -> the UDC DMA
+ * engine holds the AHB bus -> the next access/DMA-arm busy-spins with IRQs
+ * masked (F=0, T=D frozen, blank screen). The reset guard alone re-inits+acks
+ * but never releases the wedged bus master. Pure register writes, bounded and
+ * IRQ-safe. See c4pro_usb_reset_dma_abort() in usb-drv-rk27xx.c. Define
+ * C4PRO_USB_NO_RESET_DMA_ABORT to A/B it off. */
+#ifndef C4PRO_USB_NO_RESET_DMA_ABORT
+#define C4PRO_USB_RESET_DMA_ABORT
+#endif
+
+/* Default-ON — THE FIX for the sustained-write hard freeze (verified 2026-07-02:
+ * 900+ MB copied vs certain death within minutes before; see
+ * docs/c4-usb-msc-write-freeze.md s7). Mirrors the STOCK firmware's bulk-OUT
+ * arm discipline (disassembled from SYSTEM_BASE.RKW @0x6002ba68/@0x6002b52c):
+ * (1) never write RXSTAT on the receive path (stock treats it read-only there;
+ * the upstream 'RXSTAT = xfer_size' write has no stock counterpart), and
+ * (2) never fire DMA_START into a still-busy OUT engine — bounded-wait for
+ * self-clear first, and if it is genuinely stuck, abort + RXCLR-flush it at
+ * arm time (the wedged engine otherwise holds the AHB bus and the CPU's next
+ * memory access stalls forever: no fault, no IRQs, dead until power cycle).
+ * See ep_read() in usb-drv-rk27xx.c. Define C4PRO_USB_NO_RX_DMA_GUARD to A/B
+ * it off. */
+#ifndef C4PRO_USB_NO_RX_DMA_GUARD
+#define C4PRO_USB_RX_DMA_GUARD
+#endif
+
+/* C4PRO_WDT_CRASH_CAPTURE (opt-in, not default-on): JTAG-free freeze-forensics
+ * tool used to root-cause the fix above (docs/c4-usb-msc-write-freeze.md s7).
+ * The record layout/address/magic/reload-value are shared here so the tick
+ * writer (kernel-rk27xx.c), the arm sequence (system-rk27xx.c), and the boot
+ * reader (apps/main.c) can never silently disagree -- a debug tool whose own
+ * three pieces drift out of sync just stops reporting, with no signal that
+ * it broke. Chosen address is well past the app image and comfortably within
+ * the 16 MiB DRAM window (0x60000000-0x61000000, see MEMORYSIZE above); nets
+ * out unused unless C4PRO_WDT_CRASH_CAPTURE is explicitly defined. */
+#define C4PRO_WDT_CAPTURE_ADDR   0x60910000u
+#define C4PRO_WDT_CAPTURE_MAGIC  0xc4c4c4a5u
+/* WDTLR reload value for both the initial arm and the per-tick pet. FIELD-
+ * CORRECTED 2026-07-02: LR=1 (the value system_reboot() uses to fire
+ * immediately) expires in under one tick period when reused for petting --
+ * caused an instant boot loop (WDT fired before the first tick could even
+ * write a crash record). This larger value is based on the one documented
+ * clock reference in this codebase for a sibling APB0 peripheral
+ * (tick_start()'s TMR0LR = 50000 * ms, i.e. a 50 MHz base) -- unverified for
+ * the WDT specifically (no datasheet), but empirically confirmed: no boot
+ * loop, and a real freeze was caught cleanly on the next repro. */
+#define C4PRO_WDT_CAPTURE_RELOAD 50000000u
+
+/* Default-ON (PART 1 - defer heavy re-init out of the IRQ): the upstream rk27xx
+ * driver calls the heavy usb_drv_init() from INT_UDC on every USBRST. After the
+ * one-time connect (done in thread context by usb_core_init before any reset),
+ * that per-reset call only re-runs usb_drv_startup() + semaphore_init() - which
+ * is both unnecessary and unsafe to do in IRQ context (re-initialising the
+ * endpoint completion semaphores while the usb thread may be waiting on them,
+ * and burning IRQ time while the tick is frozen). The minimal EP0 re-arm the
+ * USBRST branch already does inline, plus usb_core_bus_reset() (which defers the
+ * class-driver teardown to the usb thread - the standard Rockbox pattern), is
+ * sufficient. With this flag the reset IRQ does NOT call usb_drv_init(). Define
+ * C4PRO_USB_NO_RESET_DEFER to A/B it off (restore the in-IRQ re-init). */
+#ifndef C4PRO_USB_NO_RESET_DEFER
+#define C4PRO_USB_RESET_DEFER
+#endif
+
+/* Default-ON (PART 2 - drop stale data-EP completions around a reset): a host
+ * bus reset invalidates every in-flight bulk transfer. A bulk-OUT/IN completion
+ * IRQ latched in flight around the reset (observed: X=0x100, a BOUT1 completion
+ * right before the freeze) must NOT be processed against endpoint/usb_core state
+ * the reset is concurrently tearing down: doing so re-arms a DMA (ep_read) to a
+ * stale buffer or posts a completion for a transfer the thread already dropped,
+ * wedging the AHB -> masked-IRQ busy-spin (F=0, T=D frozen). While
+ * usb_core_bus_reset_pending() is true, in_intr()/out_intr() ACK and skip data
+ * endpoints (EP0/control is never gated). Define C4PRO_USB_NO_RESET_STALE_GUARD
+ * to A/B it off. */
+#ifndef C4PRO_USB_NO_RESET_STALE_GUARD
+#define C4PRO_USB_RESET_STALE_GUARD
+#endif
+
+/* Default-ON: incremental write-back flush. As a sequential write stream
+ * advances past a complete logical block, program that block to NAND right away
+ * instead of letting up to C4OWN_CACHE_SLOTS dirty blocks pile up until the
+ * end-of-file SCSI SYNCHRONIZE_CACHE. That keeps the per-file sync flush to ~1
+ * block (fast), so the host never times out the SYNCHRONIZE_CACHE command and
+ * never resets the USB link (the reset was what triggered the IRQ-context
+ * crash). Same total NAND writes, just spread across the transfer. Opt out with
+ * C4PRO_FTL_NO_EAGER_FLUSH to A/B (reproduce the crash). */
+#ifndef C4PRO_FTL_NO_EAGER_FLUSH
+#define C4PRO_FTL_EAGER_FLUSH
+#endif
+
+/* Default-ON crash fix: iteration-cap the cache-op busy-waits (CACHEOP) in
+ * system-rk27xx.c. Those `while (CACHEOP & 0x03)` spins run with IRQs MASKED
+ * (commit_discard_idcache wraps them in disable_irq_save; commit_discard_dcache_
+ * range is reached from usb_core's disable_irq'd setup path), so if a wedged bus
+ * master never releases the AHB the CPU spins forever -> the F=0 / T=D-frozen
+ * "busy-spin" hang. Capping breaks out and proceeds. Opt out with
+ * C4PRO_NO_CACHE_SPIN_CAP to A/B. */
+#ifndef C4PRO_NO_CACHE_SPIN_CAP
+#define C4PRO_CACHE_SPIN_CAP
+#endif
+
 #define USB_VENDOR_ID 0x071b
 #define USB_PRODUCT_ID 0x3203
 #define HAVE_BOOTLOADER_USB_MODE

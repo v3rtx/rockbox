@@ -108,6 +108,100 @@ void NORETURN_ATTR UIE(unsigned int pc, unsigned int num)
     lcd_clear_display();
     lcd_putsf(0, line++, "%s at %08x" IF_COP(" (%d)"), uiename[num], pc IF_COP(, CURRENT_CORE));
 
+#if defined(C4PRO_FAULT_VISIBLE) && (CONFIG_CPU == RK27XX)
+    /* Make a CPU fault VISIBLE on the C4 Pro. During a sustained USB copy a hang
+     * leaves a black/frozen screen that is ambiguous between "CPU fault -> UIE"
+     * and "masked-IRQ busy-spin". Here we FORCE the backlight/PWM on, paint a
+     * high-contrast fault frame (exception name + faulting PC) and LOOP
+     * REDRAWING it forever. We do NOT call system_exception_wait() (it spins on
+     * a button that is invisible here) and we do NOT read CP15 FSR/FAR (the
+     * RK27XX ARM7 core has no CP15 coprocessor -> that access would itself fault
+     * inside the fault handler). Interrupts stay disabled (fault state), but the
+     * LCD path is pure polling (lcdif_wait_*), so lcd_update works here.
+     *
+     * Outcome after the next hang:
+     *   - This frame appears  -> it WAS a CPU fault; map PC with:
+     *        arm-none-eabi-addr2line -f -e build-c4pro/rockbox.elf <PC>
+     *   - Screen keeps the frozen heartbeat (no fault frame) -> UIE was never
+     *     reached; the hang is a masked-IRQ busy-spin, not a fault. */
+    {
+        extern void backlight_hw_on(void);
+        extern void backlight_hw_brightness(int brightness);
+        extern volatile uint32_t c4pro_hb_phase;      /* last write-path stage */
+        /* Persisted fault record. Written BEFORE any call that might itself
+         * fault, so the values survive even if the paint below double-faults. */
+        extern volatile uint32_t c4pro_fault_count;
+        extern volatile uint32_t c4pro_fault_pc;
+        extern volatile uint32_t c4pro_fault_num;
+        extern volatile uint32_t c4pro_fault_phase;
+        static int reentry;
+
+        disable_interrupt(IRQ_FIQ_STATUS);
+
+        /* Record FIRST (no function calls, no dereferences that can re-fault). */
+        c4pro_fault_pc    = pc;
+        c4pro_fault_num   = num;
+        c4pro_fault_phase = c4pro_hb_phase;
+        c4pro_fault_count++;
+
+        /* Re-entry guard: if painting the fault frame itself faults (e.g.
+         * lcd_update touches memory that also aborts), we land back here in
+         * abort mode. On the 2nd+ entry, skip the (faulting) LCD path and just
+         * hold the backlight on + spin, so we don't recurse the abort forever
+         * (which looks identical to a masked-IRQ lockup). */
+        if (++reentry >= 2)
+        {
+            for (;;)
+                backlight_hw_on();   /* pure register writes; keep screen lit */
+        }
+
+        /* Format PC/PH into STATIC buffers with a MINIMAL hex routine - NO
+         * lcd_putsf()/vsnprintf(), because the RK27XX abort mode shares the tiny
+         * 0x400 (1 KB) IRQ stack (crt0.S), and vsnprintf's large format buffer
+         * overflowed it -> the paint itself data-aborted (the "double fault"
+         * that left only the frozen heartbeat). Static buffers + lcd_puts keep
+         * abort-context stack use tiny so the frame actually paints. */
+        {
+            static const char hx[] = "0123456789abcdef";
+            static char pcbuf[16];   /* "PC=xxxxxxxx" */
+            static char phbuf[16];   /* "PH=xx CNT=xx" */
+            int i;
+
+            pcbuf[0] = 'P'; pcbuf[1] = 'C'; pcbuf[2] = '=';
+            for (i = 0; i < 8; i++)
+                pcbuf[3 + i] = hx[(pc >> ((7 - i) * 4)) & 0xf];
+            pcbuf[11] = 0;
+
+            phbuf[0] = 'P'; phbuf[1] = 'H'; phbuf[2] = '=';
+            phbuf[3] = hx[(c4pro_fault_phase >> 4) & 0xf];
+            phbuf[4] = hx[c4pro_fault_phase & 0xf];
+            phbuf[5] = ' '; phbuf[6] = 'N'; phbuf[7] = '='; phbuf[8] = 'r';
+            /* N=r reminds: read c4pro_fault_num for the exception type */
+            phbuf[9] = 0;
+
+            for (;;)
+            {
+                backlight_hw_on();
+                backlight_hw_brightness(MAX_BRIGHTNESS_SETTING);
+#if LCD_DEPTH > 1
+                lcd_set_backdrop(NULL);
+                lcd_set_drawinfo(DRMODE_SOLID, LCD_BLACK, LCD_WHITE);
+#endif
+                lcd_setfont(FONT_SYSFIXED);
+                lcd_set_viewport(NULL);
+                lcd_clear_display();
+                lcd_puts(0, 0, "*** CPU FAULT ***");
+                lcd_puts(0, 2, uiename[num]);   /* literal string, no format */
+                lcd_puts(0, 3, pcbuf);
+                lcd_puts(0, 5, phbuf);
+                lcd_puts(0, 6, pcbuf);          /* repeated for legibility */
+                lcd_update();
+                udelay(200000);   /* ~0.2s; IRQs off, cannot sleep() */
+            }
+        }
+    }
+#endif /* C4PRO_FAULT_VISIBLE && RK27XX */
+
 #if !defined(CPU_ARM7TDMI) && (CONFIG_CPU != RK27XX) /* arm7tdmi has no MPU/MMU */
     if(num == 1 || num == 2) /* prefetch / data abort */
     {

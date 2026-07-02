@@ -179,13 +179,16 @@ entry_point:
     msr     cpsr_c, #0xd1
     ldr     sp, =_fiqstackend
 
-    /* Let svc, abort and undefined modes use irq stack */
+    /* svc uses the irq stack; abort and undefined modes get their OWN 4 KB
+     * stack (_abortstackend) so the fault handler (UIE) can paint the fault
+     * frame without overflowing the 1 KB irq stack (which already holds the
+     * interrupted IRQ frames when an abort is taken in IRQ context). */
     msr     cpsr_c, #0xd3
     ldr     sp, =_irqstackend
     msr     cpsr_c, #0xd7
-    ldr     sp, =_irqstackend
+    ldr     sp, =_abortstackend
     msr     cpsr_c, #0xdb
-    ldr     sp, =_irqstackend
+    ldr     sp, =_abortstackend
 
     /* Switch to sys mode */
     msr     cpsr_c, #0xdf

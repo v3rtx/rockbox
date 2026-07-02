@@ -2299,7 +2299,50 @@ static void c4pro_show_usb_diag_loop(void)
     }
 }
 
-#elif defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_WDT_CRASH_CAPTURE)
+/* JTAG-free crash capture (docs/c4-usb-msc-write-freeze.md s6 option 2).
+ * DRAM confirmed 2026-07-02 to survive a WDT-triggered reset (the survival
+ * test above). c4pro_wdt_capture_start() (system-rk27xx.c) arms the WDT;
+ * INT_TIMER0 (kernel-rk27xx.c) pets it every tick while also stashing the
+ * current interrupted PC into this same DRAM record, so the LAST value
+ * written just before the tick genuinely stops (the freeze itself) is what
+ * survives into the next boot -- this checks for and reports it.
+ * C4PRO_WDT_CAPTURE_ADDR/MAGIC/RELOAD live in colorflyc4pro.h, shared with
+ * the tick writer (kernel-rk27xx.c) and the arm sequence (system-rk27xx.c)
+ * so the three pieces of this tool can't silently drift out of sync. */
+
+extern void c4pro_wdt_capture_start(void);
+
+static void c4pro_wdt_crash_capture_check_and_report(void)
+{
+    volatile unsigned long *rec = (volatile unsigned long *)C4PRO_WDT_CAPTURE_ADDR;
+
+    if (rec[0] == C4PRO_WDT_CAPTURE_MAGIC)
+    {
+        unsigned long pc = rec[1];
+        unsigned long tick = rec[2];
+
+        lcd_setfont(FONT_SYSFIXED);
+        lcd_clear_display();
+        lcd_puts(0, 0, "WDT CRASH CAPTURE");
+        lcd_puts(0, 2, "FREEZE CAUGHT!");
+        lcd_putsf(0, 3, "pc  =0x%08lx", pc);
+        lcd_putsf(0, 4, "tick=%lu", tick);
+        lcd_puts(0, 6, "addr2line this pc");
+        lcd_update();
+
+        rec[0] = 0;  /* clear so a future unrelated boot doesn't misreport */
+        while (1) { }
+    }
+
+    c4pro_wdt_capture_start();
+}
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_USB_MSC_ENABLE)
 static void c4pro_usb_msc_settle_storage(void)
 {
@@ -3840,6 +3883,14 @@ static void c4pro_usb_msc_serve(void)
     bool eject = false;
     int menu_samples = 0;
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_WDT_CRASH_CAPTURE)
+    /* Same entry-point reasoning as the survival test above. Check-and-report
+     * runs first (reports+halts if a previous session's freeze was caught),
+     * otherwise arms capture for THIS session before anything else runs. */
+    c4pro_wdt_crash_capture_check_and_report();
+#endif
+
     c4pro_usb_diag_enter_storage_mode();
     c4pro_usb_diag_force_reattach();
     sleep(2 * HZ);
@@ -3876,6 +3927,102 @@ static void c4pro_usb_msc_serve(void)
         else
             menu_samples = 0;
 
+#ifdef C4PRO_BOOT_HEARTBEAT
+        /* Liveness heartbeat. Four counters, each owned by a different context:
+         *   T - kernel tick (INT_TIMER0, kernel-rk27xx.c)
+         *   U - this main/UI-serve loop
+         *   W - usb thread's write path, per completed WRITE(10) buffer
+         *       (usb_storage.c, bumped after storage_write_sectors returns)
+         *   D - TMR0CON timer-drain fires in irq_handler (system-rk27xx.c)
+         *
+         * PACED WITH sleep() (cooperative, below), NOT udelay(): the previous
+         * udelay busy-wait pinned the CPU and starved the usb thread, so the
+         * copy never ran (W stayed 0) and the real hang was never reproduced.
+         * sleep() yields, so the usb/copy thread runs at FULL speed and a
+         * genuine sustained write is reproduced. Repaint is throttled to ~100ms
+         * so LCD traffic is negligible; button polling keeps the 20ms cadence.
+         *
+         * Trade-off: sleep() depends on the tick, so if the tick itself dies the
+         * painter also freezes. Acceptable because (a) the copy must run for the
+         * hang to reproduce, and (b) the leading hypothesis is that the hang is
+         * NOT a tick-freeze - in which case T keeps climbing and the frozen
+         * counter pinpoints the culprit. Interpretation when the copy hangs:
+         *   T,U,D climb, W frozen    -> usb thread stuck in the write/NAND path
+         *                               (copy hang; scheduler + tick alive)
+         *   T,D climb, U+W frozen     -> UI/serve loop wedged, tick alive
+         *   everything frozen         -> tick died / total lockup; D's last value
+         *                               shows whether the drain was still firing
+         *   D never climbs under load -> the TMR0CON drain is not firing */
+        {
+            extern volatile unsigned long c4pro_hb_tick;
+            extern volatile unsigned long c4pro_hb_usb;
+            extern volatile unsigned long c4pro_hb_drain;
+            extern volatile uint32_t c4pro_hb_phase;             /* write stage */
+            extern volatile unsigned int c4pro_uirq_last_src;    /* true UIRQ src */
+            /* R = host bus-reset count, X = last INT2FLAG (UDC event bits) */
+            extern volatile unsigned c4pro_usb_diag_reset_count;
+            extern volatile unsigned c4pro_usb_diag_last_intsrc;
+#ifdef C4PRO_FAULT_VISIBLE
+            /* F = CPU-fault count: F>0 at a freeze => UIE was entered => it IS a
+             * fault (that couldn't paint). F==0 => never faulted => busy-spin. */
+            extern volatile uint32_t c4pro_fault_count;
+#endif
+            /* Diag only: force the backlight full-on EVERY serve iteration and
+             * override any idle dim, so the heartbeat (and a fault frame) stays
+             * readable for the whole copy even with no button presses. If the
+             * device freezes, the PWM holds its last (on) state -> counters
+             * remain visible. */
+            extern void backlight_hw_on(void);
+            extern void backlight_hw_brightness(int brightness);
+            static unsigned long c4pro_hb_ui;
+            static unsigned int c4pro_hb_div;
+
+            backlight_hw_on();
+            backlight_hw_brightness(MAX_BRIGHTNESS_SETTING);
+
+            c4pro_hb_ui++;
+            if ((c4pro_hb_div++ % 5u) == 0u)   /* ~every 100ms (5 x 20ms) */
+            {
+                unsigned int s = c4pro_uirq_last_src & 0x1f;
+#ifdef C4PRO_FAULT_VISIBLE
+                unsigned long f = (unsigned long)c4pro_fault_count;
+#else
+                unsigned long f = 0;
+#endif
+#ifdef C4PRO_CACHE_SPIN_CAP
+                extern volatile uint32_t c4pro_cache_spin_timeouts;
+                unsigned long c = (unsigned long)c4pro_cache_spin_timeouts;
+#else
+                unsigned long c = 0;
+#endif
+
+                lcd_putsf(0, 4, "T%lu U%lu", c4pro_hb_tick, c4pro_hb_ui);
+                lcd_putsf(0, 5, "W%lu D%lu P%lu", c4pro_hb_usb, c4pro_hb_drain,
+                          (unsigned long)c4pro_hb_phase);
+                /* DECISIVE LINE: F = fault count, R = bus-reset count,
+                 * X = last INT2FLAG (UDC event bits). */
+                lcd_putsf(0, 6, "F%lu R%u", f,
+                          c4pro_usb_diag_reset_count);
+                lcd_putsf(0, 7, "X%x", c4pro_usb_diag_last_intsrc);
+                /* C = cache-op busy-wait timeouts: C>0 means the CACHEOP cap
+                 * fired -> the masked-IRQ cache spin WAS the hang, now survived. */
+                lcd_putsf(0, 8, "IRQ%u C%lu", s, c);
+#ifdef C4PRO_USB_RX_DMA_GUARD
+                /* B = pre-arm found OUT DMA still busy (the race the guard
+                 * absorbs); S = bounded wait expired -> engine was stuck and
+                 * got abort+RXCLR recovery at arm time (freeze doc s7). */
+                {
+                    extern volatile unsigned c4pro_usb_diag_rx_arm_busy_count;
+                    extern volatile unsigned c4pro_usb_diag_rx_arm_stuck_count;
+                    lcd_putsf(0, 9, "B%u S%u",
+                              c4pro_usb_diag_rx_arm_busy_count,
+                              c4pro_usb_diag_rx_arm_stuck_count);
+                }
+#endif
+                lcd_update();
+            }
+        }
+#endif
         sleep(HZ / 50);
     }
 
@@ -3886,6 +4033,66 @@ static void c4pro_usb_msc_serve(void)
         lcd_update();
         c4pro_usb_diag_exit_storage_mode();
         sleep(HZ / 2);
+    }
+}
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_INTC_PROBE)
+/* On-device localization of the INTC_SCR-priority boot hang. Run at an
+ * LCD-available point (after init()) so the effect of writing INTC priorities
+ * on the kernel tick is directly observable. Does the same SCR write that
+ * C4PRO_USB_TIMER_PRIO used to do (all sources -> level 1, TIMER0 -> level 2),
+ * then paints INTC_ISR/IPR and a current_tick heartbeat in a tick-INDEPENDENT
+ * loop (yield()+udelay(), never sleep()), so if the SCR write kills the tick we
+ * see current_tick (tick/d) FREEZE while the loop keeps repainting. Interpret:
+ *   tick 'd' keeps climbing after POST SCR -> SCR write is harmless; hang is
+ *                                             elsewhere.
+ *   tick 'd' frozen at 0 after POST SCR     -> the SCR write killed the kernel
+ *                                             tick; read ISR/IPR to see what the
+ *                                             INTC now reports.
+ * ftl=5A confirms ftl_init ran during init(); ftl=00 means storage init was
+ * never reached. Never returns. */
+extern volatile unsigned long c4pro_intc_ftl_mark;   /* set at ftl_init entry */
+static void c4pro_intc_probe(void)
+{
+    volatile unsigned long *intc = (volatile unsigned long *)0x18080000u;
+    unsigned long isr_pre, ipr_pre;
+    long tick0;
+    int n;
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "INTC PROBE");
+
+    isr_pre = intc[0x104 / 4];
+    ipr_pre = intc[0x108 / 4];
+    lcd_putsf(0, 1, "pre ISR=%08lx", isr_pre);
+    lcd_putsf(0, 2, "pre IPR=%08lx", ipr_pre);
+    lcd_putsf(0, 3, "ftl=%02lx", c4pro_intc_ftl_mark & 0xffu);
+    lcd_update();
+
+    /* The suspect write (stock-faithful): all sources level 1, TIMER0 level 2.
+     * SCRn is at intc + n (word index = byte offset n*4 / 4). */
+    for (n = 0; n <= 23; n++)
+        intc[n] = (intc[n] & ~0xc0u) | 0x40u;
+    intc[2] = (intc[2] & ~0xc0u) | 0x80u;
+
+    tick0 = current_tick;
+    for (;;)
+    {
+        int k;
+
+        lcd_putsf(0, 4, "POST SCR");
+        lcd_putsf(0, 5, "ISR=%08lx", intc[0x104 / 4]);
+        lcd_putsf(0, 6, "IPR=%08lx", intc[0x108 / 4]);
+        lcd_putsf(0, 7, "tk=%ld d=%ld", current_tick, current_tick - tick0);
+        lcd_update();
+
+        for (k = 0; k < 10; k++)
+        {
+            yield();
+            udelay(2000);
+        }
     }
 }
 #endif
@@ -3916,6 +4123,9 @@ int main(void)
         screens[i].update();
     }
     C4PRO_BOOT_STEP("screens ok");
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_INTC_PROBE)
+    c4pro_intc_probe();   /* does the SCR write + tick-independent display; never returns */
+#endif
     list_init();
     C4PRO_BOOT_STEP("list ok");
     C4PRO_BOOT_STEP("tree_init");

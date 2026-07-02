@@ -60,6 +60,9 @@ void usb_core_setup_received(struct usb_ctrlrequest* req);
 void usb_core_control_response(enum usb_control_response response, const void* data, size_t size);
 void usb_core_transfer_complete(int endpoint,int dir,int status,int length);
 void usb_core_bus_reset(void);
+#if defined(COLORFLY_C4_PRO)
+bool usb_core_bus_reset_pending(void);
+#endif
 void usb_core_enable_driver(int driver,bool enabled);
 bool usb_core_driver_enabled(int driver);
 #ifdef HAVE_USBSTACK

@@ -318,6 +318,7 @@ void lcd_c4pro_direct_fill(unsigned int color)
 
     LCDC_CTRL &= ~RGB24B;
 }
+
 #endif
 
 /* rockbox API functions */

@@ -153,6 +153,35 @@ void c4pro_usb_diag_force_reattach(void)
 }
 #endif
 
+#ifdef C4PRO_USB_TX_WEDGE_GUARD
+/* Instrumentation + hard-hang guard for the bulk-IN sender. Placed OUTSIDE the
+ * diag/MSC #if so it compiles whenever the flag is set, independent of which
+ * build (runtime vs installer) enables USB-MSC.
+ *
+ * ROOT-CAUSE HYPOTHESIS (sustained-write hard hang): c4pro_ep_write_sync() runs
+ * inside the INT_UDC IRQ handler; irq_handler() never re-enables IRQs, so the
+ * timer IRQ is masked and current_tick is FROZEN for the whole INT_UDC. The
+ * existing TIME_AFTER(current_tick, timeout) guards are therefore INERT here:
+ * if DMA_START or TXFULL never clears, the "bounded" waits spin forever -> hard
+ * hang (USB dead, screen black, buttons dead, power-cycle only, storage intact).
+ * This guard replaces the frozen-tick timeouts with a pure ITERATION cap (safe
+ * in IRQ context) and records where/how often the sender wedged.
+ * tx_wedge_where: 1 = DMA_START stuck, 2 = TXFULL stuck. tx_chunks = heartbeat. */
+#ifndef C4PRO_USB_TX_WEDGE_ITERS
+#define C4PRO_USB_TX_WEDGE_ITERS 2000000u  /* ~tens of ms at 200 MHz, bounded */
+#endif
+volatile unsigned c4pro_usb_diag_tx_wedge_count;
+volatile unsigned c4pro_usb_diag_tx_wedge_where;
+volatile unsigned c4pro_usb_diag_tx_chunks;
+#endif /* C4PRO_USB_TX_WEDGE_GUARD */
+
+#ifdef C4PRO_USB_RESET_STALE_GUARD
+/* Count of data-EP completion IRQs dropped because a bus reset was in progress
+ * (PART 2 guard). Nonzero at a survived copy = the guard is catching the stale
+ * X=0x100-class completions that used to wedge the AHB. */
+volatile unsigned c4pro_usb_diag_stale_compl_count;
+#endif
+
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
 volatile unsigned c4pro_usb_diag_irq_count;
 volatile unsigned c4pro_usb_diag_reset_count;
@@ -279,9 +308,38 @@ static void c4pro_ep_write_sync(struct endpoint_t *endp)
 {
     int remaining = endp->cnt;
 
+#ifdef C4PRO_BOOT_HEARTBEAT
+    /* phase 11 = inside the polled bulk-IN sender (CSW/data DMA + TX FIFO
+     * waits). A freeze frozen at P11 pinpoints this loop despite its iteration
+     * caps (e.g. a fault mid-loop after a host link reset). */
+    extern volatile uint32_t c4pro_hb_phase;
+    c4pro_hb_phase = 11;
+#endif
+
     while(remaining > 0)
     {
         int chunk = MIN(C4PRO_SYNC_IN_CHUNK, remaining);
+#ifdef C4PRO_USB_TX_WEDGE_GUARD
+        /* IRQ-safe iteration cap (current_tick is frozen in INT_UDC context, so
+         * the tick-based timeouts below are inert here). */
+        unsigned int guard;
+
+        /* 1. DMA engine idle */
+        guard = C4PRO_USB_TX_WEDGE_ITERS;
+        while((DMAINCTL(endp) & DMA_START) && --guard)
+            ;
+        if(!guard) { c4pro_usb_diag_tx_wedge_count++;
+                     c4pro_usb_diag_tx_wedge_where = 1; }
+
+        /* 2. FIFO not full */
+        guard = C4PRO_USB_TX_WEDGE_ITERS;
+        while((TXBUF(endp) & TXFULL) && --guard)
+            ;
+        if(!guard) { c4pro_usb_diag_tx_wedge_count++;
+                     c4pro_usb_diag_tx_wedge_where = 2; }
+
+        c4pro_usb_diag_tx_chunks++;
+#else
         unsigned int timeout;
 
         /* 1. DMA engine idle */
@@ -293,6 +351,7 @@ static void c4pro_ep_write_sync(struct endpoint_t *endp)
         timeout = current_tick + HZ/10;
         while(TXBUF(endp) & TXFULL)
             if(TIME_AFTER(current_tick, timeout)) break;
+#endif
 
         /* 3-5. program count + source and fire the DMA, then return to the
          * loop IMMEDIATELY - exactly per stock @0x607041BC, which does NOT wait
@@ -309,6 +368,47 @@ static void c4pro_ep_write_sync(struct endpoint_t *endp)
         remaining -= chunk;
     }
 
+#ifdef C4PRO_USB_DEFER_WRITE
+    /* STRUCTURAL FIX for residual sustained-write I/O errors (default OFF; A/B
+     * against the plain guard build).
+     *
+     * Finding: the storage write + CSW send already run in the "usb" thread
+     * (usb_storage registers .transfer_complete, so out_intr -> the standard
+     * usb_core signal -> usb_queue -> usb_thread path), NOT in INT_UDC. There
+     * is therefore nothing to move out of the IRQ. The real hazard is that
+     * current_tick only advances in INT_TIMER0, which is starved under the
+     * INT_UDC storm of a sustained transfer, so every current_tick-based wait
+     * in this sender is unreliable, AND the pipelined design below returns as
+     * soon as the LAST chunk's DMA is *fired* (not drained): usb_storage then
+     * advances its state machine and reports the CSW complete before the bytes
+     * actually leave. Under load the TX FIFO double-buffer can wedge with the
+     * final chunk (typically the 13-byte CSW) undelivered -> host write error.
+     *
+     * Fix: before reporting completion, wait (iteration-bounded, so it is
+     * immune to the starved tick) for the final DMA to self-clear, i.e. make
+     * the completion honest. This is the same self-clear wait the non-sync
+     * ep_write() path already does; it attacks the documented "slots stuck
+     * full, DMA retiring without refill" wedge without touching TXCON/FIFO
+     * reset semantics or the per-chunk data path. */
+    {
+        unsigned int guard =
+#ifdef C4PRO_USB_TX_WEDGE_ITERS
+            C4PRO_USB_TX_WEDGE_ITERS;
+#else
+            2000000u;
+#endif
+        while((DMAINCTL(endp) & DMA_START) && --guard)
+            ;
+#ifdef C4PRO_USB_TX_WEDGE_GUARD
+        if(!guard)
+        {
+            c4pro_usb_diag_tx_wedge_count++;
+            c4pro_usb_diag_tx_wedge_where = 3;  /* final-drain wedge */
+        }
+#endif
+    }
+#endif /* C4PRO_USB_DEFER_WRITE */
+
     /* The whole payload has been drained synchronously. Complete the transfer
      * WITHOUT relying on the TXACK interrupt, mirroring exactly what in_intr()
      * does on the final TXACK so the usb_storage state machine advances to the
@@ -323,11 +423,16 @@ static void c4pro_ep_write_sync(struct endpoint_t *endp)
 static void ep_write(struct endpoint_t *endp)
 {
     int xfer_size = MIN(max_pkt_size(endp), endp->cnt);
-    unsigned int timeout = current_tick + HZ/10;
 
-#if defined(COLORFLY_C4_PRO)
+#if defined(COLORFLY_C4_PRO) && !defined(C4PRO_USB_STANDARD_TRANSFER)
     /* Divert bulk-IN data endpoints to the synchronous polled sender (stock
-     * @0x607041BC). EP0/control and OUT stay on the interrupt-driven path. */
+     * @0x607041BC). EP0/control and OUT stay on the interrupt-driven path.
+     *
+     * C4PRO_USB_STANDARD_TRANSFER (default OFF) REVERTS this to the upstream
+     * rk27xx behaviour: bulk-IN uses the normal IRQ-driven ep_write below (fire
+     * ONE packet + DMA, return) and in_intr()'s TXACK handler chains the next
+     * packet - no polled sender, no per-transfer busy-waits held in the caller.
+     * The enumeration path (c4pro_udc_arm_and_connect) is unaffected. */
     if(c4pro_is_sync_in_ep(endp))
     {
         c4pro_ep_write_sync(endp);
@@ -335,11 +440,31 @@ static void ep_write(struct endpoint_t *endp)
     }
 #endif
 
+#ifdef C4PRO_USB_TX_WEDGE_GUARD
+    /* IRQ-safe iteration cap. current_tick only advances in INT_TIMER0, which
+     * is starved by the INT_UDC storm of a sustained transfer, so a TXFULL wait
+     * bounded by current_tick can spin forever -> hard hang. Bound it by
+     * iterations instead (tick-independent). Covers EP0/control and any
+     * non-sync IN endpoint. */
+    {
+        unsigned int guard = C4PRO_USB_TX_WEDGE_ITERS;
+        while((TXBUF(endp) & TXFULL) && --guard)
+            ;
+        if(!guard)
+        {
+            c4pro_usb_diag_tx_wedge_count++;
+            c4pro_usb_diag_tx_wedge_where = 4;  /* non-sync TXFULL stuck */
+        }
+    }
+#else
+    unsigned int timeout = current_tick + HZ/10;
+
     while(TXBUF(endp) & TXFULL) /* TXFULL flag */
     {
         if(TIME_AFTER(current_tick, timeout))
             break;
     }
+#endif
 
     /* setup transfer size and DMA */
     TXSTAT(endp) = xfer_size;
@@ -351,6 +476,18 @@ static void ep_write(struct endpoint_t *endp)
      * DMA_START bit until it self-clears after every chunk; without this wait
      * the controller can transmit before the DMA has filled the FIFO and clock
      * out stale FIFO residue for >=512-byte transfers. */
+#ifdef C4PRO_USB_TX_WEDGE_GUARD
+    {
+        unsigned int guard = C4PRO_USB_TX_WEDGE_ITERS;
+        while((DMAINCTL(endp) & DMA_START) && --guard)
+            ;
+        if(!guard)
+        {
+            c4pro_usb_diag_tx_wedge_count++;
+            c4pro_usb_diag_tx_wedge_where = 5;  /* non-sync DMA self-clear stuck */
+        }
+    }
+#else
     {
         unsigned int dma_to = current_tick + HZ/10;
         while(DMAINCTL(endp) & DMA_START)
@@ -359,6 +496,7 @@ static void ep_write(struct endpoint_t *endp)
                 break;
         }
     }
+#endif
 #endif
     /* Decrement by max packet size is intentional.
      * This way if we have final packet short one we will get negative len
@@ -373,8 +511,82 @@ static void ep_write(struct endpoint_t *endp)
     TXCON(endp) &= ~TXNAK;
 }
 
+#ifdef C4PRO_USB_RX_DMA_GUARD
+/* Count of times the pre-arm DMA-idle wait found the OUT engine still busy
+ * (i.e. the race that would previously have fired DMA_START into a live
+ * engine), and of times the bounded wait expired with it STILL busy. */
+volatile unsigned c4pro_usb_diag_rx_arm_busy_count;
+volatile unsigned c4pro_usb_diag_rx_arm_stuck_count;
+#endif
+
 static void ep_read(struct endpoint_t *endp)
 {
+#ifdef C4PRO_USB_RX_DMA_GUARD
+    /* Root-cause fix candidate for the sustained-write AHB-bus-stall freeze
+     * (docs/c4-usb-msc-write-freeze.md s7): mirror the STOCK firmware's
+     * bulk-OUT arm exactly, as disassembled 2026-07-02 from
+     * SYSTEM_BASE.RKW @0x6002ba68 (arm) / @0x6002b52c (RXACK handler):
+     *
+     *   1. Stock NEVER writes RXSTAT on the receive path -- it is read-only
+     *      there (packet byte count + error bits 0x02030000). The upstream
+     *      Rockbox 'RXSTAT(endp) = xfer_size' write mirrors the TX side
+     *      (where TXSTAT = length is meaningful) but has no stock
+     *      counterpart for RX; its effect on the RX FIFO/DMA state machine
+     *      is undocumented. Omit it.
+     *   2. Stock's data-phase arms happen with the packet ALREADY in the
+     *      FIFO and the engine idle (disarmed between packets), giving a
+     *      full USB packet-time of margin after the previous drain. Our
+     *      proactive re-arm (from out_intr, same IRQ) has no such margin,
+     *      so enforce it: bounded wait for the previous OUT DMA to
+     *      self-clear before firing DMA_START -- the exact discipline the
+     *      TX path already adopted from stock (@0x607041BC polls DMA_START
+     *      after every chunk; see ep_write above). Firing DMA_START into a
+     *      still-busy engine is the prime suspect for the wedged AHB master
+     *      that stalls the CPU dead (s7).
+     * Iteration-capped (tick-independent -- this runs in IRQ context where
+     * current_tick can be frozen), same idiom/bound as the TX wedge guard. */
+    {
+        unsigned guard =
+#ifdef C4PRO_USB_TX_WEDGE_ITERS
+            C4PRO_USB_TX_WEDGE_ITERS;
+#else
+            2000000u;
+#endif
+        if(DMAOUTCTL(endp) & DMA_START)
+        {
+            c4pro_usb_diag_rx_arm_busy_count++;
+            while((DMAOUTCTL(endp) & DMA_START) && --guard)
+                ;
+            if(!guard)
+            {
+                /* Engine genuinely stuck busy. VERIFIED ON THE WIRE
+                 * (2026-07-02, c4-rxguard-verify capture): firing DMA_START
+                 * into it anyway leaves the endpoint dead -- the host got
+                 * NAKs for 30s until its SCSI timeout cancelled, re-validated
+                 * and retried the command (which then succeeded). Recover at
+                 * arm time instead: abort the wedged DMA and flush the RX
+                 * FIFO (same per-EP sequence c4pro_usb_reset_dma_abort uses
+                 * on USBRST), then proceed with a clean arm. If stale
+                 * ACKed-but-undrained bytes are discarded here, the transfer
+                 * simply never completes and no CSW success is ever sent --
+                 * degrading to exactly the host's existing 30s retry path,
+                 * never to silent data corruption. */
+                c4pro_usb_diag_rx_arm_stuck_count++;
+                DMAOUTCTL(endp) = 0;
+                RXCON(endp) |= RXCLR;
+                RXCON(endp) &= ~RXCLR;
+            }
+        }
+    }
+
+    /* setup DMA -- stock sequence: address, then GO. No RXSTAT write. */
+    DMAOUTLMADDR(endp) = (uint32_t)endp->buf; /* local buffer address */
+    DMAOUTCTL(endp) = DMA_START;
+    /* clear NAK (stock does this per-arm on EP0 only -- @0x6002ba7c; for the
+     * C4 bulk-OUT config RX1CON=0x190 RXNAK is never set, so this is a
+     * harmless no-op there and required for EP0). */
+    RXCON(endp) &= ~RXNAK;
+#else
     int xfer_size = MIN(max_pkt_size(endp), endp->cnt);
 
     /* setup DMA */
@@ -383,6 +595,7 @@ static void ep_read(struct endpoint_t *endp)
     DMAOUTCTL(endp) = DMA_START;
     /* clear NAK */
     RXCON(endp) &= ~RXNAK;
+#endif
 }
 
 static void in_intr(struct endpoint_t *endp)
@@ -396,19 +609,32 @@ static void in_intr(struct endpoint_t *endp)
         c4pro_usb_diag_last_tx0con = TXCON(endp);
     }
 #endif
+#ifdef C4PRO_USB_RESET_STALE_GUARD
+    /* Drop a stale bulk-IN completion latched around a bus reset. EP0/control is
+     * never gated (enumeration must proceed). */
+    if(endp->ep_num != 0 && usb_core_bus_reset_pending())
+    {
+        c4pro_usb_diag_stale_compl_count++;
+        return;
+    }
+#endif
     /* check if clear feature was sent by host */
     if(txstat & TXCFINT)
     {
         logf("clear_stall: %d", endp->ep_num);
         usb_drv_stall(endp->ep_num, false, true);
     }
-#if defined(COLORFLY_C4_PRO)
+#if defined(COLORFLY_C4_PRO) && !defined(C4PRO_USB_STANDARD_TRANSFER)
     /* Bulk-IN data endpoints are sent synchronously in c4pro_ep_write_sync(),
      * which already drained the whole transfer and called
      * usb_core_transfer_complete() exactly once. The hardware still raises a
      * TXACK per packet afterwards; ignore those here so the transfer is not
      * completed (and the next one not re-armed) a second time. Control EP0 and
-     * the OUT path are untouched. */
+     * the OUT path are untouched.
+     *
+     * With C4PRO_USB_STANDARD_TRANSFER we DO NOT early-return: the TXACK handler
+     * below drives the standard IRQ-driven multi-packet bulk-IN (chain next
+     * packet via ep_write, or complete on the last) - the upstream behaviour. */
     if(c4pro_is_sync_in_ep(endp))
         return;
 #endif
@@ -447,6 +673,15 @@ static void out_intr(struct endpoint_t *endp)
         c4pro_usb_diag_last_outn_con = RXCON(endp);
     }
 #endif
+#ifdef C4PRO_USB_RESET_STALE_GUARD
+    /* Drop a stale bulk-OUT completion (the X=0x100 BOUT1 event that precedes
+     * the freeze) latched around a bus reset. EP0/control is never gated. */
+    if(endp->ep_num != 0 && usb_core_bus_reset_pending())
+    {
+        c4pro_usb_diag_stale_compl_count++;
+        return;
+    }
+#endif
     logf("udc: out intr(%d)", endp->ep_num);
     /* check if clear feature was sent by host */
     if(rxstat & RXCFINT)
@@ -463,8 +698,10 @@ static void out_intr(struct endpoint_t *endp)
         logf("udc: ack(%d) -> %d/%d", endp->ep_num, xfer_size, endp->cnt);
         /* finished ? */
         if(endp->cnt <= 0 || xfer_size < max_pkt_size(endp))
+        {
             usb_core_transfer_complete(endp->ep_num, endp->dir, 0,
                                        endp->len - endp->cnt);
+        }
         else
             ep_read(endp);
     }
@@ -780,6 +1017,58 @@ int usb_detect(void)
         return USB_EXTRACTED;
 }
 
+#ifdef C4PRO_USB_RESET_DMA_ABORT
+/* Abort every in-flight UDC DMA engine and flush the per-endpoint FIFOs.
+ *
+ * ROOT-CAUSE HYPOTHESIS (sustained-write/format hard hang preceded by host bus
+ * RESETs, R climbs then freeze; F=0, T=D frozen together => IRQs-masked
+ * busy-spin, screen blank): when a host USBRST arrives while a bulk-OUT receive
+ * DMA (DMAOUTCTL) or bulk-IN send DMA (DMAINCTL) is IN FLIGHT, the link dies
+ * mid-burst and that DMA's GO/busy bit (DMA_START) never self-clears, leaving
+ * the UDC's DMA engine holding the AHB bus. The very next bus/cache access or
+ * DMA arm then spins forever with IRQs masked -> the F=0 / T=D lockup. The old
+ * C4PRO_USB_RESET_GUARD re-inits + ACKs but NEVER releases the wedged master.
+ *
+ * Fix: on every USBRST, BEFORE any re-init, force DMA_START low on all DMA
+ * control registers (the write is the abort - DMA_START is both the GO command
+ * and the busy status on this controller) and pulse the FIFO-clear bits
+ * (TXCLR / RXCLR, exactly as the RESUME handler already does for EP0) so no DMA
+ * is left mid-burst and no FIFO residue survives into the re-armed link.
+ *
+ * IRQ-SAFE / BOUNDED: this is pure register writes - no polling, no wait, no
+ * dependence on the (frozen) tick. Every UDC DMA engine that physically exists
+ * is covered: EP0 (TX0/RX0) plus endpoints[1..15], each of which is fixed to a
+ * single direction by the hardware endpoint map, so iterating by endp->dir
+ * touches exactly one real DMA control register per endpoint number. */
+static void c4pro_usb_reset_dma_abort(void)
+{
+    /* EP0 control endpoint: both TX0 and RX0 DMA engines + FIFOs. */
+    TX0DMAINCTL = 0;                 /* clear IN  DMA GO -> release AHB master */
+    RX0DMACTLO  = 0;                 /* clear OUT DMA GO -> release AHB master */
+    TX0CON |= TXCLR;  TX0CON &= ~TXCLR;   /* flush EP0 TX FIFO */
+    RX0CON |= RXCLR;  RX0CON &= ~RXCLR;   /* flush EP0 RX FIFO */
+
+    for(int ep_num = 1; ep_num < 16; ep_num++)
+    {
+        struct endpoint_t *endp = &endpoints[ep_num];
+        if(endp->stat == NULL)       /* unmapped (ep0 stub) */
+            continue;
+        if(endp->dir == USB_DIR_IN)
+        {
+            DMAINCTL(endp) = 0;      /* abort in-flight bulk/int IN DMA */
+            TXCON(endp) |= TXCLR;    /* pulse TX FIFO clear (preserves epnum) */
+            TXCON(endp) &= ~TXCLR;
+        }
+        else
+        {
+            DMAOUTCTL(endp) = 0;     /* abort in-flight bulk OUT DMA */
+            RXCON(endp) |= RXCLR;    /* pulse RX FIFO clear (preserves epnum) */
+            RXCON(endp) &= ~RXCLR;
+        }
+    }
+}
+#endif /* C4PRO_USB_RESET_DMA_ABORT */
+
 /* UDC ISR function */
 void INT_UDC(void)
 {
@@ -795,6 +1084,15 @@ void INT_UDC(void)
 
     if(intsrc & USBRST_INTR) /* usb reset */
     {
+#ifdef C4PRO_USB_RESET_DMA_ABORT
+        /* FIRST thing on a reset: release any in-flight UDC DMA (AHB bus
+         * master) and flush the FIFOs, BEFORE touching EN_INT / re-init. A host
+         * link reset that lands mid-burst otherwise leaves DMA_START stuck ->
+         * wedged AHB master -> the F=0 / T=D IRQs-masked lockup. Pure register
+         * writes: bounded, IRQ-safe (no tick dependence). Runs on every USBRST
+         * regardless of C4PRO_USB_RESET_GUARD. */
+        c4pro_usb_reset_dma_abort();
+#endif
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
         c4pro_usb_diag_reset_count++;
 #endif
@@ -827,6 +1125,34 @@ void INT_UDC(void)
     /* This needs to be processed AFTER usb reset */
     udc_helper();
 
+#ifdef C4PRO_USB_RESET_GUARD
+    /* CRASH GUARD (default ON for the C4 MSC build). Root cause of the
+     * sustained-copy silent freeze: a host USB link-RESET arrives between
+     * commands (thread parked post-CSW at phase 12). The USBRST branch above
+     * already re-armed EP0 and signalled usb_core_bus_reset(); but this same
+     * INT_UDC also had SETUP/IN0/OUT0/per-endpoint completion bits latched, and
+     * processing THOSE against the just-reset endpoint/transfer tables
+     * dereferences stale state -> data-abort in IRQ context (abort mode masks
+     * IRQs -> T=D freeze; UIE can't paint from the 1 KB abort stack -> silent).
+     * A reset invalidates all in-flight transfers, so finish the re-init and ACK
+     * WITHOUT touching any stale completion this cycle. */
+    if(intsrc & USBRST_INTR)
+    {
+#ifndef C4PRO_USB_RESET_DEFER
+        usb_drv_init();       /* same re-init the USBRST branch below would do */
+#else
+        /* PART 1: do NOT run the heavy usb_drv_init() in IRQ context. EP0 was
+         * already re-armed inline above, the in-flight DMA was aborted, and
+         * usb_core_bus_reset() has deferred the class-driver teardown to the usb
+         * thread (standard Rockbox pattern). The only thing skipped here is a
+         * redundant usb_drv_startup()+semaphore_init() (the one-time connect is
+         * long done). Just ACK and leave. */
+#endif
+        INT2FLAG = intsrc;    /* ack all latched UDC flags */
+        return;
+    }
+#endif
+
     if(intsrc & SETUP_INTR) /* setup interrupt */
     {
         setup_received();
@@ -844,7 +1170,12 @@ void INT_UDC(void)
     if(intsrc & USBRST_INTR)
     {
         /* usb reset */
+#ifndef C4PRO_USB_RESET_DEFER
         usb_drv_init();
+#endif
+        /* PART 1: with C4PRO_USB_RESET_DEFER the heavy re-init is not run in IRQ
+         * context; the inline EP0 re-arm + usb_core_bus_reset() (thread-deferred
+         * teardown) above are sufficient. */
     }
     if(intsrc & RESUME_INTR)
     {
