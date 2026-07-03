@@ -371,6 +371,12 @@ volatile bool c4pro_wdt_capture_enable = false;
 
 void c4pro_wdt_capture_start(void)
 {
+    /* Zero the sampler slots so a freeze report can't show a stale previous
+     * session's values (DRAM persists across the WDT reset by design). */
+    volatile unsigned long *rec = (volatile unsigned long *)C4PRO_WDT_CAPTURE_ADDR;
+    rec[3] = rec[4] = rec[5] = rec[6] = 0;
+    rec[7] = rec[8] = rec[9] = rec[10] = 0;   /* stall-kick state slots */
+
     SCU_CLKCFG &= ~CLKCFG_WDT;
     WDTLR = C4PRO_WDT_CAPTURE_RELOAD;
     WDTCON = (1<<4) | (1<<3);

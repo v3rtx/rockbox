@@ -2332,6 +2332,9 @@ static void c4pro_wdt_crash_capture_check_and_report(void)
         unsigned long pc = rec[1];
         unsigned long tick = rec[2];
         unsigned long phase = rec[3];
+        unsigned long stage = rec[4];
+        unsigned long stlast = rec[5];
+        unsigned long stage_tick = rec[6];
 
         lcd_setfont(FONT_SYSFIXED);
         lcd_clear_display();
@@ -2339,8 +2342,21 @@ static void c4pro_wdt_crash_capture_check_and_report(void)
         lcd_puts(0, 2, "FREEZE CAUGHT!");
         lcd_putsf(0, 3, "pc  =0x%08lx", pc);
         lcd_putsf(0, 4, "tick=%lu", tick);
-        lcd_putsf(0, 5, "phase=%lu", phase);
-        lcd_puts(0, 6, "addr2line this pc");
+        /* st = (region<<8)|sector; regions: 1 PAGE_BUF copy, 2 program engine
+         * wait, 3 tPROG poll, 4 read engine wait, 5 read drain, 6 write entry,
+         * 7 write cmd/addr, 8 deselect, 9 read cmd/addr, A read tR wait,
+         * B erase issue, C tERASE wait, 0 idle. Both are TICK samples (duty-
+         * cycle biased): st = last tick's value, sl/age = last NONZERO st and
+         * ticks since -- sl==0 after heavy writes means the marker plumbing is
+         * broken (positive control), NOT that no NAND op ever ran. */
+        lcd_putsf(0, 5, "phase=%lu st=0x%03lx", phase, stage);
+        lcd_putsf(0, 6, "sl=0x%03lx age=%lu", stlast, tick - stage_tick);
+        /* Stall-kick state: kf=fires, dc=DMAOUTCTL@kick (bit0=armed),
+         * cn=cnt remaining, rx=RXSTAT. kf==0 => watchdog never fired (main
+         * thread starved or phase!=13); dc&1 => armed (clean rearm), else idle
+         * (lost RXACK). */
+        lcd_putsf(0, 7, "kf=%lu dc=%lx", rec[7], rec[8]);
+        lcd_putsf(0, 8, "cn=%ld rx=%lx", (long)rec[9], rec[10]);
         lcd_update();
 
         rec[0] = 0;  /* clear so a future unrelated boot doesn't misreport */
@@ -3886,6 +3902,75 @@ static void c4pro_boot_profile_show(const char *where)
  * Returns when the user ejects with MENU (or the cable is pulled). USB is the
  * only power on a battery-less unit, so usb_detect() (VBUS) never drops while
  * the cable is in; MENU eject disconnects the USB device but keeps power. */
+#ifdef C4PRO_NAND_WRITE_STRESS
+/* Standalone NAND write stress: hammer the FTL write path with NO USB attached
+ * (called before enter_storage_mode, so the pull-up is never asserted -> no
+ * enumeration, no SOF traffic, no UDC interrupts). Discriminates whether the
+ * residual phase-5 AHB wedge needs the UDC present at all:
+ *   - wedges standalone  -> pure NANDC issue, USB exonerated
+ *   - never wedges       -> the UDC's presence (ISR MMIO during NAND ops) is
+ *                           implicated and becomes the fix target
+ * Single-4KB writes scattered over a wide LBA span are the worst case: each one
+ * COWs a whole 128-page block (program burst + fill reads), the exact workload
+ * that trips the wedge fastest (host mkfs). WDT crash capture is armed by the
+ * caller, so a wedge produces the FREEZE screen with phase/st on reboot. */
+static void c4pro_nand_write_stress(void)
+{
+    static unsigned char buf[4096] __attribute__((aligned(32)));
+    uint32_t seed = 0xc4c4c4c4u;
+    unsigned long n = 0, errs = 0;
+    int menu_samples = 0;
+
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_clear_display();
+    lcd_puts(0, 0, "NAND WRITE STRESS");
+    lcd_puts(0, 1, "standalone, no USB");
+    lcd_puts(0, 2, "hold MENU: exit->USB");
+    lcd_update();
+
+    for (;;)
+    {
+        /* Escape hatch: a held MENU drops out of the stress into the normal
+         * USB-MSC serve, so a stress build is never stranded unreflashable
+         * (BACK-hold RKUSB entry lives in the serve loop). */
+        if (button_read_device() == BUTTON_MENU)
+        {
+            if (++menu_samples >= 5)
+                return;
+        }
+        else
+            menu_samples = 0;
+
+        seed = seed * 1103515245u + 12345u;
+        /* 8-sector (4KB) writes scattered across a ~2GB span above the
+         * partition start: recycles a few thousand logical blocks, keeping
+         * steady erase+program+fill-read churn (maximal COW amplification). */
+        uint32_t lba = 2048u + (((seed >> 7) % 4000000u) & ~7u);
+
+        for (unsigned i = 0; i < 4096u; i += 4)
+            *(uint32_t *)(buf + i) = seed ^ (n + i);
+
+        if (storage_write_sectors(IF_MD(0,) lba, 8, buf))
+            errs++;
+        n++;
+
+        if ((n & 15u) == 0)
+        {
+            lcd_putsf(0, 3, "w=%lu e=%lu", n, errs);
+            lcd_update();
+        }
+#ifdef HAVE_STORAGE_FLUSH
+        if ((n & 255u) == 0)
+            storage_flush();   /* exercise the sync-flush path too */
+#endif
+        /* (No explicit flush otherwise: the FTL's eager high-water flush drains
+         * dirty blocks continuously during these writes anyway.) */
+
+        yield();
+    }
+}
+#endif /* C4PRO_NAND_WRITE_STRESS */
+
 static void c4pro_usb_msc_serve(void)
 {
     /* ~3 consecutive ~20ms ADC reads (~60ms) = a stable MENU press */
@@ -3904,6 +3989,12 @@ static void c4pro_usb_msc_serve(void)
      * runs first (reports+halts if a previous session's freeze was caught),
      * otherwise arms capture for THIS session before anything else runs. */
     c4pro_wdt_crash_capture_check_and_report();
+#endif
+
+#ifdef C4PRO_NAND_WRITE_STRESS
+    /* Runs with USB never attached; returns only on a MENU hold, after which
+     * the normal USB-MSC serve below proceeds. */
+    c4pro_nand_write_stress();
 #endif
 
     c4pro_usb_diag_enter_storage_mode();
@@ -3945,6 +4036,111 @@ static void c4pro_usb_msc_serve(void)
             }
             else
                 menu_samples = 0;
+
+#if defined(C4PRO_USB_RX_STALL_KICK) && defined(C4PRO_PHASE_MARK)
+            /* Bulk-OUT stall watchdog: the residual sustained-write freeze is
+             * the armed receive (phase 13) silently never completing; the host
+             * then kills the device with a bus reset at its 30s SCSI timeout.
+             * This loop runs in the MAIN thread (alive while the usb thread is
+             * blocked waiting), so it can detect "phase 13 with zero RX
+             * completions for 2s" and kick the receive engine back to life
+             * (see c4pro_usb_rx_stall_kick). Kicks are rare one-off events, so
+             * painting a counter here does not perturb the hot path. */
+            {
+                extern volatile uint32_t c4pro_hb_phase;
+                extern volatile unsigned c4pro_usb_diag_outn_count;
+                extern void c4pro_usb_rx_stall_kick(void);
+                extern volatile unsigned c4pro_usb_diag_rx_kick_busy;
+                extern volatile unsigned c4pro_usb_diag_rx_kick_done;
+                static unsigned c4pro_stall_last_outn;
+                static long c4pro_stall_since = -1;
+
+                if (c4pro_hb_phase == 13 &&
+                    c4pro_usb_diag_outn_count == c4pro_stall_last_outn)
+                {
+                    /* 2s window: the kick is a LAST-RESORT recovery, not a
+                     * latency optimization. "phase 13 + outn flat" cannot
+                     * distinguish a wedged engine from a host that legally
+                     * pauses mid-WRITE (bulk has no timing obligation --
+                     * host-side writeback/scheduling pauses >100ms are
+                     * routine), so a short window routinely fires the ARMED
+                     * kick on healthy receives, re-opening the RXCLR
+                     * ACKed-packet-discard race each time. The lost-completion
+                     * race the short window was compensating for is fixed at
+                     * the cause by C4PRO_USB_IRQ_DRAIN (ack-before-service
+                     * drain loop), so genuine stalls are rare enough that 2s
+                     * of added latency on a real wedge is irrelevant. (An
+                     * earlier 100ms experiment justified itself against
+                     * C4PRO_USB_EARLY_ACK -- a config that does not ship.) */
+                    if (c4pro_stall_since < 0)
+                        c4pro_stall_since = current_tick;
+                    else if (TIME_AFTER(current_tick,
+                                        c4pro_stall_since + 2 * HZ))
+                    {
+                        c4pro_usb_rx_stall_kick();
+                        c4pro_stall_since = -1;
+                        lcd_putsf(0, 9, "K%u D%u",
+                                  c4pro_usb_diag_rx_kick_busy,
+                                  c4pro_usb_diag_rx_kick_done);
+                        lcd_update();
+                    }
+                }
+                else
+                {
+                    c4pro_stall_last_outn = c4pro_usb_diag_outn_count;
+                    c4pro_stall_since = -1;
+                }
+            }
+#endif
+
+#ifdef C4PRO_USB_RX_TIMING
+            /* Per-packet cost breakdown on the bulk-OUT MSC pipe. w = avg/max us
+             * between packets WITHIN a buffer (per-packet receive latency),
+             * g = avg/max us across a BUFFER boundary (usb-thread + serialized
+             * NAND write), h = avg us inside out_intr. Throttled to ~1s so the
+             * LCD update does not perturb what it measures. */
+            {
+                extern volatile uint32_t c4pro_rxt_win_sum, c4pro_rxt_win_cnt, c4pro_rxt_win_max;
+                extern volatile uint32_t c4pro_rxt_gap_sum, c4pro_rxt_gap_cnt, c4pro_rxt_gap_max;
+                extern volatile uint32_t c4pro_rxt_h_sum, c4pro_rxt_h_cnt;
+                static long c4pro_rxt_next;
+                if (c4pro_rxt_win_cnt && TIME_AFTER(current_tick, c4pro_rxt_next))
+                {
+                    c4pro_rxt_next = current_tick + HZ;
+                    lcd_putsf(0, 6, "w%lu/%lu n%lu",
+                              c4pro_rxt_win_sum / c4pro_rxt_win_cnt / 50,
+                              c4pro_rxt_win_max / 50, c4pro_rxt_win_cnt);
+                    lcd_putsf(0, 7, "g%lu/%lu n%lu",
+                              c4pro_rxt_gap_cnt ? c4pro_rxt_gap_sum / c4pro_rxt_gap_cnt / 50 : 0,
+                              c4pro_rxt_gap_max / 50, c4pro_rxt_gap_cnt);
+                    {
+                        extern volatile uint32_t c4pro_wp_load_sum, c4pro_wp_tprog_sum, c4pro_wp_cnt, c4pro_wp_start_sum;
+                        /* SW = entry wait (previous page's tPROG, paid serially),
+                         * LD = 8 per-sector BCH FLCTL loads, TP = 0x10 confirm.
+                         * us/page. SW+LD are the two real levers. */
+                        lcd_putsf(0, 8, "SW%lu LD%lu TP%lu",
+                              c4pro_wp_cnt ? c4pro_wp_start_sum / c4pro_wp_cnt / 50 : 0,
+                              c4pro_wp_cnt ? c4pro_wp_load_sum / c4pro_wp_cnt / 50 : 0,
+                              c4pro_wp_cnt ? c4pro_wp_tprog_sum / c4pro_wp_cnt / 50 : 0);
+                    }
+#ifdef C4PRO_NAND_DIE_INTERLEAVE
+                    /* B = batched multi-die flushes, N = avg dies/batch (~4 =>
+                     * overlap, ~1 => serial fallback), S = serial single-slot
+                     * flushes (evictions). S >> B => batching not firing. */
+                    {
+                        extern volatile uint32_t c4pro_wp_load_sum, c4pro_wp_tprog_sum, c4pro_wp_cnt;
+                        /* LD = avg us/page in the 8 per-sector BCH FLCTL loads,
+                         * TP = avg us/page in 0x10 + tPROG wait. Whichever
+                         * dominates is the real write wall. */
+                        lcd_putsf(0, 9, "LD%lu TP%lu",
+                                  c4pro_wp_cnt ? c4pro_wp_load_sum / c4pro_wp_cnt / 50 : 0,
+                                  c4pro_wp_cnt ? c4pro_wp_tprog_sum / c4pro_wp_cnt / 50 : 0);
+                    }
+#endif
+                    lcd_update();
+                }
+            }
+#endif
 
             /* BACK held long enough -> drop into mask-ROM RKUSB download mode
              * (071b:3201) for a CE#-free reflash. rk27xx_enter_rkusb() never

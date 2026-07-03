@@ -308,7 +308,7 @@ static void c4pro_ep_write_sync(struct endpoint_t *endp)
 {
     int remaining = endp->cnt;
 
-#ifdef C4PRO_BOOT_HEARTBEAT
+#ifdef C4PRO_PHASE_MARK
     /* phase 11 = inside the polled bulk-IN sender (CSW/data DMA + TX FIFO
      * waits). A freeze frozen at P11 pinpoints this loop despite its iteration
      * caps (e.g. a fault mid-loop after a host link reset). */
@@ -670,9 +670,60 @@ static void in_intr(struct endpoint_t *endp)
     }
 }
 
+#ifdef C4PRO_USB_RX_TIMING
+/* Free-running TMR2 (50MHz APB0 = 50 counts/us, 20ns res) split of the per-packet
+ * cost on the bulk-OUT MSC pipe (endpoint 1). Distinguishes:
+ *   win_* = interval between consecutive packets WITHIN a buffer (per-packet
+ *           receive latency: how fast we re-arm + host resends);
+ *   gap_* = interval across a BUFFER boundary (usb-thread wakeup + serialized
+ *           NAND write before the next receive is armed);
+ *   h_*   = time spent INSIDE out_intr (handler cost itself).
+ * These three tell us whether 314us/packet is handler cost, per-packet IRQ
+ * latency, or the per-buffer NAND stall -- i.e. which lever actually moves speed. */
+volatile uint32_t c4pro_rxt_started;
+volatile uint32_t c4pro_rxt_last;
+volatile uint32_t c4pro_rxt_prev_completed;
+volatile uint32_t c4pro_rxt_win_sum, c4pro_rxt_win_cnt, c4pro_rxt_win_max;
+volatile uint32_t c4pro_rxt_gap_sum, c4pro_rxt_gap_cnt, c4pro_rxt_gap_max;
+volatile uint32_t c4pro_rxt_h_sum,   c4pro_rxt_h_cnt;
+/* storage_write_sectors() duration, sampled from usb_storage.c. If sw ~= gap,
+ * the per-buffer gap IS the FTL/NAND write; if sw << gap, the gap is thread
+ * scheduling / USB-command latency and speeding NAND cannot help. */
+volatile uint32_t c4pro_swt_sum, c4pro_swt_cnt, c4pro_swt_max;
+uint32_t c4pro_rxt_now(void) { return TMR2CVR; }
+#endif
+
 static void out_intr(struct endpoint_t *endp)
 {
     uint32_t rxstat = RXSTAT(endp);
+#ifdef C4PRO_USB_RX_TIMING
+    uint32_t _t_entry = 0;
+    if(endp->ep_num == 1)
+    {
+        if(!c4pro_rxt_started)
+        {
+            TMR2LR = 0xFFFFFFFFu;
+            TMR2CON = (1u << 8) | (1u << 7); /* periodic, run, no irq */
+            c4pro_rxt_started = 1;
+        }
+        _t_entry = TMR2CVR;
+        if(c4pro_rxt_last)
+        {
+            uint32_t dt = (c4pro_rxt_last - _t_entry) & 0xFFFFFFFFu;
+            if(c4pro_rxt_prev_completed)
+            {
+                c4pro_rxt_gap_sum += dt; c4pro_rxt_gap_cnt++;
+                if(dt > c4pro_rxt_gap_max) c4pro_rxt_gap_max = dt;
+            }
+            else
+            {
+                c4pro_rxt_win_sum += dt; c4pro_rxt_win_cnt++;
+                if(dt > c4pro_rxt_win_max) c4pro_rxt_win_max = dt;
+            }
+        }
+        c4pro_rxt_last = _t_entry;
+    }
+#endif
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     if(endp->ep_num == 0)
     {
@@ -722,10 +773,26 @@ static void out_intr(struct endpoint_t *endp)
         {
             usb_core_transfer_complete(endp->ep_num, endp->dir, 0,
                                        endp->len - endp->cnt);
+#ifdef C4PRO_USB_RX_TIMING
+            if(endp->ep_num == 1) c4pro_rxt_prev_completed = 1;
+#endif
         }
         else
+        {
             ep_read(endp);
+#ifdef C4PRO_USB_RX_TIMING
+            if(endp->ep_num == 1) c4pro_rxt_prev_completed = 0;
+#endif
+        }
     }
+#ifdef C4PRO_USB_RX_TIMING
+    if(endp->ep_num == 1 && _t_entry)
+    {
+        uint32_t _he = TMR2CVR;
+        c4pro_rxt_h_sum += (_t_entry - _he) & 0xFFFFFFFFu;
+        c4pro_rxt_h_cnt++;
+    }
+#endif
 }
 
 static void udc_phy_reset(void)
@@ -1061,6 +1128,132 @@ int usb_detect(void)
  * is covered: EP0 (TX0/RX0) plus endpoints[1..15], each of which is fixed to a
  * single direction by the hardware endpoint map, so iterating by endp->dir
  * touches exactly one real DMA control register per endpoint number. */
+#ifdef C4PRO_USB_RX_STALL_KICK
+/* Self-recovery for the residual sustained-write freeze (measured on-device via
+ * the S4 crash capture, 2026-07-03): the bulk-OUT receive is armed (phase 13),
+ * but the data phase never completes -- the device NAKs the host's WRITE data
+ * forever while the rest of the system runs normally. After the host's ~30s
+ * SCSI timeout it issues a bus reset, and THAT reset handling wedges the AHB ->
+ * hard freeze -> WDT. (sl/age proved the NAND finished ~30s before death; the
+ * pc sampled the scheduler idle loop = usb thread blocked waiting.)
+ *
+ * The arm-time RX guard cannot see this: the arm was clean (B/S flat), the
+ * engine dies afterwards. Recovery is triggered instead by the serve loop's
+ * stall watchdog (phase 13 + zero RX completions for the watch window):
+ *  - DMA still armed  -> nothing was ACKed to the host, no stream position is
+ *    lost: abort the engine, flush the RX FIFO, re-arm at the SAME position
+ *    (the identical sequence the arm-time guard uses). The host has been
+ *    NAK-retrying all along and proceeds within microseconds -> the copy
+ *    resumes ~2s after the stall instead of dying at the 30s reset.
+ *  - DMA idle (self-cleared) -> the RXACK event was lost AFTER data hit memory
+ *    and was ACKed on the wire; blind re-arm would desync the stream, so do NOT
+ *    touch -- only count it (kick_done), so a freeze report identifies this
+ *    stall type and an lmaddr-based resync can be built if it ever shows up.
+ * IRQs are masked across the check+recovery so a genuinely-arriving out_intr
+ * cannot race it. */
+volatile unsigned c4pro_usb_diag_rx_kick_busy;
+volatile unsigned c4pro_usb_diag_rx_kick_done;
+void c4pro_usb_rx_stall_kick(void)
+{
+    struct endpoint_t *endp = &endpoints[1];   /* BOUT1 = the MSC OUT pipe */
+    int oldlevel = disable_irq_save();
+    unsigned long ctl = DMAOUTCTL(endp);
+    uint32_t rxstat = (uint32_t)RXSTAT(endp);
+
+#ifdef C4PRO_WDT_CRASH_CAPTURE
+    /* Record the stuck receive's state into the surviving WDT scratch (these
+     * globals are BSS and would be wiped by the recovery reboot). rec[7]=kick
+     * count, rec[8]=DMAOUTCTL (bit0=DMA_START armed vs idle), rec[9]=endp->cnt
+     * remaining, rec[10]=RXSTAT (ACK/err bits + last byte count). Read while the
+     * UDC is still healthy (only the 30s host reset wedges it), so this is safe
+     * here even though the tick ISR must never touch NANDC/UDC. */
+    {
+        volatile unsigned long *rec =
+            (volatile unsigned long *)C4PRO_WDT_CAPTURE_ADDR;
+        rec[7]++;
+        rec[8] = ctl;
+        rec[9] = (unsigned long)endp->cnt;
+        rec[10] = rxstat;
+    }
+#endif
+
+    if (ctl & DMA_START)
+    {
+        /* ARMED: the DMA is still waiting, no packet was accepted/ACKed, so the
+         * buffer position is exact. Abort the engine, flush any FIFO residue,
+         * clear NAK, and re-arm at the same position -- a clean resume; the host
+         * has been NAK-retrying and proceeds within microseconds.
+         *
+         * RACE GUARD: the `ctl` snapshot is stale by now -- the UDC accepts and
+         * wire-ACKs packets autonomously (IRQ masking stops only the CPU), so a
+         * packet may have landed between the snapshot and here. Aborting then
+         * would RXCLR-discard bytes the host believes delivered and re-arm at
+         * the un-advanced position -> silent 512-byte stream shift. Re-validate
+         * against the LIVE registers under the mask: if the BOUT1 completion
+         * bit (INT2FLAG bit 8 = ep1) is latched or the DMA has self-cleared,
+         * a completion is in flight -- leave it to the pending out_intr and
+         * bail; the watchdog re-fires if the stall was real. */
+        if ((INT2FLAG & 0x100u) || !(DMAOUTCTL(endp) & DMA_START))
+        {
+            restore_irq(oldlevel);
+            return;
+        }
+        c4pro_usb_diag_rx_kick_busy++;
+        DMAOUTCTL(endp) = 0;
+        RXCON(endp) |= RXCLR;
+        RXCON(endp) &= ~RXCLR;
+        RXCON(endp) &= ~RXNAK;
+        DMAOUTLMADDR(endp) = (uint32_t)endp->buf;
+        DMAOUTCTL(endp) = DMA_START;
+    }
+    else
+    {
+        /* IDLE (self-cleared): a packet already drained to memory but its
+         * out_intr completion IRQ was lost -- endp->buf/cnt are stale. Do NOT
+         * blind re-arm (that would drop or overwrite the drained packet and
+         * corrupt the filesystem). Instead replay EXACTLY what out_intr would
+         * have done from RXSTAT: advance by the received byte count, then either
+         * complete the transfer (buffer full or short packet) or re-arm for the
+         * next packet. This is data-correct -- the bytes are really in memory.
+         *
+         * DELAYED-vs-LOST GUARD: if the completion bit is still LATCHED in
+         * INT2FLAG, the IRQ is delayed, not lost -- it fires the moment we
+         * restore_irq and out_intr will account this same packet. Replaying it
+         * here too would double-advance cnt/buf (512-byte hole). Bail and let
+         * the pending IRQ do its job. */
+        if (INT2FLAG & 0x100u)
+        {
+            restore_irq(oldlevel);
+            return;
+        }
+        c4pro_usb_diag_rx_kick_done++;
+        if (rxstat & RXACK)
+        {
+            int xfer_size = rxstat & 0xffff;
+            endp->cnt -= xfer_size;
+            endp->buf += xfer_size;
+            if (endp->cnt <= 0 || xfer_size < max_pkt_size(endp))
+                usb_core_transfer_complete(endp->ep_num, endp->dir, 0,
+                                           endp->len - endp->cnt);
+            else
+                ep_read(endp);   /* arms at the advanced buf */
+        }
+        else
+        {
+            /* Idle with no ACK latched: nothing to account, clean re-arm. */
+            DMAOUTCTL(endp) = 0;
+            RXCON(endp) |= RXCLR;
+            RXCON(endp) &= ~RXCLR;
+            RXCON(endp) &= ~RXNAK;
+            DMAOUTLMADDR(endp) = (uint32_t)endp->buf;
+            DMAOUTCTL(endp) = DMA_START;
+        }
+    }
+
+    restore_irq(oldlevel);
+}
+#endif /* C4PRO_USB_RX_STALL_KICK */
+
 static void c4pro_usb_reset_dma_abort(void)
 {
     /* EP0 control endpoint: both TX0 and RX0 DMA engines + FIFOs. */
@@ -1101,6 +1294,18 @@ void INT_UDC(void)
     c4pro_usb_diag_irq_count++;
     c4pro_usb_diag_last_intsrc = intsrc;
     c4pro_usb_diag_last_dev_info = DEV_INFO;
+#endif
+
+#ifdef C4PRO_USB_EARLY_ACK
+    /* ACK the latched flags NOW, before processing. INT2FLAG is write-1-to-clear,
+     * and out_intr()/in_intr() below re-arm the DMA -- so a packet completing
+     * DURING this handler sets its bit again. Acking at the END (INT2FLAG=intsrc,
+     * the original code) would write back the ENTRY snapshot and erase that
+     * fresh completion -> its RXACK is lost -> the bulk-OUT receive sits armed
+     * with data waiting and no IRQ to service it (the phase-13 sustained-write
+     * stall). Acking here clears only what we actually read; any new completion
+     * re-triggers INT_UDC and is serviced next pass. No bit is ever lost. */
+    INT2FLAG = intsrc;
 #endif
 
     if(intsrc & USBRST_INTR) /* usb reset */
@@ -1169,7 +1374,9 @@ void INT_UDC(void)
          * redundant usb_drv_startup()+semaphore_init() (the one-time connect is
          * long done). Just ACK and leave. */
 #endif
+#ifndef C4PRO_USB_EARLY_ACK
         INT2FLAG = intsrc;    /* ack all latched UDC flags */
+#endif
         return;
     }
 #endif
@@ -1232,6 +1439,37 @@ void INT_UDC(void)
 #endif
     }
     /* other endpoints */
+#ifdef C4PRO_USB_IRQ_DRAIN
+    /* DRAIN: service every endpoint completion, INCLUDING ones that land while
+     * we are still in this handler, all within this single interrupt. Acking at
+     * exit (original) writes back the entry snapshot and ERASES a completion that
+     * arrived mid-handler -> lost RXACK -> phase-13 sustained-write stall. Acking
+     * at entry (early-ACK) fixes the loss but makes each such completion cost a
+     * whole FRESH interrupt -> ~halves throughput on this interrupt-latency-bound
+     * RX. Draining does neither: ack the control bits once, then per endpoint-bit
+     * batch ack-then-service and re-read, until no completion remains -- no bit
+     * lost, no redundant IRQ. (Endpoint completions = bits 8..22; control/one-time
+     * events = bits 1..7, handled once above.) */
+    INT2FLAG = intsrc & ~0x7fff00u;   /* ack control/one-time bits once */
+    {
+        uint32_t epbits = intsrc & 0x7fff00u;
+        while(epbits)
+        {
+            INT2FLAG = epbits;        /* ack this batch BEFORE servicing */
+            for(int ep_num = 1; ep_num < 16; ep_num++)
+            {
+                if(!(epbits & (1 << (ep_num + 7))))
+                    continue;
+                struct endpoint_t *endp = &endpoints[ep_num];
+                if(endp->dir == USB_DIR_IN)
+                    in_intr(endp);
+                else
+                    out_intr(endp);
+            }
+            epbits = INT2FLAG & 0x7fff00u;   /* completions that arrived meanwhile */
+        }
+    }
+#else
     for(int ep_num = 1; ep_num < 16; ep_num++)
     {
         if(!(intsrc & (1 << (ep_num + 7))))
@@ -1243,5 +1481,8 @@ void INT_UDC(void)
             out_intr(endp);
     }
 
+#ifndef C4PRO_USB_EARLY_ACK
     INT2FLAG = intsrc;
+#endif
+#endif
 }

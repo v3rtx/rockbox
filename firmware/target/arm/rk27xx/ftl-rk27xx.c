@@ -30,7 +30,7 @@
     defined(C4PRO_NAND_FMWAIT_SWEEP) || defined(C4PRO_NAND_CLKPROBE) || \
     defined(C4PRO_NAND_DELAY_SWEEP) || defined(C4PRO_NAND_HWECC_TEST) || \
     defined(C4PRO_NAND_HWECC_ERASED) || defined(C4PRO_NAND_WDELAY_SWEEP) || \
-    defined(C4PRO_NAND_HWECC_MULTIDIE)
+    defined(C4PRO_NAND_HWECC_MULTIDIE) || defined(C4PRO_NAND_2PLANE_TEST)
 #include "lcd.h"
 #include "backlight.h"
 #endif
@@ -1346,6 +1346,8 @@ static int c4own_read_phys_sector_uncached(uint32_t pblk, uint32_t sector,
  *   1  USB (usb_storage, between/after a write)   2  usb_storage write dispatch
  *   3  c4own_write_logical_block                  4  superblock/checkpoint flush
  *   5  c4own_write_page (NAND hwecc program)      6  c4own_erase_pblk (erase)
+ *   7  COW-fill / cache-load NAND read (between programs; previously reported
+ *      as 5, hiding whether the read or the program engine wedged)
  *   10 send_csw (about to send CSW)               11 bulk-IN sync sender (CSW DMA)
  *   12 CSW sent, arming next-command receive     13 armed, waiting for host
  *                                                    bulk-OUT WRITE data (the
@@ -1355,7 +1357,7 @@ static int c4own_read_phys_sector_uncached(uint32_t pblk, uint32_t sector,
 volatile uint32_t c4pro_hb_phase;
 #endif
 
-#if defined(C4PRO_BOOT_HEARTBEAT) || defined(C4PRO_WDT_CRASH_CAPTURE)
+#ifdef C4PRO_PHASE_MARK
 #define C4PRO_SET_PHASE(n) do { c4pro_hb_phase = (n); } while (0)
 #else
 #define C4PRO_SET_PHASE(n) do { } while (0)
@@ -1888,7 +1890,7 @@ static int c4own_flush_cache_slot(uint32_t slot)
     return 0;
 }
 
-#ifdef C4PRO_NAND_DIE_INTERLEAVE
+#if defined(C4PRO_NAND_DIE_INTERLEAVE) || defined(C4PRO_NAND_2PLANE)
 /*
  * Die-interleaved write path. The default flush programs one logical block at a
  * time on a single die, so every 4 KB page pays the full MLC tPROG serially
@@ -1903,6 +1905,7 @@ static int c4own_flush_cache_slot(uint32_t slot)
  * what records which die a block landed on, so no reformat is needed and existing
  * volumes keep mounting.
  */
+#ifdef C4PRO_NAND_DIE_INTERLEAVE
 int c4own_diag_interleave_batch_count;
 int c4own_diag_interleave_max_n;
 int c4own_diag_interleave_prog_fail;
@@ -1912,6 +1915,7 @@ int c4own_diag_interleave_verify_fail;
 
 /* Round-robin die cursor so consecutive batches start on different dies. */
 static uint32_t c4own_wr_die;
+#endif /* C4PRO_NAND_DIE_INTERLEAVE (die-only diagnostics/cursor) */
 /* Per-die page-image build buffers; all live simultaneously during a page-round
  * because the multi-program consumes all of them before any tPROG wait. 4-byte
  * aligned so c4pro_nand_prog_pages_hwecc_multi can stage them into PAGE_BUF with
@@ -1919,6 +1923,7 @@ static uint32_t c4own_wr_die;
  * not a fault -> silent corruption). */
 static unsigned char c4own_il_page[4][4096] __attribute__((aligned(4)));
 
+#ifdef C4PRO_NAND_DIE_INTERLEAVE
 /* Allocate (and erase) a free physical block that belongs to a specific die.
  * Mirrors c4own_alloc_pblk's two-pass (fresh-then-retired) policy but filtered
  * to one bank, so a batch can place each block on a distinct die. */
@@ -1958,6 +1963,7 @@ static int c4own_alloc_pblk_on_bank(uint32_t bank)
 
     return -1;
 }
+#endif /* C4PRO_NAND_DIE_INTERLEAVE (alloc_pblk_on_bank) */
 
 static void c4own_build_header(unsigned char *buf, uint32_t logical,
                                uint32_t gen)
@@ -1983,6 +1989,7 @@ static void c4own_build_commit(unsigned char *buf, uint32_t logical,
     c4own_put32(commit + 16, c4own_crc32(commit, 16));
 }
 
+#ifdef C4PRO_NAND_DIE_INTERLEAVE
 /*
  * Flush a batch of up to 4 dirty cache slots, each already allocated to a
  * distinct die (pblks[i] on banks[i]). Writes all blocks in lockstep, page-round
@@ -1992,6 +1999,13 @@ static void c4own_build_commit(unsigned char *buf, uint32_t logical,
  * the next flush. Maps/generations/old-block retirement are applied only after
  * all 128 rounds (and the optional read-after-write verify) succeed.
  */
+/* Interleave diagnostics: il_batch = # of multi-die batched flushes, il_nsum =
+ * sum of their n (avg dies-per-batch = il_nsum/il_batch; ~4 => real overlap, ~1
+ * => serial fallback). Serial single-slot flushes are counted separately by
+ * c4own_diag_cache_flush_count. Shown on the serve screen to prove whether the
+ * batching actually fires under the write pattern. */
+volatile uint32_t c4pro_il_batch, c4pro_il_nsum;
+
 static int c4own_flush_slots_interleaved(const uint32_t *slots,
                                          const int *pblks,
                                          const uint32_t *banks,
@@ -2005,6 +2019,9 @@ static int c4own_flush_slots_interleaved(const uint32_t *slots,
 
     if (n == 0)
         return 0;
+
+    c4pro_il_batch++;
+    c4pro_il_nsum += n;
 
     C4PRO_SET_PHASE(3);
 
@@ -2255,12 +2272,250 @@ static int c4own_flush_batched(bool all)
 
     return 0;
 }
-#endif /* C4PRO_NAND_DIE_INTERLEAVE */
+#endif /* C4PRO_NAND_DIE_INTERLEAVE (batched multi-die flush) */
+
+#ifdef C4PRO_NAND_2PLANE
+/*
+ * Two-plane paired flush -- the stock ~6.7 MB/s lever (validated 8.3 vs 4.2 MB/s
+ * raw). Programs TWO dirty cache slots at once onto an ADJACENT physical
+ * plane-pair (blocks P and P+1, so row1 = row0 + C4OWN_PAGES_PER_BLOCK -- the
+ * proven block-bit-0 stride), sharing one MLC tPROG per page-round between the two
+ * blocks. Each block keeps its own header(page0)/commit(page127)/payload layout
+ * and is BYTE-IDENTICAL on NAND to a single-plane write, so c4own_read_phys_sector,
+ * c4own_mount_scan and the checkpoint are UNCHANGED and existing volumes keep
+ * mounting. Map/gen are committed only after all 128 page-rounds succeed; on any
+ * page failure both fresh blocks are retired and no map changes, so a torn write
+ * never loses committed data (a block whose commit page never landed is skipped by
+ * the mount scan, exactly as in the serial writer).
+ */
+volatile uint32_t c4pro_2p_batch, c4pro_2p_pairs;
+
+/* Allocate an adjacent free plane-pair: an even PHYSICAL block P with P and P+1
+ * both free/erasable and on the same die. Erases both. Returns the low pblk
+ * (*hi = its partner) or -1. abs_pblk = C4PRO_OWNED_PBLK_START + pblk and
+ * blocks/die is even, so an even abs block and its +1 partner are always two
+ * adjacent same-die blocks differing only in block bit 0 -- the two-plane pairing
+ * constraint. Two passes (fresh, then retired) mirror c4own_alloc_pblk. */
+static int c4own_alloc_pblk_pair(int *hi)
+{
+    for (int pass = 0; pass < 2; pass++)
+    {
+        for (uint32_t P = C4OWN_FIRST_DATA_PBLK;
+             P + 1u < C4OWN_RUNTIME_PBLK_COUNT; P++)
+        {
+            uint32_t Q = P + 1u;
+
+            if (c4own_abs_pblk(P) & 1u)     /* P must start an even physical block */
+                continue;
+            if (c4own_used[P] || c4own_used[Q])
+                continue;
+            if (pass == 0 && (c4own_retired[P] || c4own_retired[Q]))
+                continue;
+            if (c4own_pblk_bank(P) != c4own_pblk_bank(Q))   /* defensive same-die */
+                continue;
+
+            if (c4own_erase_pblk(P))
+            {
+                c4own_used[P] = 1;
+                c4own_retired[P] = 1;
+                continue;
+            }
+            if (c4own_erase_pblk(Q))
+            {
+                c4own_used[Q] = 1;
+                c4own_retired[Q] = 1;
+                continue;               /* leave P free for a later single/pair use */
+            }
+            c4own_used[P] = 1;
+            c4own_used[Q] = 1;
+            c4own_retired[P] = 0;
+            c4own_retired[Q] = 0;
+            *hi = (int)Q;
+            return (int)P;
+        }
+    }
+    return -1;
+}
+
+/* Program two logical blocks in lockstep as a plane pair via two-plane. */
+static int c4own_flush_pair(uint32_t slot0, uint32_t slot1,
+                            int pblk0, int pblk1, uint32_t bank)
+{
+    uint32_t base0 = c4own_pblk_page((uint32_t)pblk0);
+    uint32_t base1 = c4own_pblk_page((uint32_t)pblk1);
+    uint32_t logical0 = c4own_cache_logical[slot0];
+    uint32_t logical1 = c4own_cache_logical[slot1];
+    uint16_t old0 = c4own_map[logical0];
+    uint16_t old1 = c4own_map[logical1];
+    uint32_t gen0 = c4own_gen[logical0] + 1u;
+    uint32_t gen1 = c4own_gen[logical1] + 1u;
+    uint32_t p;
+
+    C4PRO_SET_PHASE(3);
+
+    /* Plane pair must be adjacent (the proven stride). alloc guarantees it; bail
+     * to the caller's serial fallback if not. */
+    if (base1 != base0 + C4OWN_PAGES_PER_BLOCK)
+        return 2;
+
+    if (c4own_ckpt_active_block >= 0 && !c4own_ckpt_marked_dirty)
+        if (c4own_ckpt_mark_dirty())
+        {
+            /* Release the freshly-allocated (and already erased) pair: unlike
+             * the program-failure path below there is nothing wrong with these
+             * blocks, so free rather than retire them. Without this, every
+             * retried flush after a ckpt-marker failure leaked 2 blocks for the
+             * session (used=1, unmapped). */
+            c4own_used[pblk0] = 0;
+            c4own_used[pblk1] = 0;
+            return 1;
+        }
+
+    for (p = 0; p < C4OWN_PAGES_PER_BLOCK; p++)
+    {
+        unsigned char *b0 = c4own_il_page[0];
+        unsigned char *b1 = c4own_il_page[1];
+
+        if (p == 0)
+        {
+            c4own_build_header(b0, logical0, gen0);
+            c4own_build_header(b1, logical1, gen1);
+        }
+        else if (p == C4OWN_PAGES_PER_BLOCK - 1u)
+        {
+            c4own_build_commit(b0, logical0, gen0);
+            c4own_build_commit(b1, logical1, gen1);
+        }
+        else
+        {
+            memcpy(b0, c4own_cache_data[slot0] +
+                       (p - 1u) * C4OWN_SECTORS_PER_PAGE * 512u,
+                   C4OWN_SECTORS_PER_PAGE * 512u);
+            memcpy(b1, c4own_cache_data[slot1] +
+                       (p - 1u) * C4OWN_SECTORS_PER_PAGE * 512u,
+                   C4OWN_SECTORS_PER_PAGE * 512u);
+        }
+
+        /* Hardware-BCH inline layout, identical to the single-plane hwecc writer
+         * the production (C4PRO_NAND_HWECC) builds use, so reads via
+         * c4pro_nand_read_page_hwecc are unchanged. Phase 5 = NAND program in
+         * flight (same marker as the serial writer), so a wedge inside the
+         * two-plane program is attributed to the NAND op, not the FTL. */
+        C4PRO_SET_PHASE(5);
+        if (c4pro_nand_write_page_2plane(bank, base0 + p, base1 + p, b0, b1,
+                                         C4OWN_SECTORS_PER_PAGE))
+        {
+            c4own_used[pblk0] = 0; c4own_retired[pblk0] = 1;
+            c4own_used[pblk1] = 0; c4own_retired[pblk1] = 1;
+            c4own_diag_last_write_result = 3;
+            return 1;
+        }
+    }
+
+    c4own_map[logical0] = (uint16_t)pblk0;
+    c4own_gen[logical0] = gen0;
+    if (old0 != 0xffffu) { c4own_used[old0] = 0; c4own_retired[old0] = 1; }
+    c4own_map[logical1] = (uint16_t)pblk1;
+    c4own_gen[logical1] = gen1;
+    if (old1 != 0xffffu) { c4own_used[old1] = 0; c4own_retired[old1] = 1; }
+
+    c4own_cache_dirty[slot0] = false;
+    c4own_cache_dirty[slot1] = false;
+    c4own_map_dirty = true;
+    c4pro_2p_pairs++;
+    return 0;
+}
+
+/*
+ * Drain dirty cache slots as two-plane pairs. all=true flushes every dirty slot
+ * (sync/unmount); all=false is the eager high-water flush keeping
+ * C4PRO_FTL_FLUSH_KEEP dirty. Each round takes the two OLDEST dirty slots and one
+ * fresh plane-pair; a lone dirty slot, or a round with no plane-pair free, falls
+ * back to the serial single-slot writer so forward progress is guaranteed.
+ */
+static int c4own_flush_batched_2plane(bool all)
+{
+    unsigned guard = 2u * C4OWN_CACHE_SLOTS + 2u;
+
+    while (guard--)
+    {
+        int s0 = -1, s1 = -1;
+        uint32_t a0 = 0xffffffffu, a1 = 0xffffffffu;
+        uint32_t dirty = 0;
+        int pblk0, hi = -1;
+
+        for (uint32_t s = 0; s < C4OWN_CACHE_SLOTS; s++)
+            if (c4own_cache_valid[s] && c4own_cache_dirty[s])
+                dirty++;
+
+        if (all)
+        {
+            if (dirty == 0u)
+                break;
+        }
+        else
+        {
+            uint32_t threshold = C4PRO_FTL_FLUSH_KEEP + 2u;
+            if (threshold > C4OWN_CACHE_SLOTS)
+                threshold = C4OWN_CACHE_SLOTS;
+            if (dirty < threshold)
+                break;
+        }
+
+        for (uint32_t s = 0; s < C4OWN_CACHE_SLOTS; s++)
+        {
+            if (!c4own_cache_valid[s] || !c4own_cache_dirty[s])
+                continue;
+            if (c4own_cache_age[s] < a0)
+            { a1 = a0; s1 = s0; a0 = c4own_cache_age[s]; s0 = (int)s; }
+            else if (c4own_cache_age[s] < a1)
+            { a1 = c4own_cache_age[s]; s1 = (int)s; }
+        }
+
+        if (s0 < 0)
+            break;
+        if (s1 < 0)
+        {
+            if (c4own_flush_cache_slot((uint32_t)s0))
+                return 1;
+            continue;
+        }
+
+        pblk0 = c4own_alloc_pblk_pair(&hi);
+        if (pblk0 < 0)
+        {
+            if (c4own_flush_cache_slot((uint32_t)s0))
+                return 1;
+            continue;
+        }
+
+        c4pro_2p_batch++;
+        {
+            int r = c4own_flush_pair((uint32_t)s0, (uint32_t)s1, pblk0, hi,
+                                     c4own_pblk_bank((uint32_t)pblk0));
+            if (r == 1)
+                return 1;
+            if (r == 2)
+            {
+                c4own_used[pblk0] = 0;
+                c4own_used[hi] = 0;
+                if (c4own_flush_cache_slot((uint32_t)s0))
+                    return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+#endif /* C4PRO_NAND_2PLANE */
+#endif /* C4PRO_NAND_DIE_INTERLEAVE || C4PRO_NAND_2PLANE */
 
 static int c4own_flush_cache(void)
 {
 #ifdef C4PRO_NAND_DIE_INTERLEAVE
     return c4own_flush_batched(true);
+#elif defined(C4PRO_NAND_2PLANE)
+    return c4own_flush_batched_2plane(true);
 #else
     for (uint32_t slot = 0; slot < C4OWN_CACHE_SLOTS; slot++)
     {
@@ -2318,6 +2573,7 @@ load:
 
         if (old_pblk != 0xffffu)
         {
+            C4PRO_SET_PHASE(7);   /* cache-load fill read, see phase legend */
             if (c4own_read_phys_sector(old_pblk,
                                        C4OWN_SECTORS_PER_PAGE + payload,
                                        dst))
@@ -2470,6 +2726,9 @@ static int c4own_write_logical_block(uint32_t logical, uint32_t first,
     old_pblk = c4own_map[logical];
     gen = c4own_gen[logical] + 1u;
 
+#ifdef C4PRO_NAND_CACHE_PROGRAM
+    { extern volatile int c4pro_nand_cache_prog; c4pro_nand_cache_prog = 1; }
+#endif
     c4own_make_header(logical, gen);
     if (c4own_write_page(new_pblk, 0))
         goto fail;
@@ -2487,6 +2746,11 @@ static int c4own_write_logical_block(uint32_t logical, uint32_t first,
                 memcpy(dst, data + (payload - first) * 512u, 512);
             else if (old_pblk != 0xffffu)
             {
+                /* COW fill read. Phase 7 so a freeze here is distinguishable
+                 * from the page program (5): without this, the whole
+                 * program->fill-read->program alternation reported phase 5 and
+                 * the read engine could masquerade as a "program" wedge. */
+                C4PRO_SET_PHASE(7);
                 if (c4own_read_phys_sector(old_pblk,
                                            C4OWN_SECTORS_PER_PAGE + payload,
                                            dst))
@@ -2500,6 +2764,9 @@ static int c4own_write_logical_block(uint32_t logical, uint32_t first,
             goto fail;
     }
 
+#ifdef C4PRO_NAND_CACHE_PROGRAM
+    { extern volatile int c4pro_nand_cache_prog; c4pro_nand_cache_prog = 0; }
+#endif
     c4own_make_commit(logical, gen);
     if (c4own_write_page(new_pblk, C4OWN_PAGES_PER_BLOCK - 1u))
         goto fail;
@@ -2516,6 +2783,9 @@ static int c4own_write_logical_block(uint32_t logical, uint32_t first,
     return 0;
 
 fail:
+#ifdef C4PRO_NAND_CACHE_PROGRAM
+    { extern volatile int c4pro_nand_cache_prog; c4pro_nand_cache_prog = 0; }
+#endif
     c4own_retired[new_pblk] = 1;
     return 1;
 }
@@ -2588,6 +2858,11 @@ static int c4own_write_internal(uint32_t sector, uint32_t count,
          * C4PRO_FTL_FLUSH_KEEP dirty), but drain the excess in batches spread
          * across the 4 dies so their tPROG windows overlap. */
         if (c4own_flush_batched(false))
+            return 1;
+#elif defined(C4PRO_NAND_2PLANE)
+        /* Two-plane eager flush: drain excess dirty blocks in plane-pairs so each
+         * MLC tPROG programs two blocks at once (~2x). */
+        if (c4own_flush_batched_2plane(false))
             return 1;
 #else
         /* Bounded by construction: each successful c4own_flush_cache_slot clears
@@ -3389,6 +3664,131 @@ uint32_t ftl_init(void)
         }
     }
 #endif
+#ifdef C4PRO_NAND_2PLANE_TEST
+    /* Two-plane program validation + speed (DRAM RAM-run, SCRATCH blocks only, no
+     * FS touched -- this diag build loops forever below and never mounts). Proves
+     * the Micron two-plane sequence (0x80/0x11 .. 0x81/0x10) round-trips on this
+     * part, finds the plane STRIDE (which block-address bit pairs the two planes),
+     * and measures 2-plane vs single-plane KB/s. The stride is data-driven (ONFI)
+     * and not statically known, so we try candidate block-bit hypotheses and see
+     * which one both programs cleanly (status ok) AND round-trips BOTH planes to
+     * their distinct target blocks. Erases only scratch blocks on die 0. */
+    {
+        static unsigned char b0[4096], b1[4096], rb[4096];
+        const uint32_t PPB = C4OWN_PAGES_PER_BLOCK;      /* 128 pages/block */
+        const uint32_t BB  = 8000u;                      /* scratch base block */
+        /* stride candidates in ROW (page) units = plane-select block-bit guesses:
+         *   PPB        -> block bit 0  (adjacent block; most common Micron 2-plane)
+         *   8192*PPB   -> block bit 13 (die split into two plane-halves)
+         *   1024*PPB   -> block bit 10 */
+        static const uint32_t strides[] = { PPB, 8192u * PPB, 1024u * PPB };
+        const int NS = (int)(sizeof(strides) / sizeof(strides[0]));
+        uint32_t st[3];
+        int m0[3], m1[3];
+        int si, i, okstride = -1;
+        unsigned long kb2 = 0, kb1 = 0;
+
+        c4pro_nand_fmwait = 0x1081;
+        c4pro_nand_delay_iters = 50;
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "2PLANE TEST");
+        lcd_puts(0, 1, "probe strides...");
+        lcd_update();
+
+        for (si = 0; si < NS; si++)
+        {
+            uint32_t row0 = BB * PPB;
+            uint32_t row1 = row0 + strides[si];
+
+            for (i = 0; i < 4096; i++)
+            {
+                b0[i] = (unsigned char)(0xA0 + si + i * 7);
+                b1[i] = (unsigned char)(0x51 + si + i * 13);
+            }
+            c4pro_nand_erase_block(0, row0);
+            c4pro_nand_erase_block(0, row1);
+
+            st[si] = c4pro_nand_write_page_2plane(0, row0, row1, b0, b1, 8);
+
+            /* plane 0 must read back b0 from block(row0); plane 1 must read back
+             * b1 from block(row1), through the SAME hwecc decode the production
+             * (C4PRO_NAND_HWECC) FTL uses. mism = differing bytes, -1 = read fail. */
+            m0[si] = -1; m1[si] = -1;
+            if (!c4pro_nand_read_page_hwecc(0, row0, rb, 8))
+            {
+                m0[si] = 0;
+                for (i = 0; i < 4096; i++)
+                    if (rb[i] != (unsigned char)(0xA0 + si + i * 7))
+                        m0[si]++;
+            }
+            if (!c4pro_nand_read_page_hwecc(0, row1, rb, 8))
+            {
+                m1[si] = 0;
+                for (i = 0; i < 4096; i++)
+                    if (rb[i] != (unsigned char)(0x51 + si + i * 13))
+                        m1[si]++;
+            }
+            if (okstride < 0 && st[si] == 0 && m0[si] == 0 && m1[si] == 0)
+                okstride = si;
+        }
+
+        /* Speed: for the valid stride, time 128 two-plane programs (256 pages =
+         * 1 MiB) vs 256 single-plane hwecc programs over the same two scratch
+         * blocks -- both in the production (hwecc) layout. */
+        if (okstride >= 0)
+        {
+            uint32_t row0 = BB * PPB;
+            uint32_t row1 = row0 + strides[okstride];
+            const unsigned long bytes = 256ul * 4096ul;
+            long t0, dt;
+            int p;
+
+            lcd_puts(0, 1, "timing 2-plane...");
+            lcd_update();
+            c4pro_nand_erase_block(0, row0);
+            c4pro_nand_erase_block(0, row1);
+            t0 = current_tick;
+            for (p = 0; p < (int)PPB; p++)
+                c4pro_nand_write_page_2plane(0, row0 + (uint32_t)p,
+                                             row1 + (uint32_t)p, b0, b1, 8);
+            dt = current_tick - t0;
+            kb2 = dt > 0 ? (bytes * (unsigned long)HZ) /
+                  ((unsigned long)dt * 1024u) : 0;
+
+            lcd_puts(0, 1, "timing 1-plane...");
+            lcd_update();
+            c4pro_nand_erase_block(0, row0);
+            c4pro_nand_erase_block(0, row1);
+            t0 = current_tick;
+            for (p = 0; p < (int)PPB; p++)
+            {
+                c4pro_nand_write_page_hwecc(0, row0 + (uint32_t)p, b0, 8);
+                c4pro_nand_write_page_hwecc(0, row1 + (uint32_t)p, b1, 8);
+            }
+            dt = current_tick - t0;
+            kb1 = dt > 0 ? (bytes * (unsigned long)HZ) /
+                  ((unsigned long)dt * 1024u) : 0;
+        }
+
+        lcd_clear_display();
+        lcd_puts(0, 0, "2PLANE TEST");
+        for (si = 0; si < NS; si++)
+            lcd_putsf(0, 1 + si, "s%d st%lu m%d,%d", si,
+                      (unsigned long)st[si], m0[si], m1[si]);
+        if (okstride >= 0)
+            lcd_putsf(0, 4, "OK s%d 2P%lu 1P%lu", okstride, kb2, kb1);
+        else
+            lcd_puts(0, 4, "NO VALID STRIDE");
+        lcd_update();
+        while (1) {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
 #ifdef C4PRO_NAND_DELAY_SWEEP
     /* nand_delay sweep (DRAM RAM-run): the clock probe showed dropping the
      * post-command busy-wait from 10000 to 50 iters took reads 1462->5206 KB/s.
@@ -3558,7 +3958,7 @@ uint32_t ftl_init(void)
         static unsigned char rbuf[4096], rsp[128];
         const uint32_t PBASE = 8000u * C4OWN_PAGES_PER_BLOCK;
         const int NP = (int)C4OWN_PAGES_PER_BLOCK;
-        const int PASSES = 6;
+        const int PASSES = 4;
         const unsigned long bytes = (unsigned long)PASSES * NP * 4096u;
         static const uint32_t cand[] = {
             0x1081, 0x1041, 0x1021, 0x1011, 0x0821, 0x0421,
@@ -3574,17 +3974,6 @@ uint32_t ftl_init(void)
         lcd_puts(0, 1, "prep...");
         lcd_update();
 
-        c4pro_nand_fmwait = 0x1081;
-        c4pro_nand_erase_block(0, PBASE);
-        for (p = 0; p < NP; p++)
-        {
-            for (i = 0; i < 4096; i++)
-                wbuf[i] = (unsigned char)(p * 7 + i * 13 + 0x5a);
-            for (i = 0; i < 128; i++)
-                wsp[i] = (unsigned char)(p * 3 + i * 11 + 0x1d);
-            c4pro_nand_write_page(0, PBASE + (uint32_t)p, wbuf, wsp);
-        }
-
         for (ci = 0; ci < NC; ci++)
         {
             long t0, dt;
@@ -3594,15 +3983,31 @@ uint32_t ftl_init(void)
             lcd_update();
             c4pro_nand_fmwait = cand[ci];
 
+            /* WRITE at this timing. The measured bottleneck is the phase-1 data
+             * load (ld=3379us vs pg=524us tPROG), and FMWAIT paces exactly those
+             * per-sector FLCTL transfers -- so this write throughput is the real
+             * speed lever, not the read sweep the original harness did. Time
+             * PASSES full-block (512KB) programs, erasing before each. */
             t0 = current_tick;
             for (pass = 0; pass < PASSES; pass++)
+            {
+                c4pro_nand_erase_block(0, PBASE);
                 for (p = 0; p < NP; p++)
-                    c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p,
-                                                      rbuf, rsp);
+                {
+                    for (i = 0; i < 4096; i++)
+                        wbuf[i] = (unsigned char)(p * 7 + i * 13 + 0x5a);
+                    for (i = 0; i < 128; i++)
+                        wsp[i] = (unsigned char)(p * 3 + i * 11 + 0x1d);
+                    c4pro_nand_write_page(0, PBASE + (uint32_t)p, wbuf, wsp);
+                }
+            }
             dt = current_tick - t0;
             kbs[ci] = dt > 0 ? (bytes * (unsigned long)HZ) /
                       ((unsigned long)dt * 1024u) : 0;
 
+            /* Verify end-to-end AT THE SAME TIGHT TIMING (a baked-in FMWAIT paces
+             * both read and write), so the fastest value with bad=0 is the true
+             * safe timing. bad = read failures + data mis-compares. */
             for (p = 0; p < NP; p++)
             {
                 if (c4pro_nand_read_linear_page_spare(0, PBASE + (uint32_t)p,
@@ -3617,7 +4022,7 @@ uint32_t ftl_init(void)
         c4pro_nand_fmwait = 0x1081;
 
         lcd_clear_display();
-        lcd_puts(0, 0, "FMWAIT  kb/s  bad");
+        lcd_puts(0, 0, "FMWAIT w-kb/s bad");
         for (ci = 0; ci < NC; ci++)
             lcd_putsf(0, 1 + ci, "%04lx  %lu  b%d",
                       (unsigned long)cand[ci], kbs[ci], bad[ci]);

@@ -72,6 +72,7 @@ void INT_TIMER0(void)
         extern volatile bool c4pro_wdt_capture_enable;
         extern volatile unsigned long c4pro_irq_interrupted_pc;
         extern volatile uint32_t c4pro_hb_phase;
+        extern volatile uint32_t c4pro_nand_stage;
 
         if (c4pro_wdt_capture_enable)
         {
@@ -86,6 +87,26 @@ void INT_TIMER0(void)
              * samples innocent scheduler code, so this phase is what actually
              * localizes the wedged stage. */
             rec[3] = (unsigned long)c4pro_hb_phase;
+            /* Fine-grained NAND-op stage ((region<<8)|sector, see nand-rk27xx.c)
+             * -- discriminates staging-copy / engine-wait / tPROG-poll / read
+             * engine within the coarse phase. Plain DRAM copy: NEVER read NANDC
+             * registers here (a wedged slave port would stall this ISR too). */
+            rec[4] = (unsigned long)c4pro_nand_stage;
+            /* Positive control + posted-write catcher: rec[4] is a duty-cycle
+             * sample (this ISR runs at most every tick, so a freeze shows the
+             * LAST tick's value, biased toward long-lived states). rec[5]/rec[6]
+             * remember the last NONZERO stage and the tick it was seen at:
+             *  - rec[5]==0 across a whole write session => the marker plumbing
+             *    itself is broken (we have never yet seen a nonzero st);
+             *  - rec[5]!=0 with rec[6]==rec[2] (age 0) => a NANDC op region was
+             *    entered within the final tick -- convicts that region even when
+             *    rec[4] sampled the idle gap (e.g. a posted boundary write that
+             *    wedges the port only when the NEXT bus access lands). */
+            if (c4pro_nand_stage != 0)
+            {
+                rec[5] = (unsigned long)c4pro_nand_stage;
+                rec[6] = (unsigned long)current_tick;
+            }
 
             WDTLR = C4PRO_WDT_CAPTURE_RELOAD;
         }

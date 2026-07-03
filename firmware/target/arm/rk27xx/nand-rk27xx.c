@@ -446,10 +446,17 @@ static const struct nand_device_info_type c4pro_micron_2cd9d53e88 =
 static long last_activity = 0;
 
 /* NAND interface wait-state timing (AHB0_NANDC+0x04). 0x1081 is the original
- * conservative value; every read/write programs it from here so a DRAM sweep
- * can find the fastest value the NAND still reads correctly at (stock runs
- * tighter timing -> ~6.7 MB/s vs our ~1.4). Lower = faster but risks errors. */
-uint32_t c4pro_nand_fmwait = 0x1081;
+ * conservative value and the shipped default. The FMWAIT sweep that suggested
+ * 0x1041 (2.4x) was measured on the RAW write path (c4pro_nand_write_page,
+ * FMWAIT-paced byte PIO); the production hwecc path stages through PAGE_BUF +
+ * the BCH engine (FLCTL=0xA26), which FMWAIT does NOT pace, so on the real
+ * write path 0x1041 gave no measurable benefit -- keep the wide-margin timing
+ * (it paces every boot/FTL read too). Overridable for re-sweeps via
+ * -DC4PRO_NAND_FMWAIT_VALUE. */
+#ifndef C4PRO_NAND_FMWAIT_VALUE
+#define C4PRO_NAND_FMWAIT_VALUE 0x1081u
+#endif
+uint32_t c4pro_nand_fmwait = C4PRO_NAND_FMWAIT_VALUE;
 
 /* Post-command settle busy-wait. The original 10000 iters (~150-250us) ran
  * several times per page ON TOP of the real nand_wait_ready() FM_RDY poll and
@@ -509,6 +516,51 @@ static void nand_delay(void)
 #define C4PRO_NAND_STATUS_POLL_SPACING 20
 #endif
 
+#ifdef C4PRO_WDT_CRASH_CAPTURE
+/* Fine-grained NAND-op stage marker for the WDT crash capture (rec[4]). The
+ * coarse phase marker (c4pro_hb_phase=5) spans the WHOLE c4own_write_page call
+ * region including the COW-fill reads between programs, so it cannot tell which
+ * access actually wedged the NANDC slave port. This marker pinpoints the
+ * instruction region: (region << 8) | sector, where region is
+ *   1 = staging copy into PAGE_BUF/SPARE_BUF   (program path)
+ *   2 = FL_RDY wait after firing the sector transfer (program path)
+ *   3 = program-confirm 0x10 issued, tPROG completion poll
+ *   4 = FL_RDY wait after firing a read sector transfer (hwecc read path)
+ *   5 = drain copy out of PAGE_BUF               (hwecc read path)
+ *   6 = write-op entry (FL_RST / select / ready wait)
+ *   7 = write-op cmd/addr issue (0x80 + row)
+ *   8 = deselect (per-op FMCTL write, both paths)
+ *   9 = read-op cmd/addr issue (0x00 + row + 0x30)
+ *   A = read-op tR ready wait
+ *   0 = idle / op completed
+ * Plain DRAM stores only -- the tick ISR must NEVER read NANDC registers to
+ * capture this (a wedged slave port would stall the capturer itself). */
+volatile uint32_t c4pro_nand_stage;
+#define NAND_STAGE(x) (c4pro_nand_stage = (x))
+#else
+#define NAND_STAGE(x) do { } while (0)
+#endif
+
+/* Per-sector BCH control value, written FRESH (no read-modify-write) under
+ * C4PRO_NAND_BCH_NO_RMW. The default RMW pattern (BCHCTL = (BCHCTL & ~0x1C03) |
+ * ...) READS BCHCTL while the BCH engine may be mid-encode/decode -- an access
+ * type stock provably never performs (its trigger routine at 0x60081214 writes a
+ * fresh-computed BCHCTL, and never reads it). A CPU read of a busy engine's
+ * control register is the prime remaining suspect for the residual phase-5 AHB
+ * slave-port stall, and this is the last "we do, stock doesn't" divergence in
+ * the pinpointed region. The fresh value is fully determined: entry code sets
+ * BCHCTL = 1 (strength-8 preset, bit13=0), so nothing outside bits 0,1,10,11
+ * ever needs preserving. */
+#ifdef C4PRO_NAND_BCH_NO_RMW
+#define C4PRO_BCHCTL_WR(bank)  (BCHCTL = 3u | (((bank) & 3u) << 10))
+#define C4PRO_BCHCTL_RD(bank)  (BCHCTL = 1u | (((bank) & 3u) << 10))
+#else
+#define C4PRO_BCHCTL_WR(bank) \
+    (BCHCTL = (BCHCTL & ~0x1C03u) | 1u | 2u | (((bank) & 3u) << 10))
+#define C4PRO_BCHCTL_RD(bank) \
+    (BCHCTL = (BCHCTL & ~0x1C03u) | 1u | (((bank) & 3u) << 10))
+#endif
+
 #ifdef C4PRO_NAND_SPACED_POLL
 #ifndef C4PRO_NAND_POLL_SPACING
 #define C4PRO_NAND_POLL_SPACING 24
@@ -551,9 +603,24 @@ static bool nand_wait_fl_ready(void)
     return false;
 }
 
+#ifdef C4PRO_NAND_FMCTL_NO_RMW
+/* Cached FMCTL non-CE bits (bit4 FM_PROTECT is the only writable one; bit5
+ * FM_RDY is read-only status), snapshotted once at nand_device_init() while the
+ * controller is quiescent. Lets select/deselect write FMCTL fresh instead of
+ * read-modify-write: the st=0x000/phase=5 freeze localization puts the residual
+ * AHB wedge at the op BOUNDARY, exactly where these two per-op FMCTL READS live
+ * -- the same CPU-reads-NANDC-register-at-engine-transition pattern whose
+ * elimination on BCHCTL (C4PRO_NAND_BCH_NO_RMW) already dropped the wedge
+ * frequency (host format went from always-freezing to passing). Default covers
+ * the pre-init window (WP# high = writes permitted), overwritten at init. */
+static unsigned long c4pro_nand_fmctl_base = FM_PROTECT;
+#endif
+
 static void nand_select(uint32_t bank)
 {
+#ifndef C4PRO_NAND_FMCTL_NO_RMW
     unsigned long ctl = FMCTL;
+#endif
 
 #ifdef COLORFLY_C4_PRO
     /* Re-assert the NAND CS2/CS3 pin-mux on every select. These IOMUXA bits
@@ -561,19 +628,38 @@ static void nand_select(uint32_t bank)
      * (i2c_iomux) transiently clears them; re-asserting here guarantees the
      * pins carry the NAND-CS function for this access regardless of I2C timing,
      * so a volume-change I2C write can never corrupt a concurrent die-2/3 read.
-     * Mirrors the setup in nand_device_init(). */
-    SCU_IOMUXA_CON = (SCU_IOMUXA_CON & ~((3u << 14) | (3u << 16))) |
-                     IOMUX_NAND_CS1 | IOMUX_NAND_CS2 | IOMUX_NAND_CS3;
+     * Mirrors the setup in nand_device_init().
+     * C4PRO_NAND_IOMUX_DIE0_SKIP: die 0's CE#0 is a dedicated NAND pin that
+     * needs no mux, so for bank-0 ops the reassert is pure overhead -- and it is
+     * a per-op SCU read-modify-write sitting exactly in the op-boundary window
+     * the residual freeze localizes to. Skipping it for bank 0 removes the last
+     * boundary register READ for die-0 traffic (which is where mkfs/dd land)
+     * while keeping the corruption guard for dies 1-3. */
+#ifdef C4PRO_NAND_IOMUX_DIE0_SKIP
+    if (bank != 0)
+#endif
+    {
+        SCU_IOMUXA_CON = (SCU_IOMUXA_CON & ~((3u << 14) | (3u << 16))) |
+                         IOMUX_NAND_CS1 | IOMUX_NAND_CS2 | IOMUX_NAND_CS3;
+    }
 #endif
 
+#ifdef C4PRO_NAND_FMCTL_NO_RMW
+    FMCTL = c4pro_nand_fmctl_base | (1u << bank);
+#else
     ctl &= 0xf0;
     ctl |= 1u << bank;
     FMCTL = ctl;
+#endif
 }
 
 static void nand_deselect(void)
 {
+#ifdef C4PRO_NAND_FMCTL_NO_RMW
+    FMCTL = c4pro_nand_fmctl_base;
+#else
     FMCTL &= 0xf0;
+#endif
 }
 
 static bool nand_wait_ready_erase(void)
@@ -1414,16 +1500,42 @@ uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
  * 512-data + 16-spare per sector. `data` is nsec*512 bytes; the 3 free spare
  * bytes/sector are written 0xFF (parity fills the rest). Deltas vs the read
  * trigger: FLCTL 0xA24->0xA26 (FL_WR), BCHCTL |1 -> |3 (generate direction). */
+#ifdef C4PRO_USB_RX_TIMING
+/* Per-page write cost split: LD = the 8 per-sector BCH FLCTL loads (0xA26 +
+ * nand_wait_fl_ready), TP = the 0x10 program-confirm + tPROG completion wait.
+ * Tells us which half of the ~1.37ms/page to attack. */
+volatile uint32_t c4pro_wp_load_sum, c4pro_wp_tprog_sum, c4pro_wp_cnt;
+volatile uint32_t c4pro_wp_start_sum;   /* entry nand_wait_ready = prev tPROG */
+#endif
+
+#ifdef C4PRO_NAND_CACHE_PROGRAM
+/* When set, c4pro_nand_write_page_hwecc confirms with 0x11 (cache program)
+ * instead of 0x10: the die commits the page to the array in the BACKGROUND and
+ * frees its page/cache register immediately, so the NEXT page's data load (LD)
+ * overlaps the previous page's array program (SW/tPROG) -- SW+LD collapses to
+ * max(SW,LD). The caller must program the LAST page of a run with the flag
+ * CLEAR (plain 0x10 + full tPROG wait) to guarantee the final page commits
+ * before the block is considered durable. */
+volatile int c4pro_nand_cache_prog;
+#endif
+
 uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
                                      const void* databuffer, uint32_t nsec)
 {
     unsigned s, i;
     const unsigned char *data = databuffer;
     unsigned status;
+#ifdef C4PRO_USB_RX_TIMING
+    uint32_t _wp_t0 = 0, _wp_t1 = 0, _wp_ts = 0;
+#endif
 
     if (bank > 3 || !data || nsec == 0 || nsec > 8)
         return 1;
+#ifdef C4PRO_USB_RX_TIMING
+    _wp_ts = TMR2CVR;
+#endif
 
+    NAND_STAGE(0x600u);   /* write-op entry: FL_RST/select/ready wait */
     FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
@@ -1435,8 +1547,12 @@ uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
         return 1;
     }
 
+#ifdef C4PRO_USB_RX_TIMING
+    c4pro_wp_start_sum += (_wp_ts - TMR2CVR) & 0xFFFFFFFFu;
+#endif
     BCHCTL = 1;   /* strength-8 preset leaves bit13=0 */
 
+    NAND_STAGE(0x700u);   /* write-op cmd/addr issue */
     /* serial data input: 0x80 + col=0 + 3 row bytes */
     FLASH_CMD(bank) = 0x80;
     FLASH_ADDR(bank) = 0x00;
@@ -1445,6 +1561,9 @@ uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
     FLASH_ADDR(bank) = (page >> 8) & 0xff;
     FLASH_ADDR(bank) = (page >> 16) & 0xff;
 
+#ifdef C4PRO_USB_RX_TIMING
+    _wp_t0 = TMR2CVR;
+#endif
     for (s = 0; s < nsec; s++)
     {
         volatile unsigned char *pb =
@@ -1452,14 +1571,27 @@ uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
         volatile unsigned char *sb =
             (volatile unsigned char *)&SPARE_BUF + ((s & 3) << 4);
 
-        for (i = 0; i < 512; i++)
-            pb[i] = data[s * 512 + i];
-        for (i = 0; i < 16; i++)
-            sb[i] = 0xff;
+        NAND_STAGE(0x100u | s);
+        /* 32-bit word copy into on-chip PAGE_BUF (was a 512-iter byte loop =
+         * 4096 MMIO stores/page). PAGE_BUF slot is 512-aligned and c4own_page_data
+         * is word-aligned, so this is safe and ~4x fewer AHB stores -- shaving the
+         * staging portion of LD. Mirrors c4pro_nand_prog_pages_hwecc_multi. */
+        {
+            volatile uint32_t *pbw = (volatile uint32_t *)pb;
+            const uint32_t *dw = (const uint32_t *)(data + s * 512);
+            for (i = 0; i < 512u / 4u; i++)
+                pbw[i] = dw[i];
+        }
+        {
+            volatile uint32_t *sbw = (volatile uint32_t *)sb;
+            for (i = 0; i < 16u / 4u; i++)
+                sbw[i] = 0xffffffffu;
+        }
 
         FLCTL = FL_RST;
-        BCHCTL = (BCHCTL & ~0x1C03u) | 1u | 2u | ((bank & 3u) << 10);
+        C4PRO_BCHCTL_WR(bank);
         /* FL_WR|FL_START|(1 sector)|FL_XFER_EN|FL_COR_EN + start-sector */
+        NAND_STAGE(0x200u | s);
         FLCTL = 0xA26u | ((s & 3u) << 3);
         if (!nand_wait_fl_ready())
         {
@@ -1468,7 +1600,19 @@ uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
         }
     }
 
+#ifdef C4PRO_USB_RX_TIMING
+    _wp_t1 = TMR2CVR;
+    c4pro_wp_load_sum += (_wp_t0 - _wp_t1) & 0xFFFFFFFFu;
+    c4pro_wp_cnt++;
+#endif
+    NAND_STAGE(0x300u);
+#ifdef C4PRO_NAND_CACHE_PROGRAM
+    /* 0x11 = cache program (pipeline tPROG under the next page's load); plain
+     * 0x10 for the flag-clear last page so the block fully commits. */
+    FLASH_CMD(bank) = c4pro_nand_cache_prog ? 0x11u : 0x10u;
+#else
     FLASH_CMD(bank) = 0x10;   /* program confirm */
+#endif
 
 #ifdef C4PRO_NAND_STATUS_POLL
     /* Stock program-completion discipline (SYSTEM_BASE.RKW @0x60082c50): poll the
@@ -1506,11 +1650,152 @@ uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
     FLASH_CMD(bank) = 0x70;
     status = FLASH_DATA(bank);
 #endif
+#ifdef C4PRO_USB_RX_TIMING
+    c4pro_wp_tprog_sum += (_wp_t1 - TMR2CVR) & 0xFFFFFFFFu;
+#endif
+    NAND_STAGE(0x800u);   /* deselect (per-op FMCTL write) */
     nand_deselect();
+    NAND_STAGE(0);
     last_activity = current_tick;
 
     return (status & 0x01) ? 4 : 0;   /* bit0 = program FAIL */
 }
+
+#if defined(C4PRO_NAND_2PLANE) || defined(C4PRO_NAND_2PLANE_TEST)
+/* Stage one plane's payload into the FMC via the SAME proven per-sector BCH path
+ * as c4pro_nand_write_page_hwecc (PAGE_BUF slots + FLCTL=0xA26|((s&3)<<3)). The
+ * 0x80/0x81 serial-input command must already be open for this plane.
+ * HARDWARE-BCH inline 512+16 layout -- the layout every stable production build
+ * uses (all S-series/DAILY builds define C4PRO_NAND_HWECC), so pages read back
+ * via c4pro_nand_read_page_hwecc byte-identically to single-plane writes. */
+static bool c4pro_2plane_stage(uint32_t bank, const unsigned char *data,
+                               unsigned nsec)
+{
+    unsigned s, i;
+    for (s = 0; s < nsec; s++)
+    {
+        volatile unsigned char *pb =
+            (volatile unsigned char *)&PAGE_BUF + ((s & 3) << 9);
+        volatile unsigned char *sb =
+            (volatile unsigned char *)&SPARE_BUF + ((s & 3) << 4);
+        volatile uint32_t *pbw = (volatile uint32_t *)pb;
+        const uint32_t *dw = (const uint32_t *)(data + s * 512);
+        volatile uint32_t *sbw = (volatile uint32_t *)sb;
+
+        for (i = 0; i < 512u / 4u; i++)
+            pbw[i] = dw[i];
+        for (i = 0; i < 16u / 4u; i++)
+            sbw[i] = 0xffffffffu;
+
+        FLCTL = FL_RST;
+        C4PRO_BCHCTL_WR(bank);
+        FLCTL = 0xA26u | ((s & 3u) << 3);
+        if (!nand_wait_fl_ready())
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Two-plane page program -- the stock ~6.7 MB/s lever (2 pages per single tPROG).
+ *
+ * Programs plane 0 at row0 and plane 1 at row1 in ONE array-program using the
+ * Micron two-plane sequence (verified from rkboot_s3.bin program fn 0x60707afc,
+ * agent disassembly 2026-07-03; stride + round-trip + 2x speed validated
+ * on-device via C4PRO_NAND_2PLANE_TEST: s0 st0 m0,0, 8533 vs 4266 KB/s):
+ *     0x80 - addr(row0) - data0 - 0x11   (plane-0 serial input + dummy confirm)
+ *     0x81 - addr(row1) - data1 - 0x10   (plane-1 serial input + final commit)
+ *     0x70  status                        (bit0 = unified two-plane P/F)
+ * Payload staging per plane reuses the proven single-plane hwecc BCH path
+ * (c4pro_2plane_stage); only the command bytes and the two-phase wrapper differ,
+ * so pages are byte-identical on read via c4pro_nand_read_page_hwecc.
+ *
+ * row1 MUST be row0 with ONLY the plane block-address bit toggled (bit 0 of the
+ * block address = +128 in row units -- the on-device-validated stride): same die,
+ * same page-in-block, same column.
+ *
+ * DANGER (validated the hard way): emitting 0x11 WITHOUT the matching
+ * 0x81..0x10 second phase corrupts silently -- never split the two phases.
+ */
+uint32_t c4pro_nand_write_page_2plane(uint32_t bank, uint32_t row0, uint32_t row1,
+                                      const void *buf0, const void *buf1,
+                                      uint32_t nsec)
+{
+    unsigned status;
+
+    if (bank > 3 || !buf0 || !buf1 || nsec == 0 || nsec > 8)
+        return 1;
+
+    NAND_STAGE(0x2100u);   /* 2plane entry: FL_RST/select/ready wait */
+    FMWAIT = c4pro_nand_fmwait;
+    FLCTL = FL_RST;
+    nand_select(bank);
+    nand_prog_delay();
+    if (!nand_wait_ready())
+    {
+        nand_deselect();
+        NAND_STAGE(0);
+        return 1;
+    }
+    BCHCTL = 1;
+
+    /* ---- PHASE 0: plane 0 serial input, then dummy program confirm 0x11 ---- */
+    NAND_STAGE(0x2200u);   /* plane-0 cmd/addr + staging */
+    FLASH_CMD(bank) = 0x80;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = row0 & 0xff;
+    FLASH_ADDR(bank) = (row0 >> 8) & 0xff;
+    FLASH_ADDR(bank) = (row0 >> 16) & 0xff;
+    if (!c4pro_2plane_stage(bank, buf0, nsec))
+    {
+        /* No confirm was issued yet: the open 0x80 serial-input is cleanly
+         * superseded by the next op's command, but reset anyway for symmetry. */
+        goto abort_reset;
+    }
+    NAND_STAGE(0x2300u);   /* 0x11 dummy confirm wait */
+    FLASH_CMD(bank) = 0x11;   /* plane-0 dummy confirm (no array program yet) */
+    if (!nand_wait_ready())
+        goto abort_reset;
+
+    /* ---- PHASE 1: plane 1 serial input, then final two-plane commit 0x10 ---- */
+    NAND_STAGE(0x2400u);   /* plane-1 cmd/addr + staging */
+    FLASH_CMD(bank) = 0x81;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = 0x00;
+    FLASH_ADDR(bank) = row1 & 0xff;
+    FLASH_ADDR(bank) = (row1 >> 8) & 0xff;
+    FLASH_ADDR(bank) = (row1 >> 16) & 0xff;
+    if (!c4pro_2plane_stage(bank, buf1, nsec))
+        goto abort_reset;
+    NAND_STAGE(0x2500u);   /* 0x10 final commit: shared tPROG for both planes */
+    FLASH_CMD(bank) = 0x10;   /* final commit -> ONE tPROG programs both planes */
+    if (!nand_wait_ready())
+        goto abort_reset;
+
+    FLASH_CMD(bank) = 0x70;
+    status = FLASH_DATA(bank);
+    nand_deselect();
+    NAND_STAGE(0);
+    last_activity = current_tick;
+
+    return (status & 0x01) ? 4 : 0;   /* bit0 = unified two-plane FAIL */
+
+abort_reset:
+    /* Never leave the die parked mid two-plane sequence: once 0x11 has been
+     * issued, ANY next command other than the 0x81..0x10 continuation is
+     * out-of-spec and corrupts silently (the retry path programs this same die
+     * single-plane). 0xFF device RESET aborts the pending multi-plane state;
+     * wait out tRST before releasing the die. Also issued for pre-0x11 bails --
+     * harmless and keeps one recovery path. */
+    NAND_STAGE(0x2600u);   /* abort: 0xFF device reset wait */
+    FLASH_CMD(bank) = 0xff;
+    nand_wait_ready();
+    nand_deselect();
+    NAND_STAGE(0);
+    return 3;
+}
+#endif /* C4PRO_NAND_2PLANE || C4PRO_NAND_2PLANE_TEST */
 
 /* Hardware-ECC page read, matching c4pro_nand_write_page_hwecc's inline
  * 512+16-per-sector layout. Unlike nand_read_page() (which re-seeks half 1 at
@@ -1540,6 +1825,7 @@ uint32_t c4pro_nand_read_page_hwecc(uint32_t bank, uint32_t page,
 
     BCHCTL = 1;
 
+    NAND_STAGE(0x900u);   /* read-op cmd/addr issue */
     FLASH_CMD(bank) = 0x00;
     FLASH_ADDR(bank) = 0x00;
     FLASH_ADDR(bank) = 0x00;
@@ -1548,6 +1834,7 @@ uint32_t c4pro_nand_read_page_hwecc(uint32_t bank, uint32_t page,
     FLASH_ADDR(bank) = (page >> 16) & 0xff;
     FLASH_CMD(bank) = 0x30;
 
+    NAND_STAGE(0xA00u);   /* read-op tR wait after 0x30 */
     nand_delay();
     if (!nand_wait_ready())
     {
@@ -1561,19 +1848,25 @@ uint32_t c4pro_nand_read_page_hwecc(uint32_t bank, uint32_t page,
         volatile unsigned char *pb =
             (volatile unsigned char *)&PAGE_BUF + ((s & 3) << 9);
 
-        BCHCTL = (BCHCTL & ~0x1C03u) | 1u | ((bank & 3u) << 10);
+        C4PRO_BCHCTL_RD(bank);
+        NAND_STAGE(0x400u | s);
         FLCTL = 0xA24u | ((s & 3u) << 3);
         if (!nand_wait_fl_ready())
         {
             nand_deselect();
             return 2;
         }
+        /* BCHST read happens with the engine already FL_RDY-idle, unlike the
+         * (optional) BCHCTL RMW above which reads mid-run -- keep it. */
         c4pro_nand_last_bchst |= BCHST;   /* OR of every sector's BCH status */
+        NAND_STAGE(0x500u | s);
         for (i = 0; i < 512; i++)
             data[s * 512 + i] = pb[i];
     }
 
+    NAND_STAGE(0x800u);   /* deselect (per-op FMCTL write) */
     nand_deselect();
+    NAND_STAGE(0);
     last_activity = current_tick;
     return 0;
 }
@@ -1635,6 +1928,7 @@ uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page)
     if (bank > 3)
         return 1;
 
+    NAND_STAGE(0xB00u);   /* erase entry/issue */
     FMWAIT = c4pro_nand_fmwait;
     FLCTL = FL_RST;
 
@@ -1653,6 +1947,7 @@ uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page)
     FLASH_ADDR(bank) = (page >> 16) & 0xff;
     FLASH_CMD(bank) = 0xd0;
 
+    NAND_STAGE(0xC00u);   /* tERASE wait */
     if (!nand_wait_ready_erase())
     {
         nand_deselect();
@@ -1661,7 +1956,9 @@ uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page)
 
     FLASH_CMD(bank) = 0x70;
     status = FLASH_DATA(bank);
+    NAND_STAGE(0x800u);   /* deselect */
     nand_deselect();
+    NAND_STAGE(0);
     last_activity = current_tick;
 
     return (status & 1) ? 1 : 0;
@@ -1766,6 +2063,11 @@ uint32_t c4pro_nand_erase_blocks_multi(const uint32_t *banks,
  * before any wait). Returns a bitmask: bit i set if die i failed a pre-check,
  * FL transfer, or reported program-fail status.
  */
+#ifdef C4PRO_USB_RX_TIMING
+volatile uint32_t c4pro_ml_load_sum, c4pro_ml_load_cnt, c4pro_ml_prog_sum;
+static uint32_t c4pro_ml_p1_save;
+#endif
+
 uint32_t c4pro_nand_prog_pages_hwecc_multi(const uint32_t *banks,
                                            const uint32_t *pages,
                                            const void *const *datas,
@@ -1781,6 +2083,9 @@ uint32_t c4pro_nand_prog_pages_hwecc_multi(const uint32_t *banks,
 
     FMWAIT = c4pro_nand_fmwait;
 
+#ifdef C4PRO_USB_RX_TIMING
+    uint32_t _ml_p0 = TMR2CVR;
+#endif
     /* Phase 1: stage each die's page and fire 0x10; do NOT wait tPROG so the
      * per-die array-program windows overlap. */
     for (i = 0; i < n; i++)
@@ -1835,7 +2140,7 @@ uint32_t c4pro_nand_prog_pages_hwecc_multi(const uint32_t *banks,
                 sbw[k] = 0xffffffffu;
 
             FLCTL = FL_RST;
-            BCHCTL = (BCHCTL & ~0x1C03u) | 1u | 2u | ((bank & 3u) << 10);
+            C4PRO_BCHCTL_WR(bank);
             /* FL_WR|FL_START|(1 sector)|FL_XFER_EN|FL_COR_EN + start-sector */
             FLCTL = 0xA26u | ((s & 3u) << 3);
             if (!nand_wait_fl_ready())
@@ -1855,6 +2160,20 @@ uint32_t c4pro_nand_prog_pages_hwecc_multi(const uint32_t *banks,
         nand_deselect();
     }
 
+#ifdef C4PRO_USB_RX_TIMING
+    /* Split the multi-die program: LOAD = phase-1 serial staging+FLCTL transfer
+     * of all n dies (does NOT overlap across dies); PROG = phase-2 tPROG wait
+     * (DOES overlap). If LOAD >> PROG, die-interleave can't help -- the data-load
+     * is the wall, and the fix is that path, not more dies. */
+    {
+        extern volatile uint32_t c4pro_ml_load_sum, c4pro_ml_load_cnt;
+        extern volatile uint32_t c4pro_ml_prog_sum;
+        uint32_t _ml_p1 = TMR2CVR;
+        c4pro_ml_load_sum += (_ml_p0 - _ml_p1) & 0xFFFFFFFFu;
+        c4pro_ml_load_cnt++;
+        c4pro_ml_p1_save = _ml_p1;
+    }
+#endif
     /* Phase 2: by the time we poll die i, dies 0..i-1 have been programming
      * since phase 1, so total wall time approaches one tPROG plus per-die
      * transfer overhead rather than n * tPROG. */
@@ -1882,6 +2201,12 @@ uint32_t c4pro_nand_prog_pages_hwecc_multi(const uint32_t *banks,
             fail |= 1u << i;
     }
 
+#ifdef C4PRO_USB_RX_TIMING
+    {
+        extern volatile uint32_t c4pro_ml_prog_sum;
+        c4pro_ml_prog_sum += (c4pro_ml_p1_save - TMR2CVR) & 0xFFFFFFFFu;
+    }
+#endif
     last_activity = current_tick;
     return fail;
 }
@@ -1938,6 +2263,16 @@ uint32_t nand_reset(uint32_t bank)
 uint32_t nand_device_init(void)
 {
     SCU_CLKCFG &= ~CLKCFG_NAND;
+
+#ifdef C4PRO_NAND_FMCTL_NO_RMW
+    /* One-time snapshot of FMCTL's non-CE bits while the controller is
+     * quiescent (clock just ungated, no op in flight) so per-op select/deselect
+     * never has to READ FMCTL again. Force FM_PROTECT (WP# high) into the base:
+     * if the boot path happened to leave WP asserted at snapshot time, every
+     * later program/erase would silently fail (a possible cause of dead-looking
+     * cold boots). All writes legitimately require WP# high anyway. */
+    c4pro_nand_fmctl_base = (FMCTL & 0xf0u) | FM_PROTECT;
+#endif
 
 #ifdef COLORFLY_C4_PRO
     /*

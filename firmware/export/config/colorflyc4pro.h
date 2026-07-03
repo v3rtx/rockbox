@@ -145,6 +145,38 @@
  * read in diag. Freeze-sensitive path -> validate with crash-capture + multiple
  * runs. */
 
+/* C4PRO_USB_RX_STALL_KICK (OPT-IN): serve-loop watchdog for the residual
+ * sustained-write freeze -- the armed bulk-OUT receive (phase 13) silently never
+ * completing, which the host punishes ~30s later with a bus reset that wedges
+ * the AHB. On "phase 13 + zero RX completions for 2s" the main thread kicks the
+ * receive engine (abort+RXCLR+re-arm at the same position; safe because nothing
+ * was ACKed). See c4pro_usb_rx_stall_kick() in usb-drv-rk27xx.c. */
+
+/* Phase markers must be live whenever the WDT crash capture is, not only with
+ * the LCD heartbeat: a captured freeze with the USB phases (1,2,10-13) compiled
+ * out reports a STALE FTL phase and misdirects the investigation (this exact
+ * mistake pointed the residual-freeze hunt at the NAND boundary while the
+ * thread was actually hanging in the USB CSW/receive path). */
+#if defined(C4PRO_BOOT_HEARTBEAT) || defined(C4PRO_WDT_CRASH_CAPTURE)
+#define C4PRO_PHASE_MARK
+#endif
+
+/* Residual phase-5 wedge, stage-1 instruments/fix (see nand-rk27xx.c):
+ * - C4PRO_NAND_BCH_NO_RMW (OPT-IN): write BCHCTL fresh per sector instead of the
+ *   read-modify-write. The RMW READS the BCH engine's control register while it
+ *   may be mid-encode -- an access stock provably never makes (its trigger
+ *   routine writes a fresh-computed BCHCTL and never reads it), and the last
+ *   "we do, stock doesn't" divergence left in the wedge region after
+ *   serialize/spaced-poll/status-poll were exhausted.
+ * - c4pro_nand_stage marker (automatic with C4PRO_WDT_CRASH_CAPTURE):
+ *   fine-grained (region<<8)|sector stage in the WDT crash record (rec[4],
+ *   "st=" on the FREEZE screen), discriminating staging-copy / program-engine
+ *   wait / tPROG poll / read-engine wait -- plus FTL phase 7 for the COW-fill
+ *   reads that previously masqueraded as phase 5.
+ * - C4PRO_NAND_WRITE_STRESS (OPT-IN, diagnostic build): standalone FTL write
+ *   hammer with USB never attached, to discriminate a pure-NANDC wedge from a
+ *   UDC-presence-dependent one. */
+
 /* Default-ON crash fix (active only in the USB-MSC build): if a stray INT_UDC
  * reaches UIRQ during the FTL sync-flush of a sustained copy, ACK it instead of
  * panicking (see UIRQ in system-rk27xx.c). Define C4PRO_USB_NO_UDC_IRQ_FIX to
@@ -271,6 +303,27 @@
  * top to check every page (paranoid, much slower). */
 #if defined(C4PRO_NAND_DIE_INTERLEAVE) && !defined(C4PRO_NAND_HWECC)
 #error "C4PRO_NAND_DIE_INTERLEAVE requires C4PRO_NAND_HWECC"
+#endif
+
+/* Two-plane write path (OPT-IN, enable with -DC4PRO_NAND_2PLANE). The stock
+ * ~6.7 MB/s lever: this Micron MLC part programs TWO adjacent-block pages (plane 0
+ * = block P, plane 1 = block P+1, differing only in block bit 0) in a SINGLE array
+ * tPROG via the 0x80/0x11..0x81/0x10 sequence. The flush pairs two dirty cache
+ * blocks onto a fresh plane-pair, halving the per-page tPROG cost (sequence,
+ * block-bit-0 stride, round-trip and 2x speed all validated on-device). Each block
+ * is written in the SAME hwecc inline 512+16 layout as the single-plane writer
+ * (c4pro_nand_write_page_hwecc), so it is byte-identical on NAND to a serial write
+ * and the reader, mount scan and checkpoint are UNCHANGED -- existing volumes keep
+ * mounting and it is a pure write-side scheduling change (no reformat). Requires
+ * C4PRO_NAND_HWECC (every production build defines it -- a build without it uses
+ * the incompatible software-BCH layout and corrupts: this exact mismatch caused
+ * the 2026-07-03 bad-md5/vanished-disk regression). Mutually exclusive with
+ * C4PRO_NAND_DIE_INTERLEAVE (both replace the serial flush). */
+#if defined(C4PRO_NAND_2PLANE) && !defined(C4PRO_NAND_HWECC)
+#error "C4PRO_NAND_2PLANE requires C4PRO_NAND_HWECC (production layout is hwecc inline 512+16)"
+#endif
+#if defined(C4PRO_NAND_2PLANE) && defined(C4PRO_NAND_DIE_INTERLEAVE)
+#error "C4PRO_NAND_2PLANE and C4PRO_NAND_DIE_INTERLEAVE are mutually exclusive"
 #endif
 
 /* Default-ON crash fix: iteration-cap the cache-op busy-waits (CACHEOP) in

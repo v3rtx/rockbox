@@ -173,8 +173,12 @@ volatile int c4pro_usb_storage_diag_storage_write_result;
  * the usb thread died in the storage/NAND path; if it freezes together with
  * the tick, the whole scheduler stalled. Painted by apps/main.c. */
 volatile unsigned long c4pro_hb_usb;
+#endif
+#ifdef C4PRO_PHASE_MARK
 /* Write-path phase marker (defined in ftl-rk27xx.c); set here to 2 just before
- * dispatching a NAND write and back to 1 when it returns. */
+ * dispatching a NAND write and back to 1 when it returns. Gated on PHASE_MARK
+ * (heartbeat OR crash capture): with the USB phases dark, a captured freeze
+ * reports a stale FTL phase and misleads (see colorflyc4pro.h). */
 extern volatile uint32_t c4pro_hb_phase;
 #endif
 
@@ -633,23 +637,37 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
                     c4pro_usb_storage_diag_storage_write_calls++;
 #endif
-#ifdef C4PRO_BOOT_HEARTBEAT
+#ifdef C4PRO_PHASE_MARK
                     /* phase 2 = usb_storage about to dispatch a NAND write; the
                      * FTL/NAND stages (3..6) overwrite it deeper in the call. */
                     c4pro_hb_phase = 2;
+#endif
+#ifdef C4PRO_USB_RX_TIMING
+                    extern uint32_t c4pro_rxt_now(void);
+                    extern volatile uint32_t c4pro_swt_sum, c4pro_swt_cnt, c4pro_swt_max;
+                    uint32_t _sw0 = c4pro_rxt_now();
 #endif
                     result = storage_write_sectors(IF_MD(cur_cmd.lun,)
                         cur_cmd.sector,
                         MIN(WRITE_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
+#ifdef C4PRO_USB_RX_TIMING
+                    {
+                        uint32_t _d = (_sw0 - c4pro_rxt_now()) & 0xFFFFFFFFu;
+                        c4pro_swt_sum += _d; c4pro_swt_cnt++;
+                        if(_d > c4pro_swt_max) c4pro_swt_max = _d;
+                    }
+#endif
 #ifdef C4PRO_BOOT_HEARTBEAT
                     /* usb-thread write heartbeat: bumped AFTER each WRITE(10)
                      * buffer's storage_write_sectors() actually RETURNS, so it
                      * counts completed writes. If the usb thread hangs inside
-                     * the write/NAND path during a real copy, W freezes here.
-                     * phase 1 = back in USB (write returned) - a freeze at
-                     * phase 1 means the stall is NOT in the FTL/NAND write. */
+                     * the write/NAND path during a real copy, W freezes here. */
                     c4pro_hb_usb++;
+#endif
+#ifdef C4PRO_PHASE_MARK
+                    /* phase 1 = back in USB (write returned) - a freeze at
+                     * phase 1 means the stall is NOT in the FTL/NAND write. */
                     c4pro_hb_phase = 1;
 #endif
                 }
@@ -1593,7 +1611,7 @@ static void receive_time(void)
 
 static void receive_block_data(void *data,int size)
 {
-#ifdef C4PRO_BOOT_HEARTBEAT
+#ifdef C4PRO_PHASE_MARK
     /* phase 13 = armed, waiting for the host's bulk-OUT WRITE data. This is
      * the exact state usbmon caught silently wedged for 30s+ on 2026-07-02
      * (CBW ACKed, data phase never serviced) -- see freeze doc s5.1/5.2. */
@@ -1613,14 +1631,14 @@ static void send_csw(int status)
     tb.csw->data_residue = 0;
     tb.csw->status = status;
 
-#ifdef C4PRO_BOOT_HEARTBEAT
+#ifdef C4PRO_PHASE_MARK
     c4pro_hb_phase = 10;   /* about to send the CSW (bulk-IN sync sender) */
 #endif
     usb_drv_send_nonblocking(EP_IN, tb.csw,
             sizeof(struct command_status_wrapper));
     state = WAITING_FOR_CSW_COMPLETION_OR_COMMAND;
     //logf("CSW: %X",status);
-#ifdef C4PRO_BOOT_HEARTBEAT
+#ifdef C4PRO_PHASE_MARK
     c4pro_hb_phase = 12;   /* CSW sent; arming next-command receive */
 #endif
     /* Already start waiting for the next command */
