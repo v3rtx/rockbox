@@ -445,16 +445,17 @@ static const struct nand_device_info_type c4pro_micron_2cd9d53e88 =
 
 static long last_activity = 0;
 
-/* NAND interface wait-state timing (AHB0_NANDC+0x04). 0x1081 is the original
- * conservative value and the shipped default. The FMWAIT sweep that suggested
- * 0x1041 (2.4x) was measured on the RAW write path (c4pro_nand_write_page,
- * FMWAIT-paced byte PIO); the production hwecc path stages through PAGE_BUF +
- * the BCH engine (FLCTL=0xA26), which FMWAIT does NOT pace, so on the real
- * write path 0x1041 gave no measurable benefit -- keep the wide-margin timing
- * (it paces every boot/FTL read too). Overridable for re-sweeps via
- * -DC4PRO_NAND_FMWAIT_VALUE. */
+/* NAND interface wait-state timing (AHB0_NANDC+0x04). 0x1041 is the shipped
+ * default: FMWAIT paces EVERY AHB<->NAND transfer -- the hwecc PAGE_BUF staging,
+ * the FLCTL BCH loads, and every FTL/COW read, not just the raw byte-PIO path --
+ * so tightening it from the conservative 0x1081 to 0x1041 speeds the whole write
+ * and read pipeline. Measured on-device: the 2-plane build at 0x1041 sustained
+ * 4 MB/s on real file copies (md5-verified); a mistaken "cleanup" to 0x1081
+ * halved that to ~2 MB/s -- 0x1041 is the real-world default, not just a raw-path
+ * micro-opt. Verified bad=0 in the FMWAIT sweep; tighter values plateaued.
+ * Overridable for re-sweeps via -DC4PRO_NAND_FMWAIT_VALUE. */
 #ifndef C4PRO_NAND_FMWAIT_VALUE
-#define C4PRO_NAND_FMWAIT_VALUE 0x1081u
+#define C4PRO_NAND_FMWAIT_VALUE 0x1041u
 #endif
 uint32_t c4pro_nand_fmwait = C4PRO_NAND_FMWAIT_VALUE;
 

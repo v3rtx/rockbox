@@ -4055,6 +4055,23 @@ static void c4pro_usb_msc_serve(void)
                               (unsigned long)c4pro_2p_pairs,
                               (unsigned long)c4pro_2p_batch,
                               c4own_diag_cache_flush_count);
+#ifdef C4PRO_2P_TIMING
+                    /* Write-path time split, cumulative ms: A=alloc(scan+erase)
+                     * E=erase only (so scan=A-E) P=NAND program C=page copy.
+                     * wall - (A+P+C) = USB+FTL. S=alloc scan iters (thousands). */
+                    {
+                        extern volatile uint32_t c4pro_2p_alloc_us,
+                            c4pro_2p_erase_us, c4pro_2p_prog_us,
+                            c4pro_2p_copy_us, c4pro_2p_scan;
+                        lcd_putsf(0, 11, "A%lu E%lu P%lu C%lu",
+                                  (unsigned long)(c4pro_2p_alloc_us / 1000u),
+                                  (unsigned long)(c4pro_2p_erase_us / 1000u),
+                                  (unsigned long)(c4pro_2p_prog_us / 1000u),
+                                  (unsigned long)(c4pro_2p_copy_us / 1000u));
+                        lcd_putsf(0, 12, "S%luk",
+                                  (unsigned long)(c4pro_2p_scan / 1000u));
+                    }
+#endif
                     lcd_update();
                 }
             }

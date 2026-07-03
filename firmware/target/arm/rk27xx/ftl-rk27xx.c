@@ -1111,6 +1111,24 @@ static bool c4own_cache_dirty[C4OWN_CACHE_SLOTS];
 static bool c4own_ready;
 static bool c4own_formatting;
 
+#ifdef C4PRO_FTL_DEFER_COW
+/* Deferred copy-on-write: instead of pre-reading the whole old block into the
+ * cache on every write-miss (c4own_load_cache), track which payload sectors the
+ * host actually wrote (bitmap, 1 bit/sector) and read only the UNWRITTEN sectors
+ * from the old block at FLUSH time (c4own_cache_backfill). A full-block overwrite
+ * (dd, large file copies) writes every sector -> zero COW reads, so rewriting an
+ * existing (mapped) block is as fast as writing a fresh one. This is the fix for
+ * the "4 MB/s fresh vs 2 MB/s rewrite" gap: the old pre-read was ~504 KB of NAND
+ * reads per rewritten block (measured ~24 s of a 64 s / 128 MB dd). */
+#define C4OWN_WRITTEN_BYTES ((C4OWN_PAYLOAD_SECTORS_PER_BLOCK + 7u) / 8u)
+static uint8_t c4own_cache_written[C4OWN_CACHE_SLOTS][C4OWN_WRITTEN_BYTES];
+static inline void c4own_wr_set(uint32_t slot, uint32_t s)
+{ c4own_cache_written[slot][s >> 3] |= (uint8_t)(1u << (s & 7u)); }
+static inline int c4own_wr_get(uint32_t slot, uint32_t s)
+{ return (c4own_cache_written[slot][s >> 3] >> (s & 7u)) & 1u; }
+static void c4own_cache_backfill(uint32_t slot);   /* defined after c4own_load_cache */
+#endif
+
 /* Mount-checkpoint state. active_block = superblock block (0/1) holding the
  * current on-NAND checkpoint, or -1 if none loaded/written this boot.
  * seq = its monotonic version. marked_dirty = whether the dirty marker for the
@@ -1876,6 +1894,9 @@ static int c4own_flush_cache_slot(uint32_t slot)
         return 0;
 
     c4own_diag_cache_flush_count++;
+#ifdef C4PRO_FTL_DEFER_COW
+    c4own_cache_backfill(slot);   /* fill unwritten gaps from the old block */
+#endif
     if (c4own_write_logical_block(c4own_cache_logical[slot], 0,
                                   C4OWN_PAYLOAD_SECTORS_PER_BLOCK,
                                   c4own_cache_data[slot]))
@@ -2036,6 +2057,9 @@ static int c4own_flush_slots_interleaved(const uint32_t *slots,
 
     for (i = 0; i < n; i++)
     {
+#ifdef C4PRO_FTL_DEFER_COW
+        c4own_cache_backfill(slots[i]);   /* fill gaps before map update below */
+#endif
         logical[i] = c4own_cache_logical[slots[i]];
         old_pblk[i] = c4own_map[logical[i]];
         gen[i] = c4own_gen[logical[i]] + 1u;
@@ -2290,6 +2314,26 @@ static int c4own_flush_batched(bool all)
  */
 volatile uint32_t c4pro_2p_batch, c4pro_2p_pairs;
 
+#ifdef C4PRO_2P_TIMING
+/* TMR2 (50 MHz free-running down-counter) write-path time split, us-accumulated.
+ * alloc = time in c4own_alloc_pblk_pair (scan + erase); erase = just the block
+ * erases inside it (so scan = alloc-erase); prog = the 128 two-plane programs;
+ * copy = per-page memcpy/header build. wall - (alloc+prog+copy) = USB+FTL rest. */
+volatile uint32_t c4pro_2p_alloc_us, c4pro_2p_erase_us, c4pro_2p_prog_us;
+volatile uint32_t c4pro_2p_copy_us, c4pro_2p_scan;
+static void c4pro_2p_tmr_init(void)
+{
+    static int started = 0;
+    if (!started) { TMR2LR = 0xFFFFFFFFu; TMR2CON = (1u << 8) | (1u << 7); started = 1; }
+}
+#define C4P2T_NOW()        (TMR2CVR)
+#define C4P2T_ADD(acc, t0) do { (acc) += (((t0) - TMR2CVR) & 0xFFFFFFFFu) / 50u; } while (0)
+#define C4OWN_ERASE(pb) ({ uint32_t _te = C4P2T_NOW(); int _er = c4own_erase_pblk(pb); \
+                           C4P2T_ADD(c4pro_2p_erase_us, _te); _er; })
+#else
+#define C4OWN_ERASE(pb) c4own_erase_pblk(pb)
+#endif
+
 /* Allocate an adjacent free plane-pair: an even PHYSICAL block P with P and P+1
  * both free/erasable and on the same die. Erases both. Returns the low pblk
  * (*hi = its partner) or -1. abs_pblk = C4PRO_OWNED_PBLK_START + pblk and
@@ -2305,6 +2349,9 @@ static int c4own_alloc_pblk_pair(int *hi)
         {
             uint32_t Q = P + 1u;
 
+#ifdef C4PRO_2P_TIMING
+            c4pro_2p_scan++;
+#endif
             if (c4own_abs_pblk(P) & 1u)     /* P must start an even physical block */
                 continue;
             if (c4own_used[P] || c4own_used[Q])
@@ -2314,13 +2361,13 @@ static int c4own_alloc_pblk_pair(int *hi)
             if (c4own_pblk_bank(P) != c4own_pblk_bank(Q))   /* defensive same-die */
                 continue;
 
-            if (c4own_erase_pblk(P))
+            if (C4OWN_ERASE(P))
             {
                 c4own_used[P] = 1;
                 c4own_retired[P] = 1;
                 continue;
             }
-            if (c4own_erase_pblk(Q))
+            if (C4OWN_ERASE(Q))
             {
                 c4own_used[Q] = 1;
                 c4own_retired[Q] = 1;
@@ -2371,10 +2418,20 @@ static int c4own_flush_pair(uint32_t slot0, uint32_t slot1,
             return 1;
         }
 
+#ifdef C4PRO_FTL_DEFER_COW
+    /* Fill unwritten gaps from each slot's old block BEFORE the map is updated
+     * below. Full-block overwrites read nothing here (the win). */
+    c4own_cache_backfill(slot0);
+    c4own_cache_backfill(slot1);
+#endif
+
     for (p = 0; p < C4OWN_PAGES_PER_BLOCK; p++)
     {
         unsigned char *b0 = c4own_il_page[0];
         unsigned char *b1 = c4own_il_page[1];
+#ifdef C4PRO_2P_TIMING
+        uint32_t _tc = C4P2T_NOW();
+#endif
 
         if (p == 0)
         {
@@ -2402,14 +2459,26 @@ static int c4own_flush_pair(uint32_t slot0, uint32_t slot1,
          * flight (same marker as the serial writer), so a wedge inside the
          * two-plane program is attributed to the NAND op, not the FTL. */
         C4PRO_SET_PHASE(5);
+#ifdef C4PRO_2P_TIMING
+        C4P2T_ADD(c4pro_2p_copy_us, _tc);
+        { uint32_t _tp = C4P2T_NOW();
+          int _wr = c4pro_nand_write_page_2plane(bank, base0 + p, base1 + p,
+                                                 b0, b1, C4OWN_SECTORS_PER_PAGE);
+          C4P2T_ADD(c4pro_2p_prog_us, _tp);
+          if (_wr)
+#else
         if (c4pro_nand_write_page_2plane(bank, base0 + p, base1 + p, b0, b1,
                                          C4OWN_SECTORS_PER_PAGE))
+#endif
         {
             c4own_used[pblk0] = 0; c4own_retired[pblk0] = 1;
             c4own_used[pblk1] = 0; c4own_retired[pblk1] = 1;
             c4own_diag_last_write_result = 3;
             return 1;
         }
+#ifdef C4PRO_2P_TIMING
+        }   /* close the _tp timing scope opened above */
+#endif
     }
 
     c4own_map[logical0] = (uint16_t)pblk0;
@@ -2481,7 +2550,14 @@ static int c4own_flush_batched_2plane(bool all)
             continue;
         }
 
+#ifdef C4PRO_2P_TIMING
+        c4pro_2p_tmr_init();
+        { uint32_t _ta = C4P2T_NOW();
+          pblk0 = c4own_alloc_pblk_pair(&hi);
+          C4P2T_ADD(c4pro_2p_alloc_us, _ta); }
+#else
         pblk0 = c4own_alloc_pblk_pair(&hi);
+#endif
         if (pblk0 < 0)
         {
             if (c4own_flush_cache_slot((uint32_t)s0))
@@ -2566,6 +2642,14 @@ static int c4own_load_cache(uint32_t logical)
 
 load:
     old_pblk = c4own_map[logical];
+#ifdef C4PRO_FTL_DEFER_COW
+    /* Do NOT pre-read the old block here. Mark all payload sectors unwritten;
+     * c4own_cache_backfill() reads only the ones the host never touches, at
+     * flush time. cache_data is left stale -- every byte is either overwritten
+     * by the host or backfilled before it reaches NAND. */
+    (void)old_pblk;
+    memset(c4own_cache_written[victim], 0, C4OWN_WRITTEN_BYTES);
+#else
     for (uint32_t payload = 0; payload < C4OWN_PAYLOAD_SECTORS_PER_BLOCK;
          payload++)
     {
@@ -2582,6 +2666,7 @@ load:
         else
             c4own_blank_sector(dst);
     }
+#endif
 
     c4own_cache_logical[victim] = logical;
     c4own_cache_age[victim] = ++c4own_cache_tick;
@@ -2590,6 +2675,40 @@ load:
     c4own_diag_cache_logical = (int)logical;
     return (int)victim;
 }
+
+#ifdef C4PRO_FTL_DEFER_COW
+/* Fill the sectors the host never wrote (per c4own_cache_written) from the old
+ * mapped block, so cache_data[slot] is a complete image before it is programmed.
+ * Called at the start of every flush path. For a fully-overwritten block this
+ * reads nothing (the whole win); for a partial write it reads only the gaps --
+ * exactly the COW the old c4own_load_cache pre-read did, but deferred and
+ * minimized. Must run BEFORE the flush updates c4own_map[logical]. */
+static void c4own_cache_backfill(uint32_t slot)
+{
+    uint32_t logical = c4own_cache_logical[slot];
+    uint16_t old_pblk = c4own_map[logical];
+    uint32_t payload;
+
+    for (payload = 0; payload < C4OWN_PAYLOAD_SECTORS_PER_BLOCK; payload++)
+    {
+        unsigned char *dst;
+
+        if (c4own_wr_get(slot, payload))
+            continue;                       /* host wrote it -- keep */
+
+        dst = c4own_cache_data[slot] + payload * 512u;
+        if (old_pblk != 0xffffu)
+        {
+            C4PRO_SET_PHASE(7);   /* deferred COW gap read, see phase legend */
+            if (c4own_read_phys_sector(old_pblk,
+                                       C4OWN_SECTORS_PER_PAGE + payload, dst))
+                c4own_blank_sector(dst);
+        }
+        else
+            c4own_blank_sector(dst);
+    }
+}
+#endif
 
 static int c4own_read_sector_internal(uint32_t sector, void *buffer)
 {
@@ -2603,6 +2722,22 @@ static int c4own_read_sector_internal(uint32_t sector, void *buffer)
 
     if (slot >= 0)
     {
+#ifdef C4PRO_FTL_DEFER_COW
+        /* Deferred COW: an unwritten sector in a dirty slot is NOT in cache_data
+         * yet (no pre-read) -- serve it from the old block, exactly as if the
+         * slot weren't cached. Written sectors come from the cache as normal. */
+        if (!c4own_wr_get((uint32_t)slot, offset))
+        {
+            if (c4own_map[logical] == 0xffffu)
+            {
+                c4own_blank_sector(buffer);
+                return 0;
+            }
+            return c4own_read_phys_sector(c4own_map[logical],
+                                          C4OWN_SECTORS_PER_PAGE + offset,
+                                          buffer);
+        }
+#endif
         memcpy(buffer, c4own_cache_data[slot] + offset * 512u, 512);
         return 0;
     }
@@ -2639,7 +2774,17 @@ static int c4own_read_internal(uint32_t sector, uint32_t count, void *buffer)
         slot = c4own_find_cache_slot(logical);
         if (slot >= 0)
         {
+#ifdef C4PRO_FTL_DEFER_COW
+            /* Some sectors in this dirty slot may be unwritten (not in cache_data
+             * under deferred COW) -- go per-sector so each is served from cache
+             * or the old block correctly. Reads are off the write hot path. */
+            uint32_t k;
+            for (k = 0; k < n; k++)
+                if (c4own_read_sector_internal(sector + k, out + k * 512u))
+                    return 1;
+#else
             memcpy(out, c4own_cache_data[slot] + offset * 512u, n * 512u);
+#endif
             out += n * 512u;
             sector += n;
             count -= n;
@@ -2834,6 +2979,14 @@ static int c4own_write_internal(uint32_t sector, uint32_t count,
 
         memcpy(c4own_cache_data[slot] + offset * 512u, in, n * 512u);
         c4own_cache_dirty[slot] = true;
+#ifdef C4PRO_FTL_DEFER_COW
+        /* Record these sectors as host-written so backfill skips them. */
+        {
+            uint32_t s;
+            for (s = offset; s < offset + n; s++)
+                c4own_wr_set((uint32_t)slot, s);
+        }
+#endif
         sector += n;
         count -= n;
         in += n * 512u;

@@ -287,6 +287,34 @@
 #define C4PRO_FTL_EAGER_FLUSH
 #endif
 
+/* Deferred copy-on-write (default ON). The owned-RW write cache used to pre-read
+ * the ENTIRE old 504 KB block on every write-miss to a mapped logical block, so
+ * rewriting an existing volume paid ~504 KB of NAND reads per block that a fresh
+ * (unmapped) volume did not -- the measured "4 MB/s fresh vs 2 MB/s rewrite" gap
+ * (~24 s of a 64 s / 128 MB dd spent in old-block reads). This tracks which
+ * payload sectors the host actually wrote and backfills only the UNWRITTEN gaps
+ * at flush time, so a full-block overwrite (dd, large file copies) does ZERO
+ * old-block reads and rewrites run at fresh-volume speed (measured 2.0 -> 4.4
+ * MB/s, permanently). Partial writes still COW the gaps, and both FTL read paths
+ * serve unwritten cached sectors from the old block, so data is unchanged. Opt
+ * out with C4PRO_FTL_NO_DEFER_COW (reverts to the unconditional pre-read). */
+#ifndef C4PRO_FTL_NO_DEFER_COW
+#define C4PRO_FTL_DEFER_COW
+#endif
+
+/* Larger USB bulk transfer buffers (default 128 KB, up from the generic 24 KB).
+ * The sustained-write bottleneck is partly the per-buffer storage-handoff gap;
+ * bigger buffers mean proportionally fewer gaps. The RX DMA is armed per 512-byte
+ * packet, so buffer size carries NO DMA limit -- it is only a larger staging
+ * area (2x its size in DRAM, well within budget). Override with
+ * -DUSB_WRITE_BUFFER_SIZE / -DUSB_READ_BUFFER_SIZE. */
+#ifndef USB_WRITE_BUFFER_SIZE
+#define USB_WRITE_BUFFER_SIZE (128*1024)
+#endif
+#ifndef USB_READ_BUFFER_SIZE
+#define USB_READ_BUFFER_SIZE (128*1024)
+#endif
+
 /* Die-interleaved write path (OPT-IN, enable with -DC4PRO_NAND_DIE_INTERLEAVE).
  * The default flush programs one logical block on one die at a time, so every
  * page pays the full MLC tPROG serially and writes cap at ~1.7 MB/s. This batches
