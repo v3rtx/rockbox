@@ -348,6 +348,14 @@ void system_reboot(void)
     while(1);
 }
 
+/* NOTE: entering the mask-ROM RKUSB download mode (071b:3201) for a CE#-free
+ * reflash is NOT done from the running app. Jumping to the ROM handler while USB
+ * is already enumerated as MSC leaves the host with a stale enumeration and it
+ * never re-enumerates. The app instead requests it across a watchdog reset (a
+ * HANDOFF magic + system_reboot()); the native loader enters RKUSB at boot with
+ * a fresh USB. See tools/c4_native_rockbox_loader.c (HANDOFF_RKUSB_MAGIC) and
+ * apps/main.c c4pro_usb_msc_serve(). */
+
 #ifdef C4PRO_WDT_CRASH_CAPTURE
 /* Arm the WDT for crash capture WITHOUT spinning (unlike system_reboot()):
  * the tick-driven pet in INT_TIMER0 (kernel-rk27xx.c) keeps reloading WDTLR

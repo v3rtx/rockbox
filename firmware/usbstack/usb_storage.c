@@ -604,14 +604,24 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                              MIN(cur_cmd.count,WRITE_BUFFER_SIZE/cur_cmd.block_size);
                 int next_select = !cur_cmd.data_select;
 
+#ifndef C4PRO_USB_SERIALIZE_WRITE
                 if(next_count!=0) {
                     /* Ask the host to send more, to the other buffer */
                     receive_block_data(cur_cmd.data[next_select],
                                        MIN(WRITE_BUFFER_SIZE,next_count*cur_cmd.block_size));
                 }
+#endif
 
                 /* Now write the data that just came in, while the host is
-                   sending the next bit */
+                   sending the next bit.
+                   C4PRO_USB_SERIALIZE_WRITE: on the C4 the bulk-OUT DMA and the
+                   NAND controller wedge the AHB if armed concurrently (the
+                   sustained-write freeze -- caught at phase 5/NAND and 13/armed-
+                   receive). Stock decouples them via a separate NAND-consumer
+                   context; we instead SERIALIZE -- do the NAND write with the
+                   OUT DMA disarmed, then arm the next receive below -- so the two
+                   masters never collide. Costs the receive/write overlap, but the
+                   write path is receive-latency-bound anyway. */
 #ifdef USB_USE_RAMDISK
                 memcpy(ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
                         cur_cmd.data[cur_cmd.data_select],
@@ -653,6 +663,15 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                     cur_sense_data.asc=ASC_WRITE_ERROR;
                     cur_sense_data.ascq=0;
                     break;
+                }
+#endif
+#ifdef C4PRO_USB_SERIALIZE_WRITE
+                /* NAND write of the current buffer is done and the OUT DMA is
+                 * disarmed; only NOW arm the next receive, so the two AHB masters
+                 * never overlap (see the block comment above). */
+                if(next_count!=0) {
+                    receive_block_data(cur_cmd.data[next_select],
+                                       MIN(WRITE_BUFFER_SIZE,next_count*cur_cmd.block_size));
                 }
 #endif
                 if(next_count==0) {

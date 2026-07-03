@@ -1337,7 +1337,8 @@ static int c4own_read_phys_sector_uncached(uint32_t pblk, uint32_t sector,
     return 0;
 }
 
-#if defined(C4PRO_BOOT_HEARTBEAT) || defined(C4PRO_FAULT_VISIBLE)
+#if defined(C4PRO_BOOT_HEARTBEAT) || defined(C4PRO_FAULT_VISIBLE) || \
+    defined(C4PRO_WDT_CRASH_CAPTURE)
 /* Write-path phase marker for the heartbeat freeze localizer (also read by the
  * visible-fault handler to tag WHICH stage faulted). Set at entry of each
  * sustained-write stage (all run in usb-thread context, so no IRQ race). On a
@@ -1354,7 +1355,7 @@ static int c4own_read_phys_sector_uncached(uint32_t pblk, uint32_t sector,
 volatile uint32_t c4pro_hb_phase;
 #endif
 
-#ifdef C4PRO_BOOT_HEARTBEAT
+#if defined(C4PRO_BOOT_HEARTBEAT) || defined(C4PRO_WDT_CRASH_CAPTURE)
 #define C4PRO_SET_PHASE(n) do { c4pro_hb_phase = (n); } while (0)
 #else
 #define C4PRO_SET_PHASE(n) do { } while (0)
@@ -1887,8 +1888,380 @@ static int c4own_flush_cache_slot(uint32_t slot)
     return 0;
 }
 
+#ifdef C4PRO_NAND_DIE_INTERLEAVE
+/*
+ * Die-interleaved write path. The default flush programs one logical block at a
+ * time on a single die, so every 4 KB page pays the full MLC tPROG serially
+ * (~2.4 ms/page -> ~1.7 MB/s). The chip has four independent dies (CE0..3) whose
+ * array programs can run concurrently; stock reaches ~6.5 MB/s only by keeping
+ * several dies programming at once. Here we batch up to 4 dirty cache slots onto
+ * 4 DISTINCT dies and drive their block writes in lockstep, one page-round at a
+ * time, via c4pro_nand_prog_pages_hwecc_multi() -- which fires the program on
+ * every die before waiting on any, so the tPROG windows overlap. This is a
+ * pure scheduling change: the on-NAND per-page format is identical to the serial
+ * hwecc writer, and the logical->physical map (persisted in the checkpoint) is
+ * what records which die a block landed on, so no reformat is needed and existing
+ * volumes keep mounting.
+ */
+int c4own_diag_interleave_batch_count;
+int c4own_diag_interleave_max_n;
+int c4own_diag_interleave_prog_fail;
+#ifdef C4PRO_NAND_DIE_INTERLEAVE_VERIFY
+int c4own_diag_interleave_verify_fail;
+#endif
+
+/* Round-robin die cursor so consecutive batches start on different dies. */
+static uint32_t c4own_wr_die;
+/* Per-die page-image build buffers; all live simultaneously during a page-round
+ * because the multi-program consumes all of them before any tPROG wait. 4-byte
+ * aligned so c4pro_nand_prog_pages_hwecc_multi can stage them into PAGE_BUF with
+ * a 32-bit word copy (an unaligned word load on ARM7TDMI returns rotated data,
+ * not a fault -> silent corruption). */
+static unsigned char c4own_il_page[4][4096] __attribute__((aligned(4)));
+
+/* Allocate (and erase) a free physical block that belongs to a specific die.
+ * Mirrors c4own_alloc_pblk's two-pass (fresh-then-retired) policy but filtered
+ * to one bank, so a batch can place each block on a distinct die. */
+static int c4own_alloc_pblk_on_bank(uint32_t bank)
+{
+    for (uint32_t pblk = C4OWN_FIRST_DATA_PBLK;
+         pblk < C4OWN_RUNTIME_PBLK_COUNT; pblk++)
+    {
+        if (c4own_pblk_bank(pblk) != bank)
+            continue;
+        if (!c4own_used[pblk] && !c4own_retired[pblk])
+        {
+            c4own_used[pblk] = 1;
+            if (c4own_erase_pblk(pblk))
+            {
+                c4own_retired[pblk] = 1;
+                continue;
+            }
+            return (int)pblk;
+        }
+    }
+
+    for (uint32_t pblk = C4OWN_FIRST_DATA_PBLK;
+         pblk < C4OWN_RUNTIME_PBLK_COUNT; pblk++)
+    {
+        if (c4own_pblk_bank(pblk) != bank)
+            continue;
+        if (!c4own_used[pblk] && c4own_retired[pblk])
+        {
+            c4own_used[pblk] = 1;
+            if (c4own_erase_pblk(pblk))
+                continue;
+            c4own_retired[pblk] = 0;
+            return (int)pblk;
+        }
+    }
+
+    return -1;
+}
+
+static void c4own_build_header(unsigned char *buf, uint32_t logical,
+                               uint32_t gen)
+{
+    memset(buf, 0xff, 4096);
+    c4own_put32(buf + 0, C4OWN_MAGIC_HDR);
+    c4own_put32(buf + 4, C4OWN_VERSION);
+    c4own_put32(buf + 8, logical);
+    c4own_put32(buf + 12, gen);
+    c4own_put32(buf + 16, c4own_crc32(buf, 16));
+}
+
+static void c4own_build_commit(unsigned char *buf, uint32_t logical,
+                               uint32_t gen)
+{
+    unsigned char *commit = buf + 7u * 512u;
+
+    memset(buf, 0xff, 4096);
+    c4own_put32(commit + 0, C4OWN_MAGIC_COMMIT);
+    c4own_put32(commit + 4, C4OWN_VERSION);
+    c4own_put32(commit + 8, logical);
+    c4own_put32(commit + 12, gen);
+    c4own_put32(commit + 16, c4own_crc32(commit, 16));
+}
+
+/*
+ * Flush a batch of up to 4 dirty cache slots, each already allocated to a
+ * distinct die (pblks[i] on banks[i]). Writes all blocks in lockstep, page-round
+ * by page-round, so the four dies' tPROG windows overlap. On ANY page failure the
+ * whole batch is aborted -- every freshly-allocated block is retired and no map
+ * is updated -- so no committed data is lost and the dirty slots are retried on
+ * the next flush. Maps/generations/old-block retirement are applied only after
+ * all 128 rounds (and the optional read-after-write verify) succeed.
+ */
+static int c4own_flush_slots_interleaved(const uint32_t *slots,
+                                         const int *pblks,
+                                         const uint32_t *banks,
+                                         uint32_t n)
+{
+    uint32_t base_page[4];
+    uint16_t old_pblk[4];
+    uint32_t gen[4];
+    uint32_t logical[4];
+    uint32_t p, i;
+
+    if (n == 0)
+        return 0;
+
+    C4PRO_SET_PHASE(3);
+
+    /* Invalidate any clean checkpoint on NAND before the first commit, exactly
+     * as the serial writer does, so a crash can never leave a checkpoint that
+     * omits this batch. */
+    if (c4own_ckpt_active_block >= 0 && !c4own_ckpt_marked_dirty)
+    {
+        if (c4own_ckpt_mark_dirty())
+            return 1;
+    }
+
+    for (i = 0; i < n; i++)
+    {
+        logical[i] = c4own_cache_logical[slots[i]];
+        old_pblk[i] = c4own_map[logical[i]];
+        gen[i] = c4own_gen[logical[i]] + 1u;
+        base_page[i] = c4own_pblk_page((uint32_t)pblks[i]);
+    }
+
+    for (p = 0; p < C4OWN_PAGES_PER_BLOCK; p++)
+    {
+        uint32_t pbanks[4];
+        uint32_t ppages[4];
+        const void *pdatas[4];
+        uint32_t fail;
+
+        for (i = 0; i < n; i++)
+        {
+            unsigned char *buf = c4own_il_page[i];
+
+            if (p == 0)
+                c4own_build_header(buf, logical[i], gen[i]);
+            else if (p == C4OWN_PAGES_PER_BLOCK - 1u)
+                c4own_build_commit(buf, logical[i], gen[i]);
+            else
+                memcpy(buf,
+                       c4own_cache_data[slots[i]] +
+                           (p - 1u) * C4OWN_SECTORS_PER_PAGE * 512u,
+                       C4OWN_SECTORS_PER_PAGE * 512u);
+
+            pbanks[i] = banks[i];
+            ppages[i] = base_page[i] + p;
+            pdatas[i] = buf;
+        }
+
+        fail = c4pro_nand_prog_pages_hwecc_multi(pbanks, ppages, pdatas,
+                                                 C4OWN_SECTORS_PER_PAGE, n);
+        if (fail)
+        {
+            c4own_diag_interleave_prog_fail++;
+            for (i = 0; i < n; i++)
+            {
+                c4own_used[(uint32_t)pblks[i]] = 0;
+                c4own_retired[(uint32_t)pblks[i]] = 1;
+            }
+            c4own_diag_last_write_result = 3;
+            return 1;
+        }
+    }
+
+#ifdef C4PRO_NAND_DIE_INTERLEAVE_VERIFY
+    /* Read-after-write proof. The interleave's failure modes are addressing/die
+     * ones (a page landing on the wrong die or page base), which corrupt whole
+     * pages consistently -- so sampling the first and last payload page of every
+     * block catches them while adding only ~2 reads/block (negligible vs the 128
+     * programs), keeping the measured write throughput meaningful. Per-page data
+     * integrity itself is already covered by the identical hwecc primitive the
+     * serial writer uses. A mismatch retires the batch's blocks, leaves the old
+     * data intact, and fails the write loudly (host sees a write error) so a
+     * broken interleave can never silently commit corruption. Build with
+     * -DC4PRO_NAND_DIE_INTERLEAVE_VERIFY_FULL to check every page instead. */
+    for (i = 0; i < n; i++)
+    {
+        for (p = 1; p < C4OWN_PAGES_PER_BLOCK - 1u; p++)
+        {
+#ifndef C4PRO_NAND_DIE_INTERLEAVE_VERIFY_FULL
+            /* Sampled: only the first and last payload page (cheap, catches the
+             * addressing/die failure modes). Skip the middle. */
+            if (p != 1u && p != C4OWN_PAGES_PER_BLOCK - 2u)
+                continue;
+#endif
+            if (c4own_read_page_corrected(banks[i], base_page[i] + p,
+                                          c4own_read_page_data) ||
+                memcmp(c4own_read_page_data,
+                       c4own_cache_data[slots[i]] +
+                           (p - 1u) * C4OWN_SECTORS_PER_PAGE * 512u,
+                       C4OWN_SECTORS_PER_PAGE * 512u) != 0)
+            {
+                c4own_diag_interleave_verify_fail++;
+                c4own_read_page_valid = false;
+                for (uint32_t j = 0; j < n; j++)
+                {
+                    c4own_used[(uint32_t)pblks[j]] = 0;
+                    c4own_retired[(uint32_t)pblks[j]] = 1;
+                }
+                c4own_diag_last_write_result = 4;
+                return 1;
+            }
+        }
+    }
+    c4own_read_page_valid = false;
+#endif
+
+    for (i = 0; i < n; i++)
+    {
+        uint32_t lg = logical[i];
+
+        c4own_map[lg] = (uint16_t)pblks[i];
+        c4own_gen[lg] = gen[i];
+        if (old_pblk[i] != 0xffffu)
+        {
+            c4own_used[old_pblk[i]] = 0;
+            c4own_retired[old_pblk[i]] = 1;
+        }
+        c4own_cache_dirty[slots[i]] = false;
+    }
+
+    c4own_map_dirty = true;
+    c4own_diag_interleave_batch_count++;
+    if ((int)n > c4own_diag_interleave_max_n)
+        c4own_diag_interleave_max_n = (int)n;
+    c4own_diag_map0 = c4own_map[0] == 0xffffu ? -1 : (int)c4own_map[0];
+    c4own_diag_map2 = c4own_map[2] == 0xffffu ? -1 : (int)c4own_map[2];
+    return 0;
+}
+
+/*
+ * Drain dirty cache slots via die-interleaved batches. all=true flushes every
+ * dirty slot (sync/unmount); all=false is the eager high-water flush that keeps
+ * C4PRO_FTL_FLUSH_KEEP dirty blocks buffered. Each batch takes the oldest dirty
+ * slots and places each on a distinct free die. If no die (or only one) has free
+ * space, it falls back to the serial single-slot writer so forward progress is
+ * always guaranteed.
+ */
+static int c4own_flush_batched(bool all)
+{
+    uint32_t nb = ftl_banks < 4u ? ftl_banks : 4u;
+    unsigned guard = C4OWN_CACHE_SLOTS + 1u;
+
+    if (nb == 0u)
+        nb = 1u;
+
+    while (guard--)
+    {
+        uint32_t slots[4];
+        int pblks[4];
+        uint32_t banks[4];
+        uint32_t n = 0;
+        uint32_t dirty = 0;
+        uint32_t want;
+        uint32_t used_bank_mask = 0;
+        uint32_t picked_mask = 0;
+
+        for (uint32_t s = 0; s < C4OWN_CACHE_SLOTS; s++)
+            if (c4own_cache_valid[s] && c4own_cache_dirty[s])
+                dirty++;
+
+        if (all)
+        {
+            if (dirty == 0u)
+                break;
+        }
+        else
+        {
+            /* Eager flush only once a FULL die-wide batch of excess has piled up,
+             * so every batch programs nb blocks across nb distinct dies at once
+             * (real tPROG overlap). Flushing at dirty>KEEP would drain one block
+             * at a time (n=1 -> single die -> no speedup). This keeps between KEEP
+             * and KEEP+nb dirty blocks resident; clamp the trigger to the cache
+             * size so it stays reachable if KEEP+nb ever exceeds the slot count. */
+            uint32_t threshold = C4PRO_FTL_FLUSH_KEEP + nb;
+            if (threshold > C4OWN_CACHE_SLOTS)
+                threshold = C4OWN_CACHE_SLOTS;
+            if (dirty < threshold)
+                break;
+        }
+
+        want = nb;
+
+        for (uint32_t j = 0; j < want; j++)
+        {
+            int oldest = -1;
+            uint32_t oldest_age = 0xffffffffu;
+            int pblk = -1;
+            uint32_t bank = 0;
+
+            for (uint32_t s = 0; s < C4OWN_CACHE_SLOTS; s++)
+            {
+                if (!c4own_cache_valid[s] || !c4own_cache_dirty[s])
+                    continue;
+                if (picked_mask & (1u << s))
+                    continue;
+                if (c4own_cache_age[s] < oldest_age)
+                {
+                    oldest_age = c4own_cache_age[s];
+                    oldest = (int)s;
+                }
+            }
+            if (oldest < 0)
+                break;
+
+            for (uint32_t t = 0; t < nb; t++)
+            {
+                bank = (c4own_wr_die + t) % nb;
+                if (used_bank_mask & (1u << bank))
+                    continue;
+                pblk = c4own_alloc_pblk_on_bank(bank);
+                if (pblk >= 0)
+                    break;
+            }
+            if (pblk < 0)
+                break;
+
+            used_bank_mask |= 1u << bank;
+            picked_mask |= 1u << (uint32_t)oldest;
+            slots[n] = (uint32_t)oldest;
+            pblks[n] = pblk;
+            banks[n] = bank;
+            n++;
+        }
+
+        if (n == 0)
+        {
+            /* No distinct free die available: make progress serially. */
+            int oldest = -1;
+            uint32_t oldest_age = 0xffffffffu;
+
+            for (uint32_t s = 0; s < C4OWN_CACHE_SLOTS; s++)
+                if (c4own_cache_valid[s] && c4own_cache_dirty[s] &&
+                    c4own_cache_age[s] < oldest_age)
+                {
+                    oldest_age = c4own_cache_age[s];
+                    oldest = (int)s;
+                }
+            if (oldest < 0)
+                break;
+            if (c4own_flush_cache_slot((uint32_t)oldest))
+                return 1;
+            continue;
+        }
+
+        c4own_wr_die = (c4own_wr_die + n) % nb;
+
+        if (c4own_flush_slots_interleaved(slots, pblks, banks, n))
+            return 1;
+    }
+
+    return 0;
+}
+#endif /* C4PRO_NAND_DIE_INTERLEAVE */
+
 static int c4own_flush_cache(void)
 {
+#ifdef C4PRO_NAND_DIE_INTERLEAVE
+    return c4own_flush_batched(true);
+#else
     for (uint32_t slot = 0; slot < C4OWN_CACHE_SLOTS; slot++)
     {
         if (c4own_flush_cache_slot(slot))
@@ -1896,6 +2269,7 @@ static int c4own_flush_cache(void)
     }
 
     return 0;
+#endif
 }
 
 static int c4own_find_cache_slot(uint32_t logical)
@@ -2209,6 +2583,13 @@ static int c4own_write_internal(uint32_t sector, uint32_t count,
      * Skipped during format (which drives its own write+flush sequence). */
     if (first_count > 0 && !c4own_formatting)
     {
+#ifdef C4PRO_NAND_DIE_INTERLEAVE
+        /* Die-interleaved eager flush: same high-water policy (keep
+         * C4PRO_FTL_FLUSH_KEEP dirty), but drain the excess in batches spread
+         * across the 4 dies so their tPROG windows overlap. */
+        if (c4own_flush_batched(false))
+            return 1;
+#else
         /* Bounded by construction: each successful c4own_flush_cache_slot clears
          * exactly one dirty slot (dirty--), a failed one returns, and ages are
          * unique so the oldest never repeats -> at most C4OWN_CACHE_SLOTS passes.
@@ -2243,6 +2624,7 @@ static int c4own_write_internal(uint32_t sector, uint32_t count,
             if (c4own_flush_cache_slot((uint32_t)oldest))
                 return 1;   /* result already set to 3 by the slot flush */
         }
+#endif /* C4PRO_NAND_DIE_INTERLEAVE */
     }
 #endif
 

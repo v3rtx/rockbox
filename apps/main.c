@@ -2322,8 +2322,16 @@ static void c4pro_wdt_crash_capture_check_and_report(void)
 
     if (rec[0] == C4PRO_WDT_CAPTURE_MAGIC)
     {
+#ifdef C4PRO_WDT_AUTOREBOOT
+        /* Daily-driver behaviour: the watchdog already reset+rebooted us out of a
+         * (rare, residual) freeze. Just clear the marker and continue booting so
+         * the device auto-recovers -- USB re-enumerates on its own, no diagnostic
+         * halt screen, no manual replug. The failed copy is retried by the host. */
+        rec[0] = 0;
+#else
         unsigned long pc = rec[1];
         unsigned long tick = rec[2];
+        unsigned long phase = rec[3];
 
         lcd_setfont(FONT_SYSFIXED);
         lcd_clear_display();
@@ -2331,11 +2339,13 @@ static void c4pro_wdt_crash_capture_check_and_report(void)
         lcd_puts(0, 2, "FREEZE CAUGHT!");
         lcd_putsf(0, 3, "pc  =0x%08lx", pc);
         lcd_putsf(0, 4, "tick=%lu", tick);
+        lcd_putsf(0, 5, "phase=%lu", phase);
         lcd_puts(0, 6, "addr2line this pc");
         lcd_update();
 
         rec[0] = 0;  /* clear so a future unrelated boot doesn't misreport */
         while (1) { }
+#endif
     }
 
     c4pro_wdt_capture_start();
@@ -3880,8 +3890,13 @@ static void c4pro_usb_msc_serve(void)
 {
     /* ~3 consecutive ~20ms ADC reads (~60ms) = a stable MENU press */
     const int C4PRO_MENU_EJECT_SAMPLES = 3;
+    /* BACK held ~2s (deliberate; guards against an accidental tap dropping the
+     * device out of storage) enters the mask-ROM RKUSB download mode so new
+     * firmware can be flashed with the case closed -- no CE# short needed. */
+    const int C4PRO_BACK_UPDATE_SAMPLES = 100;
     bool eject = false;
     int menu_samples = 0;
+    int back_samples = 0;
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_WDT_CRASH_CAPTURE)
@@ -3905,6 +3920,7 @@ static void c4pro_usb_msc_serve(void)
     lcd_puts(0, 0, "USB Mass Storage");
     lcd_puts(0, 1, "Connected to PC");
     lcd_puts(0, 3, "MENU: Rockbox player");
+    lcd_puts(0, 2, "Hold BACK: USB flash");
     lcd_update();
 
     /* Poll the button ADC directly with a small debounce so MENU ejects on the
@@ -3919,13 +3935,58 @@ static void c4pro_usb_msc_serve(void)
             c4pro_usb_diag_force_storage_config();
         }
 
-        if (button_read_device() == BUTTON_MENU)
         {
-            if (++menu_samples >= C4PRO_MENU_EJECT_SAMPLES)
-                eject = true;
+            int btn = button_read_device();
+
+            if (btn == BUTTON_MENU)
+            {
+                if (++menu_samples >= C4PRO_MENU_EJECT_SAMPLES)
+                    eject = true;
+            }
+            else
+                menu_samples = 0;
+
+            /* BACK held long enough -> drop into mask-ROM RKUSB download mode
+             * (071b:3201) for a CE#-free reflash. rk27xx_enter_rkusb() never
+             * returns; give the user an on-screen confirmation first, and paint
+             * a progress hint partway through the hold so a partial press is
+             * visibly ignored. */
+            if (btn == BUTTON_BACK)
+            {
+                if (++back_samples == C4PRO_BACK_UPDATE_SAMPLES / 2)
+                {
+                    lcd_puts(0, 2, "Keep holding BACK...");
+                    lcd_update();
+                }
+                if (back_samples >= C4PRO_BACK_UPDATE_SAMPLES)
+                {
+                    /* Reliable CE#-free entry: DON'T jump to the ROM download
+                     * handler from here -- USB is already enumerated as MSC, so
+                     * the host never re-enumerates and never sees 071b:3201.
+                     * Instead request it via the loader across a watchdog reset:
+                     * write the magic to the shared HANDOFF DRAM slot (DRAM
+                     * survives a WDT reset), flush it to physical DRAM (the loader
+                     * reads it uncached at entry), then reboot. The loader sees
+                     * the flag with a fresh post-reset USB -- the exact cold-boot
+                     * condition under which enter_rkusb() enumerates reliably. */
+                    volatile uint32_t *handoff =
+                        (volatile uint32_t *)0x606fff00u;
+
+                    lcd_clear_display();
+                    lcd_puts(0, 0, "Entering USB flash");
+                    lcd_puts(0, 1, "mode, rebooting...");
+                    lcd_update();
+                    c4pro_usb_diag_exit_storage_mode();
+                    handoff[4] = 0xC4E9B00Bu;   /* HANDOFF_RKUSB_MAGIC */
+                    commit_discard_dcache_range((void *)handoff, 64);
+                    sleep(HZ / 4);
+                    commit_discard_dcache_range((void *)handoff, 64);
+                    system_reboot();            /* never returns */
+                }
+            }
+            else
+                back_samples = 0;
         }
-        else
-            menu_samples = 0;
 
 #ifdef C4PRO_BOOT_HEARTBEAT
         /* Liveness heartbeat. Four counters, each owned by a different context:
@@ -4003,7 +4064,15 @@ static void c4pro_usb_msc_serve(void)
                  * X = last INT2FLAG (UDC event bits). */
                 lcd_putsf(0, 6, "F%lu R%u", f,
                           c4pro_usb_diag_reset_count);
-                lcd_putsf(0, 7, "X%x", c4pro_usb_diag_last_intsrc);
+                /* O = bulk-OUT receive completions (out_intr). Compare to bytes
+                 * written: O ~= totalbytes/512 => RX re-arms per 512B packet
+                 * (per-packet overhead = the write-speed cap); O ~= buffers =>
+                 * per-buffer. This is the step-1 diagnostic for the RX rework. */
+                {
+                    extern volatile unsigned c4pro_usb_diag_outn_count;
+                    lcd_putsf(0, 7, "X%x O%u", c4pro_usb_diag_last_intsrc,
+                              c4pro_usb_diag_outn_count);
+                }
                 /* C = cache-op busy-wait timeouts: C>0 means the CACHEOP cap
                  * fired -> the masked-IRQ cache spin WAS the hang, now survived. */
                 lcd_putsf(0, 8, "IRQ%u C%lu", s, c);

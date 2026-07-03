@@ -579,13 +579,28 @@ static void ep_read(struct endpoint_t *endp)
         }
     }
 
-    /* setup DMA -- stock sequence: address, then GO. No RXSTAT write. */
+    /* setup DMA -- stock sequence: address, then GO. No RXSTAT write.
+     * (Multi-packet-per-DMA was tried and is impossible: the RK27xx OUT engine
+     * has no transfer-length register -- stock disassembly confirms it arms with
+     * exactly these two writes and receives one packet per RXACK. The lever is a
+     * minimal re-arm, below, not batching packets.) */
     DMAOUTLMADDR(endp) = (uint32_t)endp->buf; /* local buffer address */
     DMAOUTCTL(endp) = DMA_START;
+#ifdef C4PRO_USB_RX_LEAN_REARM
+    /* Stock's per-packet re-arm is 4 instructions: read length, advance ptr,
+     * write DMAOUTLMADDR, write DMAOUTCTL. It does NOT touch RXCON on re-arm. For
+     * the C4 bulk-OUT config (RX1CON=0x190) RXNAK is never set, so clearing it is
+     * a no-op that only adds an MMIO read-modify-write per packet -- skip it on
+     * the bulk endpoints to match stock, keep it for EP0 (control) where it's
+     * required. */
+    if (endp->ep_num == 0)
+        RXCON(endp) &= ~RXNAK;
+#else
     /* clear NAK (stock does this per-arm on EP0 only -- @0x6002ba7c; for the
      * C4 bulk-OUT config RX1CON=0x190 RXNAK is never set, so this is a
      * harmless no-op there and required for EP0). */
     RXCON(endp) &= ~RXNAK;
+#endif
 #else
     int xfer_size = MIN(max_pkt_size(endp), endp->cnt);
 
@@ -668,9 +683,15 @@ static void out_intr(struct endpoint_t *endp)
     else
     {
         c4pro_usb_diag_outn_count++;
+#ifndef C4PRO_USB_RX_LEAN_REARM
+        /* last_outn_con reads RXCON -- an AHB/MMIO access on EVERY bulk-OUT
+         * packet. Stock's per-packet handler touches nothing but RX1STAT + the
+         * two arm registers, so on the lean path keep only the outn_count and
+         * drop these per-packet writes/MMIO reads. */
         c4pro_usb_diag_last_outn = endp->ep_num;
         c4pro_usb_diag_last_outn_stat = rxstat;
         c4pro_usb_diag_last_outn_con = RXCON(endp);
+#endif
     }
 #endif
 #ifdef C4PRO_USB_RESET_STALE_GUARD

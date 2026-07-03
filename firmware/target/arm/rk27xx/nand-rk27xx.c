@@ -496,6 +496,33 @@ static void nand_delay(void)
         ;
 }
 
+/* Inter-poll spacing for the NAND ready waits. Our default is a tight register
+ * spin (while(!(FMCTL & FM_RDY))); stock instead spaces each status read with a
+ * ~20-count delay. Hammering the NANDC register in a tight loop while its engine
+ * is mid-AHB-transaction is the most plausible source of the intermittent AHB
+ * bus stall (the phase-5 sustained-write freeze). Spacing the reads mirrors stock
+ * and stops the CPU from pounding the controller bus during a program/erase.
+ * Gated so it can be A/B'd; C4PRO_NAND_POLL_SPACING tunes the gap. */
+#ifndef C4PRO_NAND_STATUS_POLL_SPACING
+/* Inter-poll delay for the stock-style 0x70 READ-STATUS program-completion poll
+ * (C4PRO_NAND_STATUS_POLL). Stock spaces each status read ~20 counts. */
+#define C4PRO_NAND_STATUS_POLL_SPACING 20
+#endif
+
+#ifdef C4PRO_NAND_SPACED_POLL
+#ifndef C4PRO_NAND_POLL_SPACING
+#define C4PRO_NAND_POLL_SPACING 24
+#endif
+static inline void nand_poll_space(void)
+{
+    volatile int d = C4PRO_NAND_POLL_SPACING;
+    while (d--)
+        ;
+}
+#else
+static inline void nand_poll_space(void) { }
+#endif
+
 static bool nand_wait_ready(void)
 {
     int i;
@@ -504,6 +531,7 @@ static bool nand_wait_ready(void)
     {
         if (FMCTL & FM_RDY)
             return true;
+        nand_poll_space();
     }
 
     return false;
@@ -517,6 +545,7 @@ static bool nand_wait_fl_ready(void)
     {
         if (FLCTL & FL_RDY)
             return true;
+        nand_poll_space();
     }
 
     return false;
@@ -559,6 +588,7 @@ static bool nand_wait_ready_erase(void)
     {
         if (FMCTL & FM_RDY)
             return true;
+        nand_poll_space();
     }
 
     return false;
@@ -1440,6 +1470,33 @@ uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
 
     FLASH_CMD(bank) = 0x10;   /* program confirm */
 
+#ifdef C4PRO_NAND_STATUS_POLL
+    /* Stock program-completion discipline (SYSTEM_BASE.RKW @0x60082c50): poll the
+     * NAND's own READ-STATUS byte (cmd 0x70, bit6 = R/B ready) through the data
+     * port, with an inter-poll delay -- NOT a tight FMCTL FM_RDY controller-
+     * register spin. Repeatedly reading the NANDC FMCTL register while the die is
+     * programming is the suspected trigger of the intermittent AHB bus wedge (the
+     * phase-5 sustained-write freeze); the 0x70 status read is chip-mediated and
+     * is exactly what stock does. The status byte we need for the FAIL check
+     * (bit0) is the same byte, so no extra read. */
+    {
+        unsigned guard = 400000;
+        do
+        {
+            FLASH_CMD(bank) = 0x70;
+            status = FLASH_DATA(bank);
+            if (status & 0x40)          /* bit6 = R/B ready */
+                break;
+            { volatile int d = C4PRO_NAND_STATUS_POLL_SPACING; while (d--) ; }
+        } while (--guard);
+
+        if (!guard)
+        {
+            nand_deselect();
+            return 3;
+        }
+    }
+#else
     if (!nand_wait_ready())
     {
         nand_deselect();
@@ -1448,6 +1505,7 @@ uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
 
     FLASH_CMD(bank) = 0x70;
     status = FLASH_DATA(bank);
+#endif
     nand_deselect();
     last_activity = current_tick;
 
@@ -1681,6 +1739,146 @@ uint32_t c4pro_nand_erase_blocks_multi(const uint32_t *banks,
         nand_deselect();
 
         if (status & 1)
+            fail |= 1u << i;
+    }
+
+    last_activity = current_tick;
+    return fail;
+}
+
+/*
+ * Multi-die concurrent hardware-ECC page program. The write path is otherwise
+ * tPROG-bound: an MLC array program (~1-3 ms) dwarfs the per-page data transfer,
+ * so a single-die serial writer caps at ~1.7 MB/s no matter how fast the data
+ * phase is. This mirrors c4pro_nand_erase_blocks_multi's interleave: it streams
+ * each die's page image and fires the 0x10 program-confirm on up to 4 dies
+ * WITHOUT blocking on tPROG (phase 1), then polls every die to completion
+ * (phase 2). Deasserting CE# after 0x10 does not abort an in-progress internal
+ * program on this Micron MLC part (the same property the erase interleave already
+ * relies on), so the tPROG windows overlap and effective throughput scales with
+ * the number of dies in the batch -- approaching the stock ~6.5 MB/s at 4 dies.
+ *
+ * Each datas[i] is a full 512*nsec-byte linear page image, streamed through the
+ * buffered PAGE_BUF engine with hardware ECC on (FLCTL=0xA26, inline 512+16
+ * layout) exactly as c4pro_nand_write_page_hwecc does, so pages written here are
+ * read back byte-for-byte by nand_read_page()/c4pro_nand_read_page_hwecc(). All
+ * n images must be distinct live buffers (they are all consumed in phase 1
+ * before any wait). Returns a bitmask: bit i set if die i failed a pre-check,
+ * FL transfer, or reported program-fail status.
+ */
+uint32_t c4pro_nand_prog_pages_hwecc_multi(const uint32_t *banks,
+                                           const uint32_t *pages,
+                                           const void *const *datas,
+                                           uint32_t nsec, uint32_t n)
+{
+    uint32_t fail = 0;
+    uint32_t i;
+    unsigned s, k;
+
+    if (n == 0 || n > 4 || nsec == 0 || nsec > 8 ||
+        !banks || !pages || !datas)
+        return 0xfu;
+
+    FMWAIT = c4pro_nand_fmwait;
+
+    /* Phase 1: stage each die's page and fire 0x10; do NOT wait tPROG so the
+     * per-die array-program windows overlap. */
+    for (i = 0; i < n; i++)
+    {
+        uint32_t bank = banks[i];
+        uint32_t page = pages[i];
+        const unsigned char *data = datas[i];
+
+        if (bank > 3 || !data)
+        {
+            fail |= 1u << i;
+            continue;
+        }
+
+        FLCTL = FL_RST;
+        nand_select(bank);
+        nand_prog_delay();
+        if (!nand_wait_ready())
+        {
+            nand_deselect();
+            fail |= 1u << i;
+            continue;
+        }
+
+        BCHCTL = 1;   /* strength-8 preset leaves bit13=0 */
+
+        FLASH_CMD(bank) = 0x80;
+        FLASH_ADDR(bank) = 0x00;
+        FLASH_ADDR(bank) = 0x00;
+        FLASH_ADDR(bank) = page & 0xff;
+        FLASH_ADDR(bank) = (page >> 8) & 0xff;
+        FLASH_ADDR(bank) = (page >> 16) & 0xff;
+
+        for (s = 0; s < nsec; s++)
+        {
+            volatile uint32_t *pbw =
+                (volatile uint32_t *)((volatile unsigned char *)&PAGE_BUF +
+                                      ((s & 3) << 9));
+            volatile uint32_t *sbw =
+                (volatile uint32_t *)((volatile unsigned char *)&SPARE_BUF +
+                                      ((s & 3) << 4));
+            const uint32_t *dw = (const uint32_t *)(data + s * 512);
+
+            /* 32-bit word copy into the on-chip PAGE_BUF (not a byte loop): with
+             * dies interleaved this staging copy is serialized on the critical
+             * path, so 4x fewer AHB stores shrinks it toward the pure-tPROG
+             * ceiling. Both ends are word-aligned (PAGE_BUF slot = 512-aligned;
+             * datas[i] is the 4096-byte c4own_il_page[] static, s*512 aligned). */
+            for (k = 0; k < 512u / 4u; k++)
+                pbw[k] = dw[k];
+            for (k = 0; k < 16u / 4u; k++)
+                sbw[k] = 0xffffffffu;
+
+            FLCTL = FL_RST;
+            BCHCTL = (BCHCTL & ~0x1C03u) | 1u | 2u | ((bank & 3u) << 10);
+            /* FL_WR|FL_START|(1 sector)|FL_XFER_EN|FL_COR_EN + start-sector */
+            FLCTL = 0xA26u | ((s & 3u) << 3);
+            if (!nand_wait_fl_ready())
+            {
+                fail |= 1u << i;
+                break;
+            }
+        }
+
+        if (fail & (1u << i))
+        {
+            nand_deselect();
+            continue;
+        }
+
+        FLASH_CMD(bank) = 0x10;   /* program confirm -- no tPROG wait here */
+        nand_deselect();
+    }
+
+    /* Phase 2: by the time we poll die i, dies 0..i-1 have been programming
+     * since phase 1, so total wall time approaches one tPROG plus per-die
+     * transfer overhead rather than n * tPROG. */
+    for (i = 0; i < n; i++)
+    {
+        uint32_t bank = banks[i];
+        unsigned status;
+
+        if (fail & (1u << i))
+            continue;
+
+        nand_select(bank);
+        if (!nand_wait_ready())
+        {
+            nand_deselect();
+            fail |= 1u << i;
+            continue;
+        }
+
+        FLASH_CMD(bank) = 0x70;
+        status = FLASH_DATA(bank);
+        nand_deselect();
+
+        if (status & 0x01)   /* bit0 = program FAIL */
             fail |= 1u << i;
     }
 

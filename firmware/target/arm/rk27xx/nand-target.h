@@ -91,6 +91,15 @@ uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page);
  * Returns a bitmask where bit i is set if block i failed to erase. */
 uint32_t c4pro_nand_erase_blocks_multi(const uint32_t *banks,
                                        const uint32_t *pages, uint32_t n);
+/* Multi-die concurrent hardware-ECC page program: streams up to 4 page images
+ * and fires 0x10 on each die without blocking on tPROG, then polls every die.
+ * The overlapping tPROG windows make write throughput scale with the batch's
+ * die count. datas[i] is a 512*nsec-byte page image (all consumed before any
+ * wait); n<=4. Returns a bitmask, bit i set if die i failed. */
+uint32_t c4pro_nand_prog_pages_hwecc_multi(const uint32_t *banks,
+                                           const uint32_t *pages,
+                                           const void *const *datas,
+                                           uint32_t nsec, uint32_t n);
 #endif
 uint32_t nand_write_page(uint32_t bank, uint32_t page, void* databuffer,
                          void* sparebuffer, uint32_t doecc);

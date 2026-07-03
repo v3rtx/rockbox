@@ -71,6 +71,7 @@ void INT_TIMER0(void)
     {
         extern volatile bool c4pro_wdt_capture_enable;
         extern volatile unsigned long c4pro_irq_interrupted_pc;
+        extern volatile uint32_t c4pro_hb_phase;
 
         if (c4pro_wdt_capture_enable)
         {
@@ -80,6 +81,11 @@ void INT_TIMER0(void)
             rec[0] = C4PRO_WDT_CAPTURE_MAGIC;
             rec[1] = c4pro_irq_interrupted_pc;
             rec[2] = (unsigned long)current_tick;
+            /* Last write-path stage the usb thread reached (see the phase legend
+             * in ftl-rk27xx.c). On a silent AHB-stall freeze the PC only ever
+             * samples innocent scheduler code, so this phase is what actually
+             * localizes the wedged stage. */
+            rec[3] = (unsigned long)c4pro_hb_phase;
 
             WDTLR = C4PRO_WDT_CAPTURE_RELOAD;
         }

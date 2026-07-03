@@ -127,6 +127,24 @@
 /* enable these for the experimental usb stack */
 #define HAVE_USBSTACK
 
+/* NOTE: enlarging USB_WRITE_BUFFER_SIZE does NOT help write throughput on the C4
+ * (tested: 24 KB -> 63 KB gave 1.7 -> 1.8 MB/s, i.e. no change, and 64 KB tripped
+ * the 16-bit out_intr count wrap and dropped the bus). The read/write asymmetry
+ * (read 4.2, write 1.8) is NOT buffer-driven -- the bulk-OUT RECEIVE path itself
+ * caps at ~1.8 MB/s (per-packet DMA arm), independent of NAND and buffer size.
+ * Left at the generic defaults; the real lever is the RX path, not buffer size. */
+
+/* Lean bulk-OUT re-arm (OPT-IN: -DC4PRO_USB_RX_LEAN_REARM). Confirmed on-device
+ * that RX re-arms once per 512B packet (O ~= bytes/512) at ~314us/packet vs
+ * stock's ~78us -> write caps ~1.7 MB/s vs stock ~6.5. Stock disassembly shows
+ * its per-packet handler is 4 instructions (read RX1STAT length, advance ptr,
+ * write DMAOUTLMADDR, write DMAOUTCTL) and touches nothing else -- no RXCON
+ * rewrite, no per-packet MMIO. (Multi-packet-per-DMA is impossible: the OUT
+ * engine has no transfer-length register.) This flag strips our per-packet path
+ * toward stock's: no RXCON NAK-clear on bulk re-arm, no per-packet RXCON MMIO
+ * read in diag. Freeze-sensitive path -> validate with crash-capture + multiple
+ * runs. */
+
 /* Default-ON crash fix (active only in the USB-MSC build): if a stray INT_UDC
  * reaches UIRQ during the FTL sync-flush of a sustained copy, ACK it instead of
  * panicking (see UIRQ in system-rk27xx.c). Define C4PRO_USB_NO_UDC_IRQ_FIX to
@@ -235,6 +253,24 @@
  * C4PRO_FTL_NO_EAGER_FLUSH to A/B (reproduce the crash). */
 #ifndef C4PRO_FTL_NO_EAGER_FLUSH
 #define C4PRO_FTL_EAGER_FLUSH
+#endif
+
+/* Die-interleaved write path (OPT-IN, enable with -DC4PRO_NAND_DIE_INTERLEAVE).
+ * The default flush programs one logical block on one die at a time, so every
+ * page pays the full MLC tPROG serially and writes cap at ~1.7 MB/s. This batches
+ * up to 4 dirty cache blocks onto 4 distinct dies and programs them in lockstep
+ * (c4pro_nand_prog_pages_hwecc_multi fires 0x10 on all dies before waiting on
+ * any), overlapping their tPROG windows to approach the stock ~6.5 MB/s. It is a
+ * pure scheduling change over the same per-page hwecc format -- no reformat, and
+ * the persisted logical->physical map records which die each block lives on, so
+ * existing volumes keep mounting. Requires C4PRO_NAND_HWECC (shares its inline
+ * 512+16 layout). Add -DC4PRO_NAND_DIE_INTERLEAVE_VERIFY to read back the first
+ * and last payload page of every block and fail the write loudly on any mismatch
+ * (catches the addressing/die failure modes at ~2 reads/block, so the measured
+ * throughput stays meaningful); add -DC4PRO_NAND_DIE_INTERLEAVE_VERIFY_FULL on
+ * top to check every page (paranoid, much slower). */
+#if defined(C4PRO_NAND_DIE_INTERLEAVE) && !defined(C4PRO_NAND_HWECC)
+#error "C4PRO_NAND_DIE_INTERLEAVE requires C4PRO_NAND_HWECC"
 #endif
 
 /* Default-ON crash fix: iteration-cap the cache-op busy-waits (CACHEOP) in
