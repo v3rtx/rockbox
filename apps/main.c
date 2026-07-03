@@ -4037,6 +4037,28 @@ static void c4pro_usb_msc_serve(void)
             else
                 menu_samples = 0;
 
+#ifdef C4PRO_NAND_2PLANE
+            /* 1Hz two-plane effectiveness display: P = pages written as plane
+             * PAIRS (each = 2 pages/1 tPROG), B = pair-batches, F = serial
+             * single-plane fallback flushes. P>>F means the 2x lever is live;
+             * F dominating means the pair path is degrading to serial (the
+             * 1.9MB/s-instead-of-4 signature under investigation). Painted at
+             * most once a second so it cannot perturb the write hot path. */
+            {
+                extern volatile uint32_t c4pro_2p_batch, c4pro_2p_pairs;
+                extern int c4own_diag_cache_flush_count;
+                static long c4pro_2p_last_paint;
+                if (TIME_AFTER(current_tick, c4pro_2p_last_paint + HZ))
+                {
+                    c4pro_2p_last_paint = current_tick;
+                    lcd_putsf(0, 10, "P%lu B%lu F%d   ",
+                              (unsigned long)c4pro_2p_pairs,
+                              (unsigned long)c4pro_2p_batch,
+                              c4own_diag_cache_flush_count);
+                    lcd_update();
+                }
+            }
+#endif
 #if defined(C4PRO_USB_RX_STALL_KICK) && defined(C4PRO_PHASE_MARK)
             /* Bulk-OUT stall watchdog: the residual sustained-write freeze is
              * the armed receive (phase 13) silently never completing; the host
@@ -4058,24 +4080,22 @@ static void c4pro_usb_msc_serve(void)
                 if (c4pro_hb_phase == 13 &&
                     c4pro_usb_diag_outn_count == c4pro_stall_last_outn)
                 {
-                    /* 2s window: the kick is a LAST-RESORT recovery, not a
-                     * latency optimization. "phase 13 + outn flat" cannot
-                     * distinguish a wedged engine from a host that legally
-                     * pauses mid-WRITE (bulk has no timing obligation --
-                     * host-side writeback/scheduling pauses >100ms are
-                     * routine), so a short window routinely fires the ARMED
-                     * kick on healthy receives, re-opening the RXCLR
-                     * ACKed-packet-discard race each time. The lost-completion
-                     * race the short window was compensating for is fixed at
-                     * the cause by C4PRO_USB_IRQ_DRAIN (ack-before-service
-                     * drain loop), so genuine stalls are rare enough that 2s
-                     * of added latency on a real wedge is irrelevant. (An
-                     * earlier 100ms experiment justified itself against
-                     * C4PRO_USB_EARLY_ACK -- a config that does not ship.) */
+                    /* 100ms window. Residual lost completions still occur
+                     * (~15/128MB even with C4PRO_USB_IRQ_DRAIN), so the window
+                     * IS a throughput component: at 2s per recovery a 128MB
+                     * write lost ~60s (measured 4 -> 1.4 MB/s); at 100ms the
+                     * same stalls cost ~1.5s total. Firing early on a HEALTHY
+                     * paused receive is safe because the kick itself now
+                     * re-validates under the IRQ mask (live INT2FLAG pending +
+                     * DMAOUTCTL re-read) and bails if any completion is in
+                     * flight -- the RXCLR ACKed-packet-discard race that made
+                     * a short window dangerous is closed at the kick, not the
+                     * window. Aborting a truly-quiet armed receive is
+                     * position-exact by design (nothing was ACKed). */
                     if (c4pro_stall_since < 0)
                         c4pro_stall_since = current_tick;
                     else if (TIME_AFTER(current_tick,
-                                        c4pro_stall_since + 2 * HZ))
+                                        c4pro_stall_since + HZ / 10))
                     {
                         c4pro_usb_rx_stall_kick();
                         c4pro_stall_since = -1;
