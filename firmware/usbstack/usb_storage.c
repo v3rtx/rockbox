@@ -642,6 +642,31 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                      * FTL/NAND stages (3..6) overwrite it deeper in the call. */
                     c4pro_hb_phase = 2;
 #endif
+#ifdef C4PRO_USB_MSC_ENABLE
+                    /* Host-triggered RKUSB: if the host writes this exact 16-byte
+                     * magic as a sector, drop to mask-ROM download mode (via the
+                     * loader across a WDT reset) INSTEAD of persisting it -- lets
+                     * the flashing host reboot the device into 071b:3201 without
+                     * the physical BACK-hold. The magic is never written to
+                     * storage, so it cannot corrupt the volume; it is specific
+                     * enough (four fixed 32-bit words) that real file data won't
+                     * hit it. Mirrors the BACK-hold path exactly. */
+                    {
+                        const volatile uint32_t *w = (const volatile uint32_t *)
+                            cur_cmd.data[cur_cmd.data_select];
+                        if (w[0] == 0xC4E9B00Bu && w[1] == 0x071B3201u &&
+                            w[2] == 0x524B5342u && w[3] == 0xC4E9B00Bu)
+                        {
+                            volatile uint32_t *handoff =
+                                (volatile uint32_t *)0x606fff00u;
+                            handoff[4] = 0xC4E9B00Bu;   /* HANDOFF_RKUSB_MAGIC */
+                            commit_discard_dcache_range((void *)handoff, 64);
+                            sleep(HZ / 4);
+                            commit_discard_dcache_range((void *)handoff, 64);
+                            system_reboot();            /* never returns */
+                        }
+                    }
+#endif
 #ifdef C4PRO_USB_RX_TIMING
                     extern uint32_t c4pro_rxt_now(void);
                     extern volatile uint32_t c4pro_swt_sum, c4pro_swt_cnt, c4pro_swt_max;

@@ -28,10 +28,13 @@
                             BUTTON_BACK|BUTTON_SRC| \
                             BUTTON_EQ)
 
-/* Keep software poweroff away from SELECT during bring-up. The real C4 power
- * key path is not mapped yet, and long SELECT is a normal UI/context action.
+/* Software poweroff on a long hold of the centre (SELECT) button. The ADC keypad
+ * never produces BUTTON_POWER, so poweroff was previously unreachable. SELECT
+ * also drives the UI context action on a short repeat (~0.3 s), but the poweroff
+ * fires only after POWEROFF_COUNT repeats (~2.7 s hold), well past the context
+ * press, so the two coexist: tap = select, brief hold = context, long hold = off.
  */
-#define POWEROFF_BUTTON BUTTON_POWER
+#define POWEROFF_BUTTON BUTTON_SELECT
 #define POWEROFF_COUNT 30
 
 #define DEBUG_CANCEL BUTTON_BACK

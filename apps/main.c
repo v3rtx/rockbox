@@ -174,6 +174,35 @@ static void c4pro_installer_halt(void)
         sleep(HZ);
 }
 
+#ifndef C4PRO_INSTALLER_NO_AUTOREBOOT
+static void c4pro_installer_reboot(void) NORETURN_ATTR;
+static void c4pro_installer_reboot(void)
+{
+    /* Auto cold-boot the freshly-flashed firmware instead of requiring a manual
+     * power-cycle (awkward once the battery is attached). Clear the RKUSB-request
+     * handoff slot so the loader boots the payload normally rather than dropping
+     * to download mode, show "done" briefly, then WDT-reset: the BootROM re-reads
+     * the NAND boot pages -> a normal cold boot into the new firmware. Only used
+     * on the SUCCESS paths; failures still halt so the error stays on screen. */
+    volatile uint32_t *handoff = (volatile uint32_t *)0x606fff00u;
+    handoff[4] = 0u;   /* HANDOFF[4] = 0: loader boots normally, not into RKUSB */
+    /* Flush to physical DRAM -- the loader reads HANDOFF uncached at entry (its
+     * cache is off), matching the BACK-hold and USB-intercept reboot paths. */
+    commit_discard_dcache_range((void *)handoff, 64);
+    sleep(2 * HZ);
+    commit_discard_dcache_range((void *)handoff, 64);
+    system_reboot();
+    while (1)   /* unreachable; satisfies NORETURN */
+        ;
+}
+#endif
+
+#ifdef C4PRO_INSTALLER_NO_AUTOREBOOT
+#define c4pro_installer_finish() c4pro_installer_halt()
+#else
+#define c4pro_installer_finish() c4pro_installer_reboot()
+#endif
+
 static void c4pro_installer_fail(const char *where, int rc) NORETURN_ATTR;
 static void c4pro_installer_fail(const char *where, int rc)
 {
@@ -447,7 +476,7 @@ static void c4pro_app_boot_installer(void)
 
     c4pro_installer_status("done", "boot native", crc ^ 0xffffffffu,
                            C4PRO_BOOT_INSTALL_PAGE_COUNT);
-    c4pro_installer_halt();
+    c4pro_installer_finish();
 }
 #endif
 
@@ -1068,7 +1097,7 @@ static void c4pro_app_native_rockbox_installer(void)
     c4pro_native_write_pages("boot ok", 0, boot_image, boot_pages, true);
 
     c4pro_installer_status("done", "native", payload_start_page, boot_pages);
-    c4pro_installer_halt();
+    c4pro_installer_finish();
 }
 #endif
 
