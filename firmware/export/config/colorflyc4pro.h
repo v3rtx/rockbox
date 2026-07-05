@@ -157,9 +157,12 @@
  * out reports a STALE FTL phase and misdirects the investigation (this exact
  * mistake pointed the residual-freeze hunt at the NAND boundary while the
  * thread was actually hanging in the USB CSW/receive path). */
-#if defined(C4PRO_BOOT_HEARTBEAT) || defined(C4PRO_WDT_CRASH_CAPTURE)
+/* PHASE_MARK: USB/FTL phase markers (c4pro_hb_phase). The RX stall-kick freeze
+ * recovery reads them, so it is UNCONDITIONALLY on -- not tied to the WDT crash
+ * capture (which we keep off to avoid reboots). Was previously gated on
+ * CRASH_CAPTURE/HEARTBEAT; decoupling it is what lets the stall-kick run with no
+ * watchdog. */
 #define C4PRO_PHASE_MARK
-#endif
 
 /* Residual phase-5 wedge, stage-1 instruments/fix (see nand-rk27xx.c):
  * - C4PRO_NAND_BCH_NO_RMW (OPT-IN): write BCHCTL fresh per sector instead of the
@@ -240,28 +243,41 @@
  * never armed, so a residual NAND-program freeze hangs dead instead of
  * self-rebooting (observed 2026-07-05). Both are needed for the daily's
  * auto-recover-on-freeze. The ~1s WDT reload only trips when the tick stops. */
-#ifndef C4PRO_NO_WDT_CRASH_CAPTURE
-#define C4PRO_WDT_CRASH_CAPTURE
-#endif
-#ifndef C4PRO_NO_WDT_AUTOREBOOT
-#define C4PRO_WDT_AUTOREBOOT
-#endif
-
-/* Production NAND layout + write scheduler -- default-on daily config. HWECC is
- * the on-NAND layout (inline 512+16) every production volume is formatted with;
- * 2PLANE is the ~4 MB/s two-plane write path (requires HWECC). These were only
- * ever build flags, so a recipe that dropped them silently fell back to the
- * incompatible software-BCH layout + single-plane (2 MB/s) and CORRUPTED an
- * HWECC volume -- the root of a long write-instability saga (2026-07-05). Baked
- * in so they can never be lost. Opt out via the C4PRO_NAND_NO_* twins only for a
- * legacy software-BCH volume. (The requires-HWECC #error checks live further down
- * in the FTL section and are satisfied because HWECC is defined here first.) */
-#ifndef C4PRO_NAND_NO_HWECC
+/* ==========================================================================
+ * C4 Pro production write path -- ALL default-on here, NO build flags needed.
+ *
+ * HARD-WON LESSON (2026-07-06): -D flags passed via C4_NATIVE_RUNTIME_EXTRA_DEFINES
+ * (make EXTRA_DEFINES) DO NOT REACH firmware .c files (nand-rk27xx.c,
+ * usb-drv-rk27xx.c) -- only config-header #defines do. A full day was lost
+ * passing the write path's flags on the command line where they silently
+ * evaporated: software-BCH instead of HWECC (volume corruption), and the RX
+ * stall-kick freeze-recovery compiled out (hard hangs seconds into a copy).
+ * EVERY firmware flag the write path needs lives HERE, unconditionally. Never
+ * move them back to a recipe. A production build passes NO write-path -D flags.
+ *
+ *  NAND: HWECC (on-NAND layout, inline 512+16) + 2PLANE (~4MB/s, needs HWECC)
+ *        + FAST_FORMAT + BCH_NO_RMW + FMCTL_NO_RMW + IOMUX_DIE0_SKIP
+ *  USB freeze recovery: RESET_DMA_ABORT (default above) + RX_STALL_KICK, which
+ *        reads the PHASE_MARK markers (made unconditional above) -- this trio is
+ *        THE fix for the residual sustained-write freeze; drop any one and a
+ *        copy hangs within seconds. Plus IRQ_DRAIN + TX_WEDGE_GUARD +
+ *        DEFER_WRITE + SERIALIZE_WRITE (default above).
+ *  FAULT_VISIBLE: show a fault on-screen instead of a silent wedge.
+ *
+ * WDT crash-capture/auto-reboot is deliberately OFF: with the stall-kick live
+ * the freeze is RECOVERED in place (copy resumes), so the device never reboots
+ * under the user. Opt in only for debugging with -DC4PRO_WDT_CRASH_CAPTURE. */
 #define C4PRO_NAND_HWECC
-#endif
-#ifndef C4PRO_NAND_NO_2PLANE
 #define C4PRO_NAND_2PLANE
-#endif
+#define C4PRO_NAND_FAST_FORMAT
+#define C4PRO_NAND_BCH_NO_RMW
+#define C4PRO_NAND_FMCTL_NO_RMW
+#define C4PRO_NAND_IOMUX_DIE0_SKIP
+#define C4PRO_USB_TX_WEDGE_GUARD
+#define C4PRO_USB_DEFER_WRITE
+#define C4PRO_USB_RX_STALL_KICK
+#define C4PRO_USB_IRQ_DRAIN
+#define C4PRO_FAULT_VISIBLE
 
 /* C4PRO_WDT_CRASH_CAPTURE (opt-in, not default-on): JTAG-free freeze-forensics
  * tool used to root-cause the fix above (docs/c4-usb-msc-write-freeze.md s7).
