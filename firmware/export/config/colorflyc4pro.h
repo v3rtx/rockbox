@@ -224,6 +224,20 @@
 #define C4PRO_USB_RX_DMA_GUARD
 #endif
 
+/* Sustained-write freeze guards -- default-on daily-driver config. These were
+ * previously only passed as build flags, so a trimmed boot-speed build dropped
+ * them and a large USB copy wedged and tore a write (2026-07-05). Baked in here
+ * so they can never be lost by trimming -Dflags. SERIALIZE_WRITE (usb_storage.c)
+ * serializes the bulk-OUT DMA against the NAND program -- the collision that
+ * wedges the AHB bus; WDT_AUTOREBOOT (main.c) auto-recovers if a wedge slips
+ * through. Define the C4PRO_*_NO_* twin to A/B either off. */
+#ifndef C4PRO_USB_NO_SERIALIZE_WRITE
+#define C4PRO_USB_SERIALIZE_WRITE
+#endif
+#ifndef C4PRO_NO_WDT_AUTOREBOOT
+#define C4PRO_WDT_AUTOREBOOT
+#endif
+
 /* C4PRO_WDT_CRASH_CAPTURE (opt-in, not default-on): JTAG-free freeze-forensics
  * tool used to root-cause the fix above (docs/c4-usb-msc-write-freeze.md s7).
  * The record layout/address/magic/reload-value are shared here so the tick
