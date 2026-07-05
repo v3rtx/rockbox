@@ -142,8 +142,29 @@ static const struct usb_qualifier_descriptor __attribute__((aligned(2)))
 static const struct usb_string_descriptor usb_string_iManufacturer =
 USB_STRING_INITIALIZER(u"Rockbox.org");
 
+#ifdef C4PRO_SCU_DIAG
+/* Diagnostic: iProduct carries loader_reg XOR app_reg for the 4 unread SCU regs
+ * (CLKCFG, CPUPD, CHIPCFG, DIVCON2) so `lsusb -v` reveals which one differs
+ * between the loader's stuck-AHB state and the app's working-AHB state. */
+static struct usb_string_descriptor usb_string_iProduct =
+USB_STRING_INITIALIZER(u"................................");
+static void c4pro_scu_diag_fill(void)
+{
+    volatile uint32_t *ho = (volatile uint32_t *)0x606fff00u;
+    uint32_t v[4];
+    v[0] = ho[18];   /* pristine (cache-off) page crc */
+    v[1] = ho[19];   /* cached page crc */
+    v[2] = ho[20];   /* cached+copy page crc */
+    v[3] = ho[21];   /* marker */
+    static const char hexd[] = "0123456789abcdef";
+    for (int r = 0; r < 4; r++)
+        for (int n = 0; n < 8; n++)
+            usb_string_iProduct.wString[r*8 + n] = hexd[(v[r] >> ((7-n)*4)) & 0xf];
+}
+#else
 static const struct usb_string_descriptor usb_string_iProduct =
 USB_STRING_INITIALIZER(u"Rockbox media player");
+#endif
 
 static struct usb_string_descriptor usb_string_iSerial =
 USB_STRING_INITIALIZER(u"00000000000000000000000000000000000000000");
@@ -471,6 +492,10 @@ void usb_core_init(void)
     int i;
     if (initialized)
         return;
+
+#ifdef C4PRO_SCU_DIAG
+    c4pro_scu_diag_fill();
+#endif
 
     usb_drv_init();
 

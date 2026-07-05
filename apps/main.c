@@ -600,6 +600,30 @@ static uint32_t c4pro_native_nand_write_page(uint32_t page,
     return rc;
 }
 
+#ifdef C4PRO_PAYLOAD_HWECC
+/* Write/read the payload via the hardware buffered-ECC engine (the same path the
+ * FTL/owned volume uses successfully), so the loader's fast buffered read reads
+ * it byte-identically. Hardware generates the ECC (8 sectors/page); the software
+ * spare is unused. This replaces the raw/linear payload write that the buffered
+ * read could not decode. */
+static uint32_t c4pro_native_nand_write_page_hwecc(uint32_t page,
+                                                   const void *data)
+{
+    int old_irq = disable_irq_save();
+    uint32_t rc = c4pro_nand_write_page_hwecc(0, page, data, 8u);
+    restore_irq(old_irq);
+    return rc;
+}
+
+static uint32_t c4pro_native_nand_read_page_hwecc(uint32_t page, void *data)
+{
+    int old_irq = disable_irq_save();
+    uint32_t rc = c4pro_nand_read_page_hwecc(0, page, data, 8u);
+    restore_irq(old_irq);
+    return rc;
+}
+#endif
+
 static uint32_t c4pro_native_nand_erase_block(uint32_t page)
 {
     int old_irq = disable_irq_save();
@@ -750,6 +774,23 @@ static int c4pro_native_write_payload_pages(const char *label,
         {
             verified = true;
 
+#ifdef C4PRO_PAYLOAD_HWECC
+            if (c4pro_native_nand_write_page_hwecc(phys_page,
+                                                   c4pro_install_page))
+            {
+                if (!fatal)
+                    return -(int)(page + 1u);
+                c4pro_installer_fail(label, (int)page);
+            }
+
+            if (c4pro_native_nand_read_page_hwecc(phys_page,
+                                                  c4pro_install_verify))
+            {
+                if (!fatal)
+                    return -(int)(page + 1u);
+                c4pro_installer_fail("payload hwecc read", (int)page);
+            }
+#else
             if (c4pro_native_nand_write_page(phys_page,
                                              c4pro_install_page,
                                              c4pro_install_spare))
@@ -766,6 +807,7 @@ static int c4pro_native_write_payload_pages(const char *label,
                     return -(int)(page + 1u);
                 c4pro_installer_fail("payload read", (int)page);
             }
+#endif
 
 #ifdef C4PRO_NATIVE_PAYLOAD_FULLPAGE
             for (uint32_t off = 0; off < C4PRO_NATIVE_DATA_BYTES; off++)
@@ -4567,6 +4609,14 @@ int main(void)
 int show_logo_boot( void ) INIT_ATTR;
 int show_logo_boot( void )
 {
+#if defined(COLORFLY_C4_PRO)
+    /* C4 Pro: no boot logo/version screen. With the fast IRAM loader the boot
+     * should flash by; a logo left on screen across the mount looked "stuck".
+     * Keep the panel clear so the boot stays visually silent until the UI/USB. */
+    lcd_clear_display();
+    lcd_update();
+    return 0;
+#else
     unsigned char version[32];
     int font_h, ver_w;
     snprintf(version, sizeof(version), "Ver. %s", rbversion);
@@ -4605,6 +4655,7 @@ int show_logo_boot( void )
     sleep(HZ); /* sim is too fast to see logo */
 #endif
     return 0;
+#endif /* COLORFLY_C4_PRO */
 }
 
 #if defined(HAVE_DIRCACHE) && !defined(COLORFLY_C4_PRO)
@@ -4897,6 +4948,11 @@ static void init(void)
      * backlight_init() starts the thread that applies brightness changes
      * (backlight_set_brightness -> queue -> backlight_hw_brightness). */
     backlight_init();
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    /* LCD + backlight are up now. */
+    backlight_on();
+#endif
 
     button_init();
     C4PRO_BOOT_STEP("button ok");
