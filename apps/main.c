@@ -4097,6 +4097,24 @@ static void c4pro_usb_msc_serve(void)
     c4pro_nand_write_stress();
 #endif
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    /* Draw the Rockbox logo immediately: the panel is lit by now (bootloader
+     * brought it up), so instead of sitting blank-but-backlit through the USB
+     * connect dance below, show the logo. The "Connected to PC" text further
+     * down replaces it once storage is settled. */
+    {
+        unsigned char c4ver[32];
+        int c4fh, c4vw;
+        snprintf(c4ver, sizeof(c4ver), "Ver. %s", rbversion);
+        c4vw = font_getstringsize(c4ver, NULL, &c4fh, FONT_SYSFIXED);
+        lcd_clear_display();
+        lcd_setfont(FONT_SYSFIXED);
+        lcd_bmp(&bm_rockboxlogo, (LCD_WIDTH - BMPWIDTH_rockboxlogo) / 2, 10);
+        lcd_putsxy((LCD_WIDTH / 2) - (c4vw / 2), LCD_HEIGHT - c4fh, c4ver);
+        lcd_setfont(FONT_UI);
+        lcd_update();
+    }
+#endif
     c4pro_usb_diag_enter_storage_mode();
     c4pro_usb_diag_force_reattach();
     sleep(2 * HZ);
