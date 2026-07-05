@@ -3940,13 +3940,17 @@ static void c4pro_boot_profile_show(const char *where)
 #define C4PRO_PRE_ROOT_MENU_HALT(step) do { } while (0)
 #endif
 
-/* Screen-free boot-phase timing (diagnostic; off unless C4PRO_BOOT_TICK_DIAG).
- * Stamps current_tick into HANDOFF words the C4PRO_SCU_DIAG USB iProduct fill
+/* Cross-binary boot profiling (diagnostic; off unless C4PRO_BOOT_TICK_DIAG).
+ * Stashes the free-running 50MHz TMR2 down-counter (started by the native loader,
+ * untouched by bootloader/app) into HANDOFF words the C4PRO_SCU_DIAG iProduct fill
  * surfaces (ho[18..21]); read via `lsusb -v -d 071b:3203 | grep iProduct`.
- * w18=pre-mount, w19=post-mount, w20=at-USB-serve, w21=0xb007b007 marker. */
+ * w18=native-loader-end (loader), w19=app main entry, w20=at-USB-serve.
+ * (LR - w18)/50e6 = native loader s; (w18-w19)/50e6 = bootloader s;
+ * (w19-w20)/50e6 = app s; (LR=0xffffffff - w20)/50e6 = total. */
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_BOOT_TICK_DIAG)
 #define C4PRO_TICK_MARK(slot) \
-    (*(volatile uint32_t *)(0x606fff00u + (slot) * 4u) = (uint32_t)current_tick)
+    (*(volatile uint32_t *)(0x606fff00u + (slot) * 4u) = \
+     *(volatile uint32_t *)0x18000024u)  /* TMR2CVR */
 #else
 #define C4PRO_TICK_MARK(slot) do { } while (0)
 #endif
@@ -4510,6 +4514,7 @@ int main(void)
 {
 #endif
     C4PRO_APP_ENTRY_HALT();
+    C4PRO_TICK_MARK(19);   /* boot-profile: TMR2 @ app main() entry */
     CHART(">init");
     init();
     CHART("<init");
@@ -5025,9 +5030,7 @@ static void init(void)
 
     CHART(">storage_init");
     C4PRO_BOOT_STEP("storage_init");
-    C4PRO_TICK_MARK(18);   /* pre-mount tick */
     rc = storage_init();
-    C4PRO_TICK_MARK(19);   /* post-mount tick: mount = w19 - w18 */
     CHART("<storage_init");
     C4PRO_BOOT_STEP("storage ok");
     C4PRO_STORAGE_HALT();
