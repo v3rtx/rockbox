@@ -142,7 +142,7 @@ static const struct usb_qualifier_descriptor __attribute__((aligned(2)))
 static const struct usb_string_descriptor usb_string_iManufacturer =
 USB_STRING_INITIALIZER(u"Rockbox.org");
 
-#ifdef C4PRO_SCU_DIAG
+#if defined(C4PRO_SCU_DIAG) || defined(C4PRO_BOOT_TICK_DIAG)
 /* Diagnostic: iProduct carries loader_reg XOR app_reg for the 4 unread SCU regs
  * (CLKCFG, CPUPD, CHIPCFG, DIVCON2) so `lsusb -v` reveals which one differs
  * between the loader's stuck-AHB state and the app's working-AHB state. */
@@ -493,7 +493,7 @@ void usb_core_init(void)
     if (initialized)
         return;
 
-#ifdef C4PRO_SCU_DIAG
+#if defined(C4PRO_SCU_DIAG) || defined(C4PRO_BOOT_TICK_DIAG)
     c4pro_scu_diag_fill();
 #endif
 

@@ -878,9 +878,19 @@ static int c4pro_native_crc_payload_region(uint32_t start_page,
 
     while (done < byte_count)
     {
+        /* Read back with the SAME engine the payload was written with (and that
+         * the loader reads it with at boot). HWECC pages carry inline per-sector
+         * ECC; a linear read would slurp those ECC bytes as data and CRC to
+         * garbage. */
+#ifdef C4PRO_PAYLOAD_HWECC
+        if (c4pro_native_nand_read_page_hwecc(start_page,
+                                              c4pro_install_verify))
+            return -1;
+#else
         if (c4pro_native_nand_read_linear_page(start_page,
                                                c4pro_install_verify))
             return -1;
+#endif
 
 #ifdef C4PRO_NATIVE_PAYLOAD_FULLPAGE
         {
@@ -3930,6 +3940,17 @@ static void c4pro_boot_profile_show(const char *where)
 #define C4PRO_PRE_ROOT_MENU_HALT(step) do { } while (0)
 #endif
 
+/* Screen-free boot-phase timing (diagnostic; off unless C4PRO_BOOT_TICK_DIAG).
+ * Stamps current_tick into HANDOFF words the C4PRO_SCU_DIAG USB iProduct fill
+ * surfaces (ho[18..21]); read via `lsusb -v -d 071b:3203 | grep iProduct`.
+ * w18=pre-mount, w19=post-mount, w20=at-USB-serve, w21=0xb007b007 marker. */
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_BOOT_TICK_DIAG)
+#define C4PRO_TICK_MARK(slot) \
+    (*(volatile uint32_t *)(0x606fff00u + (slot) * 4u) = (uint32_t)current_tick)
+#else
+#define C4PRO_TICK_MARK(slot) do { } while (0)
+#endif
+
 #if 1
 #define C4PRO_BOOT_HALT(step) do { } while (0)
 #define C4PRO_APP_ENTRY_HALT() do { } while (0)
@@ -4044,6 +4065,10 @@ static void c4pro_nand_write_stress(void)
 
 static void c4pro_usb_msc_serve(void)
 {
+    C4PRO_TICK_MARK(20);   /* time-to-USB-screen = kernel start -> here */
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_BOOT_TICK_DIAG)
+    *(volatile uint32_t *)0x606fff54u = 0xb007b007u;   /* HANDOFF[21] marker */
+#endif
     /* ~3 consecutive ~20ms ADC reads (~60ms) = a stable MENU press */
     const int C4PRO_MENU_EJECT_SAMPLES = 3;
     /* BACK held ~2s (deliberate; guards against an accidental tap dropping the
@@ -4515,7 +4540,7 @@ int main(void)
     /* All threads should be created and public queues registered by now */
     usb_start_monitoring();
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_USB_MSC_ENABLE)
+    defined(C4PRO_USB_MSC_ENABLE) && !defined(C4PRO_USB_MSC_EARLY)
     c4pro_usb_msc_serve();
 #endif
 #endif
@@ -5000,7 +5025,9 @@ static void init(void)
 
     CHART(">storage_init");
     C4PRO_BOOT_STEP("storage_init");
+    C4PRO_TICK_MARK(18);   /* pre-mount tick */
     rc = storage_init();
+    C4PRO_TICK_MARK(19);   /* post-mount tick: mount = w19 - w18 */
     CHART("<storage_init");
     C4PRO_BOOT_STEP("storage ok");
     C4PRO_STORAGE_HALT();
@@ -5014,6 +5041,19 @@ static void init(void)
         dbg_ports();
         panicf("ata: %d", rc);
     }
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+    defined(C4PRO_USB_MSC_ENABLE) && defined(C4PRO_USB_MSC_EARLY)
+    /* Serve USB-MSC immediately after the mount, before the rest of init and
+     * main()'s list_init/tree_init (which are UI-only). All of
+     * c4pro_usb_msc_serve's dependencies -- usb_init, lcd, adc/button, storage
+     * -- are already up by here, so this reclaims the ~2.9s those later init
+     * steps add before the USB screen appears. On eject it returns and the
+     * normal boot continues; usb_start_monitoring is thus also ordered before
+     * any multi-screen-API use, as required. */
+    usb_start_monitoring();
+    c4pro_usb_msc_serve();
+#endif
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_FTL_SYNTH_AUDIT)
