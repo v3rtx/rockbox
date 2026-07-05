@@ -4069,9 +4069,9 @@ static void c4pro_nand_write_stress(void)
 
 static void c4pro_usb_msc_serve(void)
 {
-    C4PRO_TICK_MARK(20);   /* time-to-USB-screen = kernel start -> here */
+    /* C4PRO_TICK_MARK(20); disabled: loader owns HANDOFF[20] (CLK DIAG STATUS) */
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(C4PRO_BOOT_TICK_DIAG)
-    *(volatile uint32_t *)0x606fff54u = 0xb007b007u;   /* HANDOFF[21] marker */
+    /* HANDOFF[21] marker disabled: loader owns [21] (PROFILE handoff mark) */
 #endif
     /* ~3 consecutive ~20ms ADC reads (~60ms) = a stable MENU press */
     const int C4PRO_MENU_EJECT_SAMPLES = 3;
@@ -4514,7 +4514,7 @@ int main(void)
 {
 #endif
     C4PRO_APP_ENTRY_HALT();
-    C4PRO_TICK_MARK(19);   /* boot-profile: TMR2 @ app main() entry */
+    /* C4PRO_TICK_MARK(19); disabled: loader owns HANDOFF[19] (CLK DIAG PLLCON1) */
     CHART(">init");
     init();
     CHART("<init");
