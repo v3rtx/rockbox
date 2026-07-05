@@ -234,8 +234,33 @@
 #ifndef C4PRO_USB_NO_SERIALIZE_WRITE
 #define C4PRO_USB_SERIALIZE_WRITE
 #endif
+/* CRASH_CAPTURE is what actually ARMS + pets the freeze-recovery watchdog
+ * (c4pro_wdt_capture_start + the tick pet in kernel-rk27xx.c). WDT_AUTOREBOOT
+ * alone only sets the post-reset behaviour -- without CRASH_CAPTURE the WDT is
+ * never armed, so a residual NAND-program freeze hangs dead instead of
+ * self-rebooting (observed 2026-07-05). Both are needed for the daily's
+ * auto-recover-on-freeze. The ~1s WDT reload only trips when the tick stops. */
+#ifndef C4PRO_NO_WDT_CRASH_CAPTURE
+#define C4PRO_WDT_CRASH_CAPTURE
+#endif
 #ifndef C4PRO_NO_WDT_AUTOREBOOT
 #define C4PRO_WDT_AUTOREBOOT
+#endif
+
+/* Production NAND layout + write scheduler -- default-on daily config. HWECC is
+ * the on-NAND layout (inline 512+16) every production volume is formatted with;
+ * 2PLANE is the ~4 MB/s two-plane write path (requires HWECC). These were only
+ * ever build flags, so a recipe that dropped them silently fell back to the
+ * incompatible software-BCH layout + single-plane (2 MB/s) and CORRUPTED an
+ * HWECC volume -- the root of a long write-instability saga (2026-07-05). Baked
+ * in so they can never be lost. Opt out via the C4PRO_NAND_NO_* twins only for a
+ * legacy software-BCH volume. (The requires-HWECC #error checks live further down
+ * in the FTL section and are satisfied because HWECC is defined here first.) */
+#ifndef C4PRO_NAND_NO_HWECC
+#define C4PRO_NAND_HWECC
+#endif
+#ifndef C4PRO_NAND_NO_2PLANE
+#define C4PRO_NAND_2PLANE
 #endif
 
 /* C4PRO_WDT_CRASH_CAPTURE (opt-in, not default-on): JTAG-free freeze-forensics
