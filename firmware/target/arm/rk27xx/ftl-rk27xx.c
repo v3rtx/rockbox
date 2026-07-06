@@ -2505,6 +2505,11 @@ static int c4own_flush_pair(uint32_t slot0, uint32_t slot1,
 static int c4own_flush_batched_2plane(bool all)
 {
     unsigned guard = 2u * C4OWN_CACHE_SLOTS + 2u;
+    /* Bad-block retry budget: on a 2-plane program failure the pair is retired
+     * and the slots stay dirty; retry with a fresh pair rather than failing the
+     * whole flush on the first bad block. Bounded so a broadly-bad region still
+     * terminates. Retries do not consume `guard` (see below). */
+    unsigned bb_retry = 128u;
 
     while (guard--)
     {
@@ -2570,7 +2575,18 @@ static int c4own_flush_batched_2plane(bool all)
             int r = c4own_flush_pair((uint32_t)s0, (uint32_t)s1, pblk0, hi,
                                      c4own_pblk_bank((uint32_t)pblk0));
             if (r == 1)
-                return 1;
+            {
+                /* Program failure: c4own_flush_pair already retired the bad pair
+                 * and left the slots dirty. Retry with a fresh pair so a write
+                 * (notably a format's metadata write) routes around sparse bad
+                 * blocks instead of dying on the first one. A retry must NOT
+                 * consume the forward-progress guard, only the bad-block budget. */
+                if (bb_retry == 0u)
+                    return 1;
+                bb_retry--;
+                guard++;
+                continue;
+            }
             if (r == 2)
             {
                 c4own_used[pblk0] = 0;
@@ -2581,6 +2597,12 @@ static int c4own_flush_batched_2plane(bool all)
         }
     }
 
+    /* Guard/bad-block budget exhausted: if an all-flush still has dirty slots the
+     * data was NOT persisted -- report failure rather than a false success. */
+    if (all)
+        for (uint32_t s = 0; s < C4OWN_CACHE_SLOTS; s++)
+            if (c4own_cache_valid[s] && c4own_cache_dirty[s])
+                return 1;
     return 0;
 }
 #endif /* C4PRO_NAND_2PLANE */
