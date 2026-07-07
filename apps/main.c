@@ -5491,6 +5491,15 @@ static void init(void)
     }
 #endif
 
+#if defined(HAVE_MULTIVOLUME) && defined(COLORFLY_C4_PRO)
+    /* Rebuild the volume display names NOW that disk_mount_all() has populated the
+     * volume->drive map. The earlier init_volume_names() (in init(), before the
+     * mount) ran with an empty map, so every volume resolved to drive 0 = NAND and
+     * the microSD showed as "<NAND1>". With the map populated, drive 1 = SD ->
+     * "<microSD1>". */
+    init_volume_names();
+#endif
+
     C4PRO_MOUNT_READY_HALT();
     C4PRO_BOOT_STEP("mount ok");
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
