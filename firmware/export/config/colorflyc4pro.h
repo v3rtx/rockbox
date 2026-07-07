@@ -54,14 +54,25 @@
 /* define this if you have a flash memory storage */
 #define HAVE_FLASH_STORAGE
 
-#define CONFIG_STORAGE STORAGE_NAND
+/* NAND (built-in, drive 0) + microSD (drive 1). Two storage bits auto-enable
+ * CONFIG_STORAGE_MULTI. storage.c is C4-gated to register NAND before SD so NAND
+ * stays drive 0 (everything C4 assumes drive 0 = NAND). microSD detect is on
+ * LSADC ch2 (see card_detect_target). */
+#define CONFIG_STORAGE (STORAGE_NAND | STORAGE_SD)
 
 #define CONFIG_NAND NAND_RK27XX
 #define HAVE_SW_TONE_CONTROLS
 
 #define HAVE_SW_VOLUME_CONTROL
 
-#define NUM_DRIVES 1
+#define NUM_DRIVES 2
+#define HAVE_MULTIDRIVE
+#define HAVE_MULTIVOLUME
+/* ISOLATION result: read-only SD still wild-jumped during NAND playback, so the
+ * corruption is NOT the SD data path -- it is a THREAD STACK OVERFLOW from enabling
+ * SD (deeper multi-drive/multi-volume + SD call chain). The fault handler now names
+ * the faulting thread (C4PRO_FAULT_VISIBLE); bump that thread's stack once named. */
+/* #define C4PRO_SD_READONLY_TEST */
 #define SECTOR_SIZE 512
 
 /* for small(ish) SD cards */

@@ -472,6 +472,21 @@ void commit_discard_dcache_range (const void *base, unsigned int size)
     uint32_t end_opcode = (uint32_t)((uintptr_t)base + size) | 0x01;
     uint32_t opcode = (uint32_t)((uintptr_t)base & 0xffffffe0) | 0x01;
 
+#ifdef COLORFLY_C4_PRO
+    /* CACHEOP is a SINGLE shared cache-controller register and a cache op is
+     * issue-then-poll -- NOT atomic. The rk27xx audio path arms its HDMA from
+     * pcm_play_dma_start() via this same range op (pcm-rk27xx.c), reachable from
+     * the HDMA ISR's getmore refill. If that fires while this loop is mid-op it
+     * clobbers the in-flight CACHEOP -> cache-controller corruption -> a random
+     * wild-branch data abort (seen once the microSD was enabled). It never bit
+     * with NAND-only playback because NAND is PIO with NO cache ops; the SD driver
+     * added a second, thread-context cache-op caller that the audio ISR races.
+     * Serialize with IRQs masked, exactly as commit_discard_idcache() does -- the
+     * spin is bounded (C4PRO_CACHE_SPIN_CAP) so the IRQ-off window stays short. The
+     * USB path already reaches this IRQ-masked; disable_irq_save nests safely. */
+    int old_irq = disable_irq_save();
+#endif
+
     while (opcode <= end_opcode)
     {
         C4PRO_CACHE_WAIT();
@@ -486,6 +501,10 @@ void commit_discard_dcache_range (const void *base, unsigned int size)
      * a DMA from the just-flushed buffer (the rk27xx UDC IN DMA is a separate
      * bus master). Wait for it here, matching cache_invalidate_way(). */
     C4PRO_CACHE_WAIT();
+
+#ifdef COLORFLY_C4_PRO
+    restore_irq(old_irq);
+#endif
 }
 
 #if !defined(BOOTLOADER) && defined(HAVE_ADJUSTABLE_CPU_FREQ)

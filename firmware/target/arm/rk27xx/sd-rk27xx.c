@@ -35,6 +35,9 @@
 #include "panic.h"
 #include "stdbool.h"
 #include "storage.h"
+#ifdef COLORFLY_C4_PRO
+#include "adc.h"        /* C4 card-detect is on LSADC ch2 (ADC_EXTRA) */
+#endif
 #include "timeout.h"
 #include "lcd.h"
 #include <stdarg.h>
@@ -155,6 +158,12 @@ static inline bool card_detect_target(void)
 #elif defined(IHIFI760) || defined(IHIFI960)
     /* TODO: find out pin */
     return true;
+#elif defined(COLORFLY_C4_PRO)
+    /* C4 microSD detect is LSADC channel 2 (ADC_EXTRA), NOT a GPIO and NOT the
+     * SD controller's CD/DAT3. Present when the ADC reads below ~512 -- from the
+     * stock SYSTEM_BASE.RKW card_detect routine @0x6002bec0 (reads adc ch2,
+     * cmp #0x200, branch-if-<= to "present"). */
+    return (adc_read(ADC_EXTRA) < 512);
 #else
 #error "Unknown target"
 #endif
@@ -583,6 +592,16 @@ int sd_write_sectors(IF_MD(int drive,) sector_t start, int count,
 {
 #ifdef HAVE_MULTIDRIVE
     (void) drive;
+#endif
+#ifdef C4PRO_SD_READONLY_TEST
+    /* ISOLATION: SD writes are inert -- no hardware, no DMA, no cache op, no SD
+     * interrupt from the write path. If playback-from-SD + NAND browsing is then
+     * stable, the residual wild-jump corruption lives in the SD WRITE path; if it
+     * still crashes, it is the SD read/transfer/enablement path. Returns success so
+     * the FAT layer does not cascade into error handling (nothing important is
+     * written during a read/playback test). */
+    (void) start; (void) count; (void) buf;
+    return 0;
 #endif
 #if defined(BOOTLOADER) /* we don't need write support in bootloader */
     (void) start;

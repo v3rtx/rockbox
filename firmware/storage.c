@@ -286,9 +286,20 @@ static inline void storage_thread_init(void)
                                       IF_COP(, CPU));
 }
 
+#ifdef COLORFLY_C4_PRO
+/* Cross-driver storage serialization lock (see storage_read_sectors for why). */
+static struct mutex storage_mtx;
+#endif
+
 int storage_init(void)
 {
     int rc=0;
+
+#ifdef COLORFLY_C4_PRO
+    /* Init before any driver init / storage access -- the cross-driver serialization
+     * lock (see storage_read_sectors) must exist before the first read/write. */
+    mutex_init(&storage_mtx);
+#endif
 
 #ifdef HAVE_SDMMC_HOST
     sdmmc_host_target_init();
@@ -320,6 +331,22 @@ int storage_init(void)
     }
 #endif
 
+#if (CONFIG_STORAGE & STORAGE_NAND) && defined(COLORFLY_C4_PRO)
+    /* C4: the built-in NAND is the MAIN storage and MUST be drive 0 -- its owned
+     * FTL, the boot path, the USB-MSC serve loop and the custom disk_mount_all all
+     * assume drive 0 = NAND. Register it BEFORE SD (the default order below puts SD
+     * first) so the microSD lands on drive 1 and nothing that hard-codes drive 0
+     * has to change. */
+    if ((rc=nand_init())) return rc;
+
+    int c4_nand_drives = nand_num_drives(num_drives);
+    for (i=0; i<c4_nand_drives; i++)
+    {
+        storage_drivers[num_drives++] =
+            (STORAGE_NAND<<DRIVER_OFFSET) | (i << DRIVE_OFFSET);
+    }
+#endif
+
 #if (CONFIG_STORAGE & STORAGE_SD)
     if ((rc=sd_init())) return rc;
 
@@ -331,7 +358,7 @@ int storage_init(void)
     }
 #endif
 
-#if (CONFIG_STORAGE & STORAGE_NAND)
+#if (CONFIG_STORAGE & STORAGE_NAND) && !defined(COLORFLY_C4_PRO)
     if ((rc=nand_init())) return rc;
 
     int nand_drives = nand_num_drives(num_drives);
@@ -364,9 +391,37 @@ int storage_init(void)
     return rc;
 }
 
+#ifdef COLORFLY_C4_PRO
+/* Serialize ALL storage access across drivers. The rk27xx SD driver reprograms the
+ * GLOBAL MMU line-buffer routing (MMU_CTRL) during its DMA transfers; on the C4 the
+ * NAND (drive 0) is live at the same time as the SD (drive 1) -- playback reads audio
+ * from SD while resume/settings/database land on NAND -- and the NAND's concurrent
+ * CPU-side buffer work inside that MMU window corrupts and data-aborts. The per-driver
+ * nand_mtx/sd_mtx don't serialize against each other, so one shared lock at this common
+ * layer keeps NAND and SD ops strictly non-overlapping. (storage_mtx is declared
+ * above storage_init so it can be mutex_init'd there before any access.) */
+static int storage_read_sectors_routed(int drive, sector_t start, int count, void* buf);
+static int storage_write_sectors_routed(int drive, sector_t start, int count,
+                                        const void* buf);
+static int storage_flush_routed(void);
+
+int storage_read_sectors(int drive, sector_t start, int count, void* buf)
+{
+    int rc;
+    mutex_lock(&storage_mtx);
+    rc = storage_read_sectors_routed(drive, start, count, buf);
+    mutex_unlock(&storage_mtx);
+    return rc;
+}
+
+static int storage_read_sectors_routed(int drive, sector_t start, int count,
+                                       void* buf)
+{
+#else
 int storage_read_sectors(IF_MD(int drive,) sector_t start, int count,
                          void* buf)
 {
+#endif
 #ifdef CONFIG_STORAGE_MULTI
     int driver=(storage_drivers[drive] & DRIVER_MASK)>>DRIVER_OFFSET;
     int ldrive=(storage_drivers[drive] & DRIVE_MASK)>>DRIVE_OFFSET;
@@ -406,9 +461,24 @@ int storage_read_sectors(IF_MD(int drive,) sector_t start, int count,
 
 }
 
+#ifdef COLORFLY_C4_PRO
+int storage_write_sectors(int drive, sector_t start, int count, const void* buf)
+{
+    int rc;
+    mutex_lock(&storage_mtx);
+    rc = storage_write_sectors_routed(drive, start, count, buf);
+    mutex_unlock(&storage_mtx);
+    return rc;
+}
+
+static int storage_write_sectors_routed(int drive, sector_t start, int count,
+                                        const void* buf)
+{
+#else
 int storage_write_sectors(IF_MD(int drive,) sector_t start, int count,
                           const void* buf)
 {
+#endif
 #ifdef CONFIG_STORAGE_MULTI
     int driver=(storage_drivers[drive] & DRIVER_MASK)>>DRIVER_OFFSET;
     int ldrive=(storage_drivers[drive] & DRIVE_MASK)>>DRIVE_OFFSET;
@@ -571,9 +641,24 @@ int storage_soft_reset(void)
 }
 
 #ifdef HAVE_STORAGE_FLUSH
+#ifdef COLORFLY_C4_PRO
+int storage_flush(void)
+{
+    int rc;
+    mutex_lock(&storage_mtx);
+    rc = storage_flush_routed();
+    mutex_unlock(&storage_mtx);
+    return rc;
+}
+
+static int storage_flush_routed(void)
+{
+    int rc=0;
+#else
 int storage_flush(void)
 {
     int rc=0;
+#endif
 
 #if (CONFIG_STORAGE & STORAGE_ATA)
     if ((rc=ata_flush())) return rc;
