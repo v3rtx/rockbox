@@ -203,6 +203,24 @@ static NO_INLINE void thread_stkov(struct thread_entry *thread)
     thread_panicf("Stkov", thread);
 }
 
+#ifdef COLORFLY_C4_PRO
+/* Name of the currently-running thread, for the C4 visible-fault handler
+ * (system-arm-classic.c). Called from an ABORT-mode context with a corrupted
+ * scheduler possible, so every pointer is DRAM-range-guarded and no allocation /
+ * formatting is done -- just returns the static name string, or NULL. */
+const char *c4pro_current_thread_name(void)
+{
+    struct thread_entry *t = __running_self_entry();
+    const char *n;
+    if ((uintptr_t)t < 0x60000000u || (uintptr_t)t >= 0x61000000u)
+        return 0;
+    n = t->name;
+    if ((uintptr_t)n < 0x60000000u || (uintptr_t)n >= 0x61000000u)
+        return 0;
+    return n;
+}
+#endif
+
 #if THREAD_EXTRA_CHECKS
 #define THREAD_PANICF(msg, thread) \
     thread_panicf(msg, thread)

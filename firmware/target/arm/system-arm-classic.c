@@ -165,6 +165,7 @@ void NORETURN_ATTR UIE(unsigned int pc, unsigned int num)
             static const char hx[] = "0123456789abcdef";
             static char pcbuf[16];   /* "PC=xxxxxxxx" */
             static char phbuf[16];   /* "PH=xx CNT=xx" */
+            static char thbuf[24];   /* "T:<threadname>" */
             int i;
 
             pcbuf[0] = 'P'; pcbuf[1] = 'C'; pcbuf[2] = '=';
@@ -178,6 +179,22 @@ void NORETURN_ATTR UIE(unsigned int pc, unsigned int num)
             phbuf[5] = ' '; phbuf[6] = 'N'; phbuf[7] = '='; phbuf[8] = 'r';
             /* N=r reminds: read c4pro_fault_num for the exception type */
             phbuf[9] = 0;
+
+            /* Current thread name = the faulting thread. For a stack-overflow
+             * return-to-0xdeadbeef this IS the overflowing thread -- exactly what
+             * we need to name. c4pro_current_thread_name() lives in thread.c (which
+             * has the scheduler internals) and DRAM-range-guards its pointers so a
+             * corrupted scheduler state cannot double-fault this handler. */
+            {
+                extern const char *c4pro_current_thread_name(void);
+                const char *nm = c4pro_current_thread_name();
+                int j = 0;
+                thbuf[0] = 'T'; thbuf[1] = ':';
+                if (nm)
+                    for (j = 0; j < 20 && nm[j]; j++)
+                        thbuf[2 + j] = nm[j];
+                thbuf[2 + j] = 0;
+            }
 
             for (;;)
             {
@@ -193,6 +210,7 @@ void NORETURN_ATTR UIE(unsigned int pc, unsigned int num)
                 lcd_puts(0, 0, "*** CPU FAULT ***");
                 lcd_puts(0, 2, uiename[num]);   /* literal string, no format */
                 lcd_puts(0, 3, pcbuf);
+                lcd_puts(0, 4, thbuf);          /* faulting thread (names a stkov) */
                 lcd_puts(0, 5, phbuf);
                 lcd_puts(0, 6, pcbuf);          /* repeated for legibility */
                 lcd_update();
