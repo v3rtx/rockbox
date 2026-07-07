@@ -1433,6 +1433,7 @@ extern void c4pro_usb_diag_sample(void);
 extern void c4pro_usb_diag_force_reattach(void);
 extern void c4pro_usb_diag_enter_storage_mode(void);
 extern void c4pro_usb_diag_exit_storage_mode(void);
+extern void c4pro_usb_diag_remount_storage(void);
 extern void c4pro_usb_diag_force_storage_config(void);
 #endif
 
@@ -4091,6 +4092,97 @@ static void c4pro_usb_msc_serve(void)
     c4pro_wdt_crash_capture_check_and_report();
 #endif
 
+#ifdef C4PRO_NAND_2PLANE_PCYCLE_TEST
+    /* Two-plane DURABILITY across a real power cycle -- raw NAND, no FS. Lives here
+     * (not ftl_init): the native runtime app runs only c4pro_usb_msc_serve, so
+     * ftl_init diag blocks never reach the screen/halt in this build. Validates the
+     * per-plane-status fix to c4pro_nand_write_page_2plane (test plane-1 fail bit1
+     * + two-stage ready wait) against a genuine reset -- the powered round-trip
+     * can't. Self-sequences via a SINGLE-PLANE control marker (known durable):
+     *   NO marker      -> WRITE a known 2-plane pattern into scratch blocks
+     *                     8000/8001, set marker, halt "WRITTEN".
+     *   marker present -> READ those pages back, compare, halt SURVIVED / LOST,
+     *                     clear marker (re-arms WRITE for the next reset).
+     * Cycle with the RESET button, USB left connected. NAND + LCD are up by now
+     * (storage is a serve dependency; the loader lit the panel). */
+    {
+        extern uint32_t c4pro_nand_write_page_2plane(uint32_t, uint32_t, uint32_t,
+                                        const void*, const void*, uint32_t);
+        extern uint32_t c4pro_nand_read_page_hwecc(uint32_t, uint32_t, void*, uint32_t);
+        extern uint32_t c4pro_nand_write_page_hwecc(uint32_t, uint32_t,
+                                        const void*, uint32_t);
+        extern uint32_t c4pro_nand_erase_block(uint32_t, uint32_t);
+        extern uint32_t c4pro_nand_fmwait;
+        static unsigned char b0[4096], b1[4096], rb[4096];
+        const uint32_t PPB  = 128u;              /* C4OWN_PAGES_PER_BLOCK */
+        const uint32_t row0 = 8000u * PPB;
+        const uint32_t row1 = 8001u * PPB;       /* +1 block = plane 1 (block bit0) */
+        const uint32_t rowc = 8002u * PPB;
+        const int NPAGES = 16;
+        int p, i, mism0 = 0, mism1 = 0, rderr0 = 0, rderr1 = 0, wfail = 0;
+        bool have_marker = false;
+
+        c4pro_nand_fmwait = 0x1041;              /* production NAND timing */
+
+        if (!c4pro_nand_read_page_hwecc(0, rowc, rb, 8))
+            if (rb[0] == 0x32 && rb[1] == 0x50 && rb[2] == 0xC4)
+                have_marker = true;
+
+        lcd_setfont(FONT_SYSFIXED);
+        lcd_clear_display();
+        lcd_puts(0, 0, "2P PCYCLE");
+        if (!have_marker)
+        {
+            c4pro_nand_erase_block(0, row0);
+            c4pro_nand_erase_block(0, row1);
+            for (p = 0; p < NPAGES; p++)
+            {
+                for (i = 0; i < 4096; i++)
+                {
+                    b0[i] = (unsigned char)(0xC3 + p * 17 + i * 7);
+                    b1[i] = (unsigned char)(0x5A + p * 23 + i * 13);
+                }
+                if (c4pro_nand_write_page_2plane(0, row0 + (uint32_t)p,
+                                                 row1 + (uint32_t)p, b0, b1, 8))
+                    wfail++;             /* per-plane fail now DETECTED (the fix) */
+            }
+            c4pro_nand_erase_block(0, rowc);
+            for (i = 0; i < 4096; i++) rb[i] = (unsigned char)i;
+            rb[0] = 0x32; rb[1] = 0x50; rb[2] = 0xC4;
+            c4pro_nand_write_page_hwecc(0, rowc, rb, 8);
+            lcd_putsf(0, 1, "WRITTEN wfail=%d", wfail);
+            lcd_puts(0, 2, "RESET NOW (usb in)");
+        }
+        else
+        {
+            for (p = 0; p < NPAGES; p++)
+            {
+                if (c4pro_nand_read_page_hwecc(0, row0 + (uint32_t)p, rb, 8))
+                    rderr0++;
+                else for (i = 0; i < 4096; i++)
+                    if (rb[i] != (unsigned char)(0xC3 + p * 17 + i * 7)) mism0++;
+                if (c4pro_nand_read_page_hwecc(0, row1 + (uint32_t)p, rb, 8))
+                    rderr1++;
+                else for (i = 0; i < 4096; i++)
+                    if (rb[i] != (unsigned char)(0x5A + p * 23 + i * 13)) mism1++;
+            }
+            lcd_putsf(0, 1, "p0 m=%d e=%d", mism0, rderr0);
+            lcd_putsf(0, 2, "p1 m=%d e=%d", mism1, rderr1);
+            lcd_puts(0, 3, (mism0 == 0 && mism1 == 0 && rderr0 == 0 && rderr1 == 0)
+                            ? "SURVIVED" : "LOST/CORRUPT");
+            c4pro_nand_erase_block(0, rowc);
+        }
+        lcd_update();
+        while (1)
+        {
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
+            sleep(HZ);
+        }
+    }
+#endif
+
 #ifdef C4PRO_NAND_WRITE_STRESS
     /* Runs with USB never attached; returns only on a MENU hold, after which
      * the normal USB-MSC serve below proceeds. */
@@ -4477,6 +4569,15 @@ static void c4pro_usb_msc_serve(void)
         lcd_update();
         c4pro_usb_diag_exit_storage_mode();
         sleep(HZ / 2);
+    }
+    else
+    {
+        /* No MENU eject: either a no-USB cold boot (serve loop never ran) or a
+         * host cable-pull. We still entered storage mode at serve entry, which
+         * disk_unmount_all'd the FAT, so REMOUNT it before returning to the player
+         * -- otherwise the file browser and theme loader see an unmounted volume
+         * ("no files"). Keeps USB monitoring intact (no host to disconnect from). */
+        c4pro_usb_diag_remount_storage();
     }
 }
 #endif
@@ -5347,6 +5448,48 @@ static void init(void)
 #endif
         }
     }
+
+#ifdef C4PRO_MOUNT_DIAG
+    /* Pin the "empty file browser on a no-USB cold boot" bug: after disk_mount_all,
+     * show the mount rc, each volume's partinfo, and whether opendir("/") actually
+     * enumerates the root. Compare a no-USB cold boot vs a USB+eject boot -- if the
+     * no-USB one shows root n=0 while USB+eject shows n>0, the difference is in the
+     * mount/volume layer, not the FTL (which MSC reads identically). Halts for a key. */
+    {
+        struct partinfo pinfo;
+        int dline = 0, n = 0;
+        char first[40] = "(none)";
+        DIR *dd;
+        struct dirent *ee;
+        lcd_setfont(FONT_SYSFIXED);
+        lcd_clear_display();
+        lcd_putsf(0, dline++, "MNTDIAG rc=%d usb=%d mnt=%d", rc,
+                  usb_detect() == USB_INSERTED ? 1 : 0, mounted ? 1 : 0);
+        for (int vi = 0; vi < NUM_VOLUMES; vi++) {
+            disk_partinfo(vi, &pinfo);
+            lcd_putsf(0, dline++, "P%d T%02x Sz%llx", vi, pinfo.type,
+                      (unsigned long long)pinfo.size);
+        }
+        dd = opendir("/");
+        if (dd) {
+            while ((ee = readdir(dd))) {
+                if (n == 0) strlcpy(first, ee->d_name, sizeof(first));
+                n++;
+            }
+            closedir(dd);
+        } else {
+            lcd_puts(0, dline++, "opendir / FAILED");
+        }
+        lcd_putsf(0, dline++, "root n=%d", n);
+        lcd_putsf(0, dline++, "first=%s", first);
+        lcd_puts(0, dline++, "(press key)");
+        lcd_update();
+        button_clear_queue();
+        while (button_get_w_tmo(HZ / 2) == BUTTON_NONE)
+            ;
+        button_clear_queue();
+    }
+#endif
 
     C4PRO_MOUNT_READY_HALT();
     C4PRO_BOOT_STEP("mount ok");

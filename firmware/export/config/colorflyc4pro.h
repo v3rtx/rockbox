@@ -137,15 +137,19 @@
  * flush uses storage_flush(), which needs HAVE_STORAGE_FLUSH defined here. */
 #define HAVE_STORAGE_FLUSH
 
-/* Mount CHECKPOINT: ON, ISOLATION TEST (2026-07-07). The earlier "checkpoint
- * corrupts" observation came from a build where 2-plane was ALSO on -- and 2-plane
- * is now the confirmed culprit. This tests the checkpoint ALONE (2-plane OFF) to
- * see if its out-of-order superblock programming (page0, entries, footer@126,
- * marker@127 -- MLC-unsafe in theory) is actually durable on this NAND. If a
- * host-eject + replug cycle stays clean with this, the checkpoint is fine and we
- * keep fast boot; if it corrupts, rewrite it MLC-legal (footer@page1, entries
- * after, dirty marker@N+2 -- one contiguous sequential run). */
+/* Mount CHECKPOINT: ON (2026-07-07) -- fast cold mount, durable + EXONERATED. The
+ * "empty Rockbox file browser on a no-USB cold boot" bug reproduces IDENTICALLY
+ * with the checkpoint OFF (authoritative full scan mount), so it is NOT the FTL /
+ * cold-load -- it lives in Rockbox's own disk_mount_all / file-browser layer and
+ * is independent of storage. Checkpoint is durable (2-plane power-cycle verified)
+ * and safe, so keep it ON for fast boot. */
 #define C4PRO_FTL_MOUNT_CHECKPOINT
+/* C4PRO_MOUNT_DIAG: after disk_mount_all, dump mount rc + partinfo + opendir("/")
+ * root entry count, halt for a key. Diagnosed the empty-browser-on-no-USB-cold-boot
+ * bug (mount OK at init, then c4pro_usb_msc_serve unmounted for MSC and only
+ * remounted on MENU eject) -- fixed via c4pro_usb_diag_remount_storage on the
+ * non-eject serve exit. Kept OFF; flip on to re-inspect the post-mount root. */
+/* #define C4PRO_MOUNT_DIAG */
 
 /* Hardware controlled charging with monitoring */
 #define CONFIG_CHARGING CHARGING_MONITOR
@@ -300,16 +304,23 @@
  * the freeze is RECOVERED in place (copy resumes), so the device never reboots
  * under the user. Opt in only for debugging with -DC4PRO_WDT_CRASH_CAPTURE. */
 #define C4PRO_NAND_HWECC
-/* C4PRO_NAND_2PLANE: OFF (2026-07-07). Isolated: with the host-flush bug fixed,
- * single-plane is durable but re-enabling 2-plane corrupts across a power cycle
- * EVEN AFTER a proper host eject -- so the original finding was right: the
- * two-plane array commit (c4pro_nand_write_page_2plane, nand-rk27xx.c: 0x11
- * plane-0 dummy -> 0x81/0x10 final) reads back correctly WHILE POWERED but is not
- * durably fixed into the array (shared-tPROG wait / FMWAIT too short, or plane-1
- * serial input not committed). It was masked by the host-flush bug, not a red
- * herring. Re-enable only after the 2-plane program's tPROG/commit is fixed +
- * verified across a real power cycle. Single-plane hwecc is durable. */
-/* #define C4PRO_NAND_2PLANE */
+/* C4PRO_NAND_2PLANE: ON (2026-07-07) -- FIXED and power-cycle-verified. The
+ * durability failure was a per-plane STATUS bug: this part reports two-plane
+ * program P/F per-plane (plane 0 in status bit0, plane 1 in bit1, matching stock
+ * rkboot_s3 0x60705c40 which samples bit1 for multi-plane). We tested only bit0,
+ * so a failed/marginal PLANE-1 program was silently committed -- BCH corrected the
+ * fresh read (looked fine powered) but it decayed across a power cycle. Fix in
+ * c4pro_nand_write_page_2plane: test BOTH fail bits (status & 0x03) + stock's
+ * two-stage ready wait (controller-ready THEN NAND 0x70 bit6) before sampling P/F,
+ * on both the 0x11 and 0x10 phases. Verified via C4PRO_NAND_2PLANE_PCYCLE_TEST:
+ * 7 write->reset->read cycles, all SURVIVED, wfail=0 (was: whole plane-1 half lost
+ * every cycle). ~2x write throughput; the FTL retires any genuinely-failed pair
+ * via the now-correct per-plane status. */
+#define C4PRO_NAND_2PLANE
+/* C4PRO_NAND_2PLANE_PCYCLE_TEST: raw-NAND power-cycle durability probe (lives in
+ * c4pro_usb_msc_serve, not ftl_init -- the native app runs only that). OFF now the
+ * fix is verified; flip on to re-check the 2-plane primitive after any change. */
+/* #define C4PRO_NAND_2PLANE_PCYCLE_TEST */
 #define C4PRO_NAND_FAST_FORMAT
 #define C4PRO_NAND_BCH_NO_RMW
 #define C4PRO_NAND_FMCTL_NO_RMW

@@ -1662,7 +1662,8 @@ uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
     return (status & 0x01) ? 4 : 0;   /* bit0 = program FAIL */
 }
 
-#if defined(C4PRO_NAND_2PLANE) || defined(C4PRO_NAND_2PLANE_TEST)
+#if defined(C4PRO_NAND_2PLANE) || defined(C4PRO_NAND_2PLANE_TEST) || \
+    defined(C4PRO_NAND_2PLANE_PCYCLE_TEST)
 /* Stage one plane's payload into the FMC via the SAME proven per-sector BCH path
  * as c4pro_nand_write_page_hwecc (PAGE_BUF slots + FLCTL=0xA26|((s&3)<<3)). The
  * 0x80/0x81 serial-input command must already be open for this plane.
@@ -1697,6 +1698,32 @@ static bool c4pro_2plane_stage(uint32_t bank, const unsigned char *data,
     return true;
 }
 
+/* Two-plane completion wait, matching the stock discipline (rkboot_s3 program
+ * fn 0x60705b68): wait the controller-ready bit FIRST, THEN poll the NAND's own
+ * READ-STATUS byte (0x70) until bit6 (R/B ready) is set, and only then return
+ * the status byte so the caller samples the per-plane P/F bits after the shared
+ * two-plane tPROG has truly completed. Our old single nand_wait_ready() sampled
+ * status a hair early on a slow die. Returns the final status byte, or -1 on
+ * timeout. */
+static int c4pro_2plane_wait_status(uint32_t bank)
+{
+    unsigned guard, status;
+
+    if (!nand_wait_ready())
+        return -1;
+
+    guard = 400000u;
+    do
+    {
+        FLASH_CMD(bank) = 0x70;
+        status = FLASH_DATA(bank);
+        if (status & 0x40u)             /* bit6 = R/B ready */
+            return (int)status;
+    } while (--guard);
+
+    return -1;
+}
+
 /*
  * Two-plane page program -- the stock ~6.7 MB/s lever (2 pages per single tPROG).
  *
@@ -1722,8 +1749,6 @@ uint32_t c4pro_nand_write_page_2plane(uint32_t bank, uint32_t row0, uint32_t row
                                       const void *buf0, const void *buf1,
                                       uint32_t nsec)
 {
-    unsigned status;
-
     if (bank > 3 || !buf0 || !buf1 || nsec == 0 || nsec > 8)
         return 1;
 
@@ -1756,7 +1781,11 @@ uint32_t c4pro_nand_write_page_2plane(uint32_t bank, uint32_t row0, uint32_t row
     }
     NAND_STAGE(0x2300u);   /* 0x11 dummy confirm wait */
     FLASH_CMD(bank) = 0x11;   /* plane-0 dummy confirm (no array program yet) */
-    if (!nand_wait_ready())
+    /* Inter-plane wait via the NAND's own status bit6 (stock reads the multi-plane
+     * read-status here), not just the controller FM_RDY: plane-1 serial input must
+     * not begin until plane 0's dummy-busy (tDBSY) has cleared, else plane 0 is
+     * latched marginal. */
+    if (c4pro_2plane_wait_status(bank) < 0)
         goto abort_reset;
 
     /* ---- PHASE 1: plane 1 serial input, then final two-plane commit 0x10 ---- */
@@ -1771,16 +1800,25 @@ uint32_t c4pro_nand_write_page_2plane(uint32_t bank, uint32_t row0, uint32_t row
         goto abort_reset;
     NAND_STAGE(0x2500u);   /* 0x10 final commit: shared tPROG for both planes */
     FLASH_CMD(bank) = 0x10;   /* final commit -> ONE tPROG programs both planes */
-    if (!nand_wait_ready())
-        goto abort_reset;
+    {
+        int st = c4pro_2plane_wait_status(bank);
+        if (st < 0)
+            goto abort_reset;
 
-    FLASH_CMD(bank) = 0x70;
-    status = FLASH_DATA(bank);
-    nand_deselect();
-    NAND_STAGE(0);
-    last_activity = current_tick;
+        nand_deselect();
+        NAND_STAGE(0);
+        last_activity = current_tick;
 
-    return (status & 0x01) ? 4 : 0;   /* bit0 = unified two-plane FAIL */
+        /* Two-plane program P/F is PER-PLANE on this part: plane 0 in bit0,
+         * plane 1 in bit1 (stock samples bit1 for the multi-plane case,
+         * rkboot_s3 0x60705c40: lsr status,#1; tst #1). Testing only bit0 -- as
+         * we did -- MISSED a failed/marginal plane-1 program: BCH still corrected
+         * the fresh read so it looked fine while powered, but the pair was
+         * committed with a plane-1 half that decayed across a power cycle. Test
+         * BOTH planes' fail bits so a marginal plane retires the pair (the FTL
+         * then retries on a fresh pair / falls back to single-plane). */
+        return (st & 0x03) ? 4 : 0;
+    }
 
 abort_reset:
     /* Never leave the die parked mid two-plane sequence: once 0x11 has been
@@ -1796,7 +1834,7 @@ abort_reset:
     NAND_STAGE(0);
     return 3;
 }
-#endif /* C4PRO_NAND_2PLANE || C4PRO_NAND_2PLANE_TEST */
+#endif /* C4PRO_NAND_2PLANE || C4PRO_NAND_2PLANE_TEST || C4PRO_NAND_2PLANE_PCYCLE_TEST */
 
 /* Hardware-ECC page read, matching c4pro_nand_write_page_hwecc's inline
  * 512+16-per-sector layout. Unlike nand_read_page() (which re-seeks half 1 at

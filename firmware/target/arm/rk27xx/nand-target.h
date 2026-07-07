@@ -80,7 +80,8 @@ uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
                                      const void* databuffer, uint32_t nsec);
 uint32_t c4pro_nand_read_page_hwecc(uint32_t bank, uint32_t page,
                                     void* databuffer, uint32_t nsec);
-#if defined(C4PRO_NAND_2PLANE) || defined(C4PRO_NAND_2PLANE_TEST)
+#if defined(C4PRO_NAND_2PLANE) || defined(C4PRO_NAND_2PLANE_TEST) || \
+    defined(C4PRO_NAND_2PLANE_PCYCLE_TEST)
 uint32_t c4pro_nand_write_page_2plane(uint32_t bank, uint32_t row0, uint32_t row1,
                                       const void* buf0, const void* buf1,
                                       uint32_t nsec);

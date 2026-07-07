@@ -22,6 +22,7 @@
 #include "system.h"
 #include <string.h>
 #include "thread.h"
+#include "kernel.h"      /* struct mutex + mutex_init/lock/unlock (reused primitive) */
 #include "disk.h"
 #include "storage.h"
 #include "panic.h"
@@ -36,19 +37,45 @@ const struct nand_device_info_type* ftl_nand_type;
 /** static, private data **/
 static bool initialized = false;
 
+#ifdef COLORFLY_C4_PRO
+/* The C4 owned FTL keeps shared write-back state (map, gen, the c4own_il_page /
+ * cache buffers) that is NOT reentrant. In USB-MSC mode every access is serialized
+ * through the single serve loop, but the player hits storage from several threads
+ * at once (audio playback reads while settings/database/resume writes flush), which
+ * corrupts that shared state -> data abort in the FTL write path. Serialize every
+ * FTL entry with the standard kernel mutex, exactly as ata.c does for ATA. */
+static struct mutex nand_mtx;
+#endif
+
 /* API Functions */
 int nand_read_sectors(IF_MD(int drive,) sector_t start, int incount,
                      void* inbuf)
 {
     IF_MD( (void)drive; )
+#ifdef COLORFLY_C4_PRO
+    int rc;
+    mutex_lock(&nand_mtx);
+    rc = ftl_read(start, incount, inbuf);
+    mutex_unlock(&nand_mtx);
+    return rc;
+#else
     return ftl_read(start, incount, inbuf);
+#endif
 }
 
 int nand_write_sectors(IF_MD(int drive,) sector_t start, int count,
                       const void* outbuf)
 {
     IF_MD( (void)drive; )
+#ifdef COLORFLY_C4_PRO
+    int rc;
+    mutex_lock(&nand_mtx);
+    rc = ftl_write(start, count, outbuf);
+    mutex_unlock(&nand_mtx);
+    return rc;
+#else
     return ftl_write(start, count, outbuf);
+#endif
 }
 
 void nand_spindown(int seconds)
@@ -95,7 +122,14 @@ long nand_last_disk_activity(void)
 #ifdef HAVE_STORAGE_FLUSH
 int nand_flush(void)
 {
+#ifdef COLORFLY_C4_PRO
+    int rc;
+    mutex_lock(&nand_mtx);
+    rc = ftl_sync();
+    mutex_unlock(&nand_mtx);
+#else
     int rc = ftl_sync();
+#endif
     if (rc != 0) panicf("Failed to unmount flash: %X", rc);
     return rc;
 }
@@ -103,6 +137,12 @@ int nand_flush(void)
 
 int nand_init(void)
 {
+#ifdef COLORFLY_C4_PRO
+    /* Init before ftl_init(): the mutex must exist before the first storage
+     * access. ftl_init() itself touches NAND only via low-level c4own_* helpers,
+     * not nand_read/write_sectors, so it needs no lock here. */
+    mutex_init(&nand_mtx);
+#endif
     if (ftl_init()) return 1;
 
     initialized = true;

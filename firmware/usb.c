@@ -858,6 +858,23 @@ void c4pro_usb_diag_exit_storage_mode(void)
         exclusive_storage_requested = false;
     }
 }
+
+/* Remount the NAND for the player WITHOUT the USB teardown of exit_storage_mode.
+ * c4pro_usb_msc_serve unconditionally enters storage mode (disk_unmount_all) at
+ * entry, but only ran exit_storage_mode on a MENU eject -- so a no-USB cold boot
+ * (serve loop skipped, no eject) left the FAT UNMOUNTED, giving an empty file
+ * browser / "no files" theme picker. This undoes just the unmount (re-mounts the
+ * volumes) and leaves USB monitoring alone, since there is no host to disconnect
+ * from on the no-USB path. */
+void c4pro_usb_diag_remount_storage(void)
+{
+    if(exclusive_storage_enabled)
+    {
+        usb_slave_mode(false);      /* remount the NAND for the player */
+        exclusive_storage_enabled = false;
+        exclusive_storage_requested = false;
+    }
+}
 #endif
 
 /* exclusive storage mode transision

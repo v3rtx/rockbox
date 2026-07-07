@@ -31,6 +31,7 @@
     defined(C4PRO_NAND_DELAY_SWEEP) || defined(C4PRO_NAND_HWECC_TEST) || \
     defined(C4PRO_NAND_HWECC_ERASED) || defined(C4PRO_NAND_WDELAY_SWEEP) || \
     defined(C4PRO_NAND_HWECC_MULTIDIE) || defined(C4PRO_NAND_2PLANE_TEST) || \
+    defined(C4PRO_NAND_2PLANE_PCYCLE_TEST) || \
     defined(C4PRO_FTL_PCYCLE_TEST)
 #include "lcd.h"
 #include "backlight.h"
