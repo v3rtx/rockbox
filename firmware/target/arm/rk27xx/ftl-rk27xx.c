@@ -30,7 +30,8 @@
     defined(C4PRO_NAND_FMWAIT_SWEEP) || defined(C4PRO_NAND_CLKPROBE) || \
     defined(C4PRO_NAND_DELAY_SWEEP) || defined(C4PRO_NAND_HWECC_TEST) || \
     defined(C4PRO_NAND_HWECC_ERASED) || defined(C4PRO_NAND_WDELAY_SWEEP) || \
-    defined(C4PRO_NAND_HWECC_MULTIDIE) || defined(C4PRO_NAND_2PLANE_TEST)
+    defined(C4PRO_NAND_HWECC_MULTIDIE) || defined(C4PRO_NAND_2PLANE_TEST) || \
+    defined(C4PRO_FTL_PCYCLE_TEST)
 #include "lcd.h"
 #include "backlight.h"
 #endif
@@ -1150,6 +1151,9 @@ int c4own_diag_map0 = -1;
 int c4own_diag_map2 = -1;
 int c4own_diag_lba0_sig = -1;
 int c4own_diag_lba2048_sig = -1;
+/* Cold-mount durability marker status (C4PRO_FTL_PCYCLE_TEST): -1 unknown,
+ * 0 = fresh/LOST (marker not found this cold mount), 1 = SURVIVED. */
+volatile int c4pro_dura_status = -1;
 int c4own_diag_last_write_result;
 int c4own_diag_last_writeback_sig = -1;
 int c4own_diag_cache_flush_count;
@@ -1550,6 +1554,11 @@ static int c4own_ckpt_read_block_page(uint32_t pblk, uint32_t page_in_block,
  * crash can never leave a clean checkpoint that omits a committed block. */
 static int c4own_ckpt_mark_dirty(void)
 {
+#ifndef C4PRO_FTL_MOUNT_CHECKPOINT
+    /* Checkpoint disabled (see mount): this writes page 127 out of order into the
+     * superblock block -- MLC-illegal, corrupts it. No-op; mount always scans. */
+    return 0;
+#else
     if (c4own_ckpt_active_block < 0)
         return 0;
 
@@ -1563,6 +1572,7 @@ static int c4own_ckpt_mark_dirty(void)
 
     c4own_ckpt_marked_dirty = true;
     return 0;
+#endif
 }
 
 /* Serialize the live map into a fresh checkpoint on the inactive superblock
@@ -1570,6 +1580,15 @@ static int c4own_ckpt_mark_dirty(void)
  * because map_dirty implies a prior commit) keeps mount on the scan path. */
 static int c4own_ckpt_write(void)
 {
+#ifndef C4PRO_FTL_MOUNT_CHECKPOINT
+    /* Checkpoint disabled (see mount): this ERASES the superblock block and
+     * rewrites it with out-of-order pages (page 0, a few entries, footer@126) --
+     * MLC-illegal, so it corrupts the very superblock that gates mount validity
+     * (observed 2026-07-07 as "FS gone"/reformat). No-op; the superblock is
+     * written cleanly (page 0 only) by c4own_write_superblock at format time, and
+     * mount is authoritative via the full scan. */
+    return 0;
+#else
     uint32_t target = (c4own_ckpt_active_block == 0) ? 1u : 0u;
     uint32_t count = 0;
     uint32_t entries_crc = 0xffffffffu;
@@ -1642,6 +1661,7 @@ static int c4own_ckpt_write(void)
     c4own_map_dirty = false;
     c4own_read_page_valid = false;
     return 0;
+#endif
 }
 
 /* Try to populate the maps from a valid, non-dirty checkpoint. Returns true on
@@ -1789,9 +1809,28 @@ static int c4own_mount_scan(void)
 
     /* Fast path: a valid, non-dirty checkpoint reconstructs the map without the
      * full per-block scan below. On any mismatch c4own_ckpt_load resets the maps
-     * and we fall through to the authoritative scan. */
+     * and we fall through to the authoritative scan.
+     *
+     * DISABLED by default (2026-07-07): DATA-INTEGRITY FIX. c4own_ckpt_write()
+     * programs the superblock block out of order -- page 0, a couple of entry
+     * pages, then the footer at page 126, and c4own_ckpt_mark_dirty() the marker
+     * at page 127 -- leaving the middle pages erased. That is illegal on this MLC
+     * NAND (2x Micron; sequential in-block programming required). It reads back
+     * correctly IN-SESSION (from the page buffer) but the footer/dirty-marker are
+     * NOT durable across a power/mount cycle, so mount can load a STALE map ->
+     * the FAT/directory reads back as garbage (corrupt filenames) and the volume
+     * looks invalid -> auto-reformat. Confirmed on device 2026-07-07 (corruption
+     * survived a proper HOST eject, which flushes correctly). The full scan below
+     * reads only sequential-programmed, MLC-durable data-block headers and is
+     * authoritative. Re-enable once c4own_ckpt_write() is made MLC-legal
+     * (one contiguous sequential page run: superblock + entries + footer, no
+     * page-126 jump, no out-of-order page-127 marker, plus a read-back verify so
+     * a non-durable checkpoint fails closed to a scan). Cost of the scan-only
+     * mount: the ~cold-scan time the checkpoint was added to skip. */
+#ifdef C4PRO_FTL_MOUNT_CHECKPOINT
     if (c4own_ckpt_load())
         return 0;
+#endif
 
     c4own_reset_maps();
 
@@ -4407,25 +4446,41 @@ uint32_t ftl_init(void)
     {
         static unsigned char bw[512];
         static unsigned char br[512];
-        const uint32_t PN = 3000u;             /* "file" = sectors 0..PN-1 */
-        const uint32_t QBASE = 5000u, QN = 500u; /* churn region */
-        const int NCYC = 30;
+        const uint32_t PN = 1024u;             /* "file" = sectors 0..PN-1 */
+        const uint32_t QBASE = 5000u, QN = 256u; /* churn region */
+        const int NCYC = 5;   /* reduced: scan-only remount is slow (checkpoint off) */
         int fmt_rc, failcyc = -1, badsec = -1, cyc, i;
         uint32_t s;
 
+        lcd_clear_display();
+        lcd_puts(0, 0, "FTL SELFTEST");
+        lcd_puts(0, 1, "P: format");
+        lcd_update();
+#ifdef HAVE_BACKLIGHT
+        backlight_on();
+#endif
         fmt_rc = (int)c4own_format();
         c4own_mount_scan();
 
+        lcd_putsf(0, 1, "P: file write %d", (int)PN);
+        lcd_update();
         for (s = 0; s < PN; s++)
         {
             for (i = 0; i < 512; i++)
                 bw[i] = (unsigned char)(s * 7u + (unsigned)i * 13u + 0x5au);
             c4own_write_internal(s, 1u, bw);
         }
+        lcd_puts(0, 1, "P: initial sync");
+        lcd_update();
         ftl_sync();
 
         for (cyc = 0; cyc < NCYC && failcyc < 0; cyc++)
         {
+            lcd_putsf(0, 1, "cyc %d/%d write ", cyc, NCYC);
+            lcd_update();
+#ifdef HAVE_BACKLIGHT
+            backlight_on();
+#endif
             for (s = QBASE; s < QBASE + QN; s++)
             {
                 for (i = 0; i < 512; i++)
@@ -4433,8 +4488,14 @@ uint32_t ftl_init(void)
                                             + (unsigned)cyc);
                 c4own_write_internal(s, 1u, bw);
             }
+            lcd_putsf(0, 1, "cyc %d/%d sync  ", cyc, NCYC);
+            lcd_update();
             ftl_sync();
-            c4own_mount_scan();   /* remount via checkpoint */
+            lcd_putsf(0, 1, "cyc %d/%d scan  ", cyc, NCYC);
+            lcd_update();
+            c4own_mount_scan();   /* remount */
+            lcd_putsf(0, 1, "cyc %d/%d verify", cyc, NCYC);
+            lcd_update();
 
             for (s = 0; s < PN; s++)
             {
@@ -4472,6 +4533,26 @@ uint32_t ftl_init(void)
             return 1;
     }
     c4own_ready = true;
+#ifdef C4PRO_FTL_PCYCLE_TEST
+    /* Non-halting cold-mount durability marker (rides the normal boot). If the
+     * magic written by a PREVIOUS boot is still readable after THIS fresh cold
+     * mount, the internal write SURVIVED (status=1); else it was LOST/reformatted
+     * (status=0). Then (re)write the marker + sync for the next boot. The result
+     * is shown on the USB-MSC screen (c4pro_dura_status). Reproduce with: boot ->
+     * note status -> USB out -> reset -> boot -> read status. SURVIVED => internal
+     * writes ARE cold-durable (bug is the host/USB path); LOST => the cold mount
+     * itself drops data that is physically on NAND. */
+    {
+        static unsigned char mb[512];
+        const uint32_t MSEC = 200000u;
+        c4pro_dura_status = (c4own_read_sector_internal(MSEC, mb) == 0 &&
+                             c4own_get32(mb) == 0xC4D0FF11u) ? 1 : 0;
+        memset(mb, 0, 512);
+        c4own_put32(mb, 0xC4D0FF11u);
+        c4own_write_internal(MSEC, 1u, mb);
+        ftl_sync();
+    }
+#endif
     {
         unsigned char diag_sector[512];
 

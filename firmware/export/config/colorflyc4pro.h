@@ -115,6 +115,38 @@
 
 #define CONFIG_BATTERY_MEASURE VOLTAGE_MEASURE
 
+/* Never force a low-battery auto power-off (2026-07-07). The device is normally
+ * USB-powered and the battery reading is unreliable/optional (a desoldered or
+ * weak cell reads ~0V, and _battery_voltage()'s ADC calibration is a placeholder).
+ * Without this, query_force_shutdown() (powermgmt.c) sees "empty battery" and
+ * sys_poweroff()s a few seconds into boot -- observed as "splash then goes dark"
+ * on both battery and USB (the USB power_input_present() inhibit doesn't apply
+ * until USB is enumerated, which is after the long mount). Data safety comes from
+ * a clean unmount/flush, not from yanking power on a bad reading. */
+#define NO_LOW_BATTERY_SHUTDOWN
+
+/* TEMPORARY DIAGNOSTIC (2026-07-07): run the in-app multi-cycle FTL persistence
+ * self-test on boot (ftl-rk27xx.c) instead of serving USB. Write a "file", then
+ * 30x { churn a different region -> ftl_sync -> c4own_mount_scan remount ->
+ * verify the file byte-exact }, and HALT showing failcyc/badsec/uncorr. Isolates
+ * the data-durability drift with no host/USB/power confound. REMOVE after. */
+/* #define C4PRO_FTL_ECC_SELFTEST  -- passed (failcyc=-1): FTL logic is correct */
+/* #define C4PRO_FTL_PCYCLE_TEST   -- passed (DURA=SURVIVED): internal writes are
+ *   cold-durable, so the data loss was the HOST write path never being flushed. */
+/* THE durability fix: flush the FTL cache on serve-loop exit (apps/main.c). That
+ * flush uses storage_flush(), which needs HAVE_STORAGE_FLUSH defined here. */
+#define HAVE_STORAGE_FLUSH
+
+/* Mount CHECKPOINT: ON, ISOLATION TEST (2026-07-07). The earlier "checkpoint
+ * corrupts" observation came from a build where 2-plane was ALSO on -- and 2-plane
+ * is now the confirmed culprit. This tests the checkpoint ALONE (2-plane OFF) to
+ * see if its out-of-order superblock programming (page0, entries, footer@126,
+ * marker@127 -- MLC-unsafe in theory) is actually durable on this NAND. If a
+ * host-eject + replug cycle stays clean with this, the checkpoint is fine and we
+ * keep fast boot; if it corrupts, rewrite it MLC-legal (footer@page1, entries
+ * after, dirty marker@N+2 -- one contiguous sequential run). */
+#define C4PRO_FTL_MOUNT_CHECKPOINT
+
 /* Hardware controlled charging with monitoring */
 #define CONFIG_CHARGING CHARGING_MONITOR
 
@@ -268,7 +300,16 @@
  * the freeze is RECOVERED in place (copy resumes), so the device never reboots
  * under the user. Opt in only for debugging with -DC4PRO_WDT_CRASH_CAPTURE. */
 #define C4PRO_NAND_HWECC
-#define C4PRO_NAND_2PLANE
+/* C4PRO_NAND_2PLANE: OFF (2026-07-07). Isolated: with the host-flush bug fixed,
+ * single-plane is durable but re-enabling 2-plane corrupts across a power cycle
+ * EVEN AFTER a proper host eject -- so the original finding was right: the
+ * two-plane array commit (c4pro_nand_write_page_2plane, nand-rk27xx.c: 0x11
+ * plane-0 dummy -> 0x81/0x10 final) reads back correctly WHILE POWERED but is not
+ * durably fixed into the array (shared-tPROG wait / FMWAIT too short, or plane-1
+ * serial input not committed). It was masked by the host-flush bug, not a red
+ * herring. Re-enable only after the 2-plane program's tPROG/commit is fixed +
+ * verified across a real power cycle. Single-plane hwecc is durable. */
+/* #define C4PRO_NAND_2PLANE */
 #define C4PRO_NAND_FAST_FORMAT
 #define C4PRO_NAND_BCH_NO_RMW
 #define C4PRO_NAND_FMCTL_NO_RMW

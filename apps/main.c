@@ -4130,6 +4130,14 @@ static void c4pro_usb_msc_serve(void)
     lcd_puts(0, 1, "Connected to PC");
     lcd_puts(0, 3, "MENU: Rockbox player");
     lcd_puts(0, 2, "Hold BACK: USB flash");
+#ifdef C4PRO_FTL_PCYCLE_TEST
+    {
+        extern volatile int c4pro_dura_status;
+        lcd_putsf(0, 5, "DURA: %s",
+                  c4pro_dura_status == 1 ? "SURVIVED" :
+                  c4pro_dura_status == 0 ? "LOST/fresh" : "?");
+    }
+#endif
     lcd_update();
 
     /* Poll the button ADC directly with a small debounce so MENU ejects on the
@@ -4445,6 +4453,22 @@ static void c4pro_usb_msc_serve(void)
 #endif
         sleep(HZ / 50);
     }
+
+#ifdef HAVE_STORAGE_FLUSH
+    /* THE durability fix (2026-07-07): whenever the serve loop exits -- MENU
+     * eject OR a host USB disconnect (cable pull) -- commit the FTL write-back
+     * cache to NAND BEFORE the device drops storage / reboots. Host writes land
+     * in the RAM cache and are only durable once flushed; a bare cable-pull sends
+     * no reliable SCSI SYNCHRONIZE CACHE, so without this the last writes (FAT/dir
+     * /file tails, and anything the eager flush hasn't drained) die on the reboot
+     * -> corrupt volume. storage_flush()->nand_flush()->ftl_sync() is the same
+     * proven-durable flush the internal path uses. Synchronous, so let the device
+     * finish (it draws "Ejecting"/reboots itself) before yanking power. */
+    lcd_clear_display();
+    lcd_puts(0, 0, "Flushing...");
+    lcd_update();
+    storage_flush();
+#endif
 
     if (eject)
     {
