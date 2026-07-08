@@ -398,6 +398,19 @@ int sd_init(void)
 
     init_controller();
 
+#ifdef COLORFLY_C4_PRO
+    /* C4 has no HAVE_HOTSWAP, so disk_mount_all() unconditionally tries to mount
+     * every drive including SD. sd_init_card() legitimately fails (times out
+     * waiting for card responses) when no card is inserted -- that used to
+     * propagate up through storage_init() and HALT THE ENTIRE BOOT with a fatal
+     * "ATA error" screen, even though the NAND is perfectly fine. A missing
+     * removable card is not a hardware fault; skip the card handshake entirely
+     * and let disk_mount() fail the SD drive alone later, same as a normal
+     * mount-failure on any other drive. */
+    if (!card_detect_target())
+        return 0;
+#endif
+
     ret = sd_init_card();
     if(ret < 0)
         return ret;
