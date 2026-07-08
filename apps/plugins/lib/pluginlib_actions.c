@@ -355,10 +355,21 @@ const struct button_mapping pla_main_ctx[] =
     {PLA_SELECT_REL,        BUTTON_SELECT|BUTTON_REL,           BUTTON_SELECT},
     {PLA_SELECT_REPEAT,     BUTTON_SELECT|BUTTON_REPEAT,        BUTTON_NONE},
 #elif (CONFIG_KEYPAD == C4PRO_PAD)
-    /* C4: BACK exits/cancels the plugin (short BACK = cancel/back-out, long BACK =
-     * force exit); SELECT confirms. Split out from the HM60X group above, which
-     * uses POWER -- the user wants BACK to exit. */
-    {PLA_CANCEL,            BUTTON_BACK|BUTTON_REL,             BUTTON_BACK},
+    /* C4: BACK exits/cancels the plugin; SELECT confirms. Split out from the
+     * HM60X group above, which uses POWER -- the user wants BACK to exit.
+     *
+     * PLA_CANCEL uses a PLAIN press, not BUTTON_BACK|BUTTON_REL. The C4's button
+     * "pad" is a single ADC line read as one of several voltage-divider ranges
+     * (button-c4pro.c: button_read_device()), so only one button is ever visible
+     * at a time and there's no clean GPIO-style edge for a release. The C4's own
+     * core keymap already establishes the working pattern: button_context_standard
+     * in keymap-c4pro.c binds ACTION_STD_CANCEL to plain BUTTON_BACK (no REL) and
+     * that's the BACK behavior proven reliable all through bring-up (menus, file
+     * browser). BUTTON_BACK|BUTTON_REL, used here originally, never fired in
+     * testing (2048, bubbles, logo.c all failed to exit via BACK). REPEAT (long
+     * hold) is unaffected -- it fires from sustained press detection, not a
+     * release edge -- so PLA_EXIT keeps using it for a force-exit. */
+    {PLA_CANCEL,            BUTTON_BACK,                        BUTTON_NONE},
     {PLA_EXIT,              BUTTON_BACK|BUTTON_REPEAT,          BUTTON_NONE},
     {PLA_SELECT,            BUTTON_SELECT,                      BUTTON_NONE},
     {PLA_SELECT_REL,        BUTTON_SELECT|BUTTON_REL,           BUTTON_SELECT},
