@@ -381,7 +381,7 @@
 #define GBN_BUTTON_PLAY                BUTTON_SELECT
 #define GBN_BUTTON_MENU                BUTTON_MENU
 
-#elif (CONFIG_KEYPAD == HM60X_PAD)
+#elif ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD))
 #define  GBN_BUTTON_UP                 BUTTON_UP
 #define  GBN_BUTTON_DOWN               BUTTON_DOWN
 #define  GBN_BUTTON_LEFT               BUTTON_LEFT

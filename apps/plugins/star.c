@@ -463,7 +463,7 @@
 #define STAR_LEVEL_DOWN_NAME "Power"
 #define STAR_LEVEL_REPEAT_NAME "User"
 
-#elif (CONFIG_KEYPAD == HM60X_PAD)
+#elif ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD))
 
 #define STAR_QUIT           BUTTON_POWER
 #define STAR_LEFT           BUTTON_LEFT

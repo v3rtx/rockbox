@@ -317,7 +317,7 @@
 #define LABEL_MENU   "Menu"
 #define LABEL_VOLUME "Up/Down"
 
-#elif (CONFIG_KEYPAD == HM60X_PAD) || \
+#elif ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD)) || \
     (CONFIG_KEYPAD == HM801_PAD)
 #define VUMETER_QUIT       BUTTON_POWER
 #define VUMETER_HELP       BUTTON_RIGHT

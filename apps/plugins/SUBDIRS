@@ -13,11 +13,17 @@ clock
 xworld
 
 /* for duke3d, wolf3d and quake */
-#if (PLUGIN_BUFFER_SIZE > 0x14000) && (CONFIG_PLATFORM & (PLATFORM_NATIVE|PLATFORM_HOSTED)) && (defined(CPU_ARM) || defined(CPU_MIPS)) && !defined(RG_NANO)
+/* C4: the SDL games fail to build with GCC 14 (-Wint-conversion errors in the
+ * duke3d/quake engine); excluded here so the rest of the plugin set builds. */
+#if (PLUGIN_BUFFER_SIZE > 0x14000) && (CONFIG_PLATFORM & (PLATFORM_NATIVE|PLATFORM_HOSTED)) && (defined(CPU_ARM) || defined(CPU_MIPS)) && !defined(RG_NANO) && !defined(COLORFLY_C4_PRO)
 sdl
 #endif
 
+/* C4: the sgt-puzzles collection fails to link on this target (plugin_crt0
+ * section/overlay issue); excluded for now so the rest build. */
+#if !defined(COLORFLY_C4_PRO)
 puzzles
+#endif
 #endif
 
 #if    (CONFIG_KEYPAD != SANSA_M200_PAD) /* not enough buttons */ \

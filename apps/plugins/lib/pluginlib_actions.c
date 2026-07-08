@@ -105,7 +105,7 @@ const struct button_mapping pla_main_ctx[] =
     || (CONFIG_KEYPAD == SANSA_CONNECT_PAD) \
     || (CONFIG_KEYPAD == SAMSUNG_YPR0_PAD) \
     || (CONFIG_KEYPAD == CREATIVE_ZENXFI3_PAD) \
-    || (CONFIG_KEYPAD == HM60X_PAD) \
+    || ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD)) \
     || (CONFIG_KEYPAD == HM801_PAD) \
     || (CONFIG_KEYPAD == SONY_NWZ_PAD) \
     || (CONFIG_KEYPAD == CREATIVE_ZEN_PAD) \
@@ -351,6 +351,15 @@ const struct button_mapping pla_main_ctx[] =
     || CONFIG_KEYPAD == HM801_PAD)
     {PLA_CANCEL,            BUTTON_POWER|BUTTON_REL,            BUTTON_POWER},
     {PLA_EXIT,              BUTTON_POWER|BUTTON_REPEAT,         BUTTON_NONE},
+    {PLA_SELECT,            BUTTON_SELECT,                      BUTTON_NONE},
+    {PLA_SELECT_REL,        BUTTON_SELECT|BUTTON_REL,           BUTTON_SELECT},
+    {PLA_SELECT_REPEAT,     BUTTON_SELECT|BUTTON_REPEAT,        BUTTON_NONE},
+#elif (CONFIG_KEYPAD == C4PRO_PAD)
+    /* C4: BACK exits/cancels the plugin (short BACK = cancel/back-out, long BACK =
+     * force exit); SELECT confirms. Split out from the HM60X group above, which
+     * uses POWER -- the user wants BACK to exit. */
+    {PLA_CANCEL,            BUTTON_BACK|BUTTON_REL,             BUTTON_BACK},
+    {PLA_EXIT,              BUTTON_BACK|BUTTON_REPEAT,          BUTTON_NONE},
     {PLA_SELECT,            BUTTON_SELECT,                      BUTTON_NONE},
     {PLA_SELECT_REL,        BUTTON_SELECT|BUTTON_REL,           BUTTON_SELECT},
     {PLA_SELECT_REPEAT,     BUTTON_SELECT|BUTTON_REPEAT,        BUTTON_NONE},

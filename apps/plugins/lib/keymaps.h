@@ -59,7 +59,7 @@
     (CONFIG_KEYPAD == SAMSUNG_YPR0_PAD)     || \
     (CONFIG_KEYPAD == IRIVER_H300_PAD)      || \
     (CONFIG_KEYPAD == HM801_PAD)            || \
-    (CONFIG_KEYPAD == HM60X_PAD)            || \
+    ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD))            || \
     (CONFIG_KEYPAD == AGPTEK_ROCKER_PAD)
 #define BTN_UP         BUTTON_UP
 #define BTN_DOWN       BUTTON_DOWN
@@ -88,7 +88,7 @@
 #define BTN_PAUSE      BUTTON_POWER
 #endif
 
-#if (CONFIG_KEYPAD == HM60X_PAD)
+#if ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD))
 #define BTN_FIRE       BUTTON_POWER
 #define BTN_PAUSE      BUTTON_SELECT
 #endif

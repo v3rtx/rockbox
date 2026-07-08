@@ -461,7 +461,7 @@ static void setoptions (void)
 #elif CONFIG_KEYPAD == SHANLING_Q1_PAD || CONFIG_KEYPAD == HIBY_R3PROII_PAD
         /* use touchscreen */
 
-#elif CONFIG_KEYPAD == MA_PAD
+#elif CONFIG_KEYPAD == MA_PAD || CONFIG_KEYPAD == C4PRO_PAD
         options.UP      = BUTTON_UP;
         options.DOWN    = BUTTON_DOWN;
         options.LEFT    = BUTTON_LEFT;

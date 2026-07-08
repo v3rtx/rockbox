@@ -3185,7 +3185,7 @@ fi
     output="rockbox.rkw"
     bootoutput="bootloader.rkw"
     appextra="recorder:gui"
-    plugins=""
+    plugins="yes"
     toolset="$genericbitmaptools"
     t_cpu="arm"
     t_manufacturer="rk27xx"
