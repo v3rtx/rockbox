@@ -329,9 +329,21 @@ void lcd_init_device(void)
     lcdctrl_init();    /* basic lcdc module configuration */
 }
 
+#ifdef COLORFLY_C4_PRO
+/* Count of update attempts that needed a retry after a timed-out DMA wait,
+ * for diagnosing the "shifted/scrambled pixels after many plugin loads,
+ * fixed by reboot" reports (View this via the debug menu / a splash if
+ * investigating further). */
+volatile uint32_t c4pro_lcd_dma_retries;
+#define C4PRO_LCD_UPDATE_RETRIES 3
+#endif
+
 void lcd_update_rect(int x, int y, int width, int height)
 {
     int x_end, y_end, x_align, y_align;
+#ifdef COLORFLY_C4_PRO
+    int attempt;
+#endif
 
     /* min alowed transfer seems to be 4x4 pixels */
     x_align = x & 3;
@@ -343,6 +355,50 @@ void lcd_update_rect(int x, int y, int width, int height)
     x_end = x + width - 1;
     y_end = y + height - 1;
 
+#ifdef COLORFLY_C4_PRO
+    /* On the C4, lcdif_wait_mcu_idle()/lcdif_wait_dma_done() are bounded spins
+     * (real hardware contention -- e.g. AHB bus traffic from a concurrent NAND/
+     * SD transfer -- can make either time out). On a DMA timeout the wait
+     * function force-clears the DMA channel mid-transfer (see below), which
+     * only ever wrote PART of the frame and can leave the controller's
+     * internal GRAM write-position out of sync with what we asked for. The
+     * caller here used to ignore both results and return anyway, so the next
+     * frame would draw assuming a clean state -- a partially-written frame
+     * plus a desynced GRAM pointer, repeated across many plugin redraws,
+     * matches the reported persistent "shifted/scrambled pixels" that only a
+     * reboot (a full hardware reset) would clear. Re-issue the ENTIRE
+     * sequence -- including lcd_set_gram_area(), which re-establishes the
+     * GRAM addressing -- on a timeout, bounded so a persistent stall still
+     * gives up rather than hanging. */
+    for (attempt = 0; attempt < C4PRO_LCD_UPDATE_RETRIES; attempt++)
+    {
+        if (attempt)
+            c4pro_lcd_dma_retries++;
+
+        lcd_set_gram_area(x, y, x_end, y_end);
+        create_llp(x, y, width, height);
+        lcdctrl_bypass(0);
+
+        /* whole framebuffer for now */
+        commit_discard_dcache_range(FBADDR(0,0), 2*LCD_WIDTH*LCD_HEIGHT);
+
+        if (!lcdif_wait_mcu_idle())
+            continue;
+
+        lcdctrl_buff_setup(width, height);
+        dwdma_start(0, scr_llp, 6);
+        udelay(10);
+
+        /* Setup buffered writes to lcd controler */
+        MCU_CTRL = MCU_CTRL_RS_HIGH|MCU_CTRL_BUFF_WRITE|MCU_CTRL_BUFF_START;
+
+        /* Wait for DMA transfer to finish; retry the whole sequence (re-sync
+         * GRAM addressing) rather than silently leaving a torn frame if this
+         * timed out. */
+        if (lcdif_wait_dma_done(0))
+            break;
+    }
+#else
     lcd_set_gram_area(x, y, x_end, y_end);
     create_llp(x, y, width, height);
     lcdctrl_bypass(0);
@@ -362,6 +418,7 @@ void lcd_update_rect(int x, int y, int width, int height)
 
     /* Wait for DMA transfer to finish */
     lcdif_wait_dma_done(0);
+#endif
 }
 
 void lcd_update()
