@@ -83,7 +83,14 @@ SECTIONS
      *(.stack)
      _stackbegin = .;
      stackbegin = .;
+#ifdef COLORFLY_C4_PRO
+     /* C4: the multi-volume (NAND+SD) + database (tagtree recursion -> tagcache ->
+      * SD storage) main-thread call chain overflows the stock 8K stack -> data abort
+      * in sd_write_sectors (str to a stack local past stackend, T:main). 32K. */
+     . += 0x8000;
+#else
      . += 0x2000;
+#endif
      _stackend = .;
      stackend = .;
      _irqstackbegin = .;
