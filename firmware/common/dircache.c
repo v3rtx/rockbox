@@ -2087,7 +2087,16 @@ static bool dircache_thread_post(int volatile *rcp)
  */
 void dircache_wait(void)
 {
+#ifdef COLORFLY_C4_PRO
+    /* C4: dircache is never initialized on this target (init_dircache() is gated
+     * off for the custom storage/mount bring-up), so the dircache thread does not
+     * exist and dircache_runinfo.thread_id is unset. thread_wait() on it would
+     * block FOREVER -> the tagcache database build hangs before scanning a single
+     * file ("updating, no progress"). Nothing to wait for here, so return. */
+    return;
+#else
     thread_wait(dircache_runinfo.thread_id);
+#endif
 }
 
 /**

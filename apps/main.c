@@ -4881,7 +4881,7 @@ static int INIT_ATTR init_dircache(bool preinit)
 }
 #endif /* HAVE_DIRCACHE */
 
-#if defined(HAVE_TAGCACHE) && !defined(COLORFLY_C4_PRO)
+#if defined(HAVE_TAGCACHE)
 static void init_tagcache(void) INIT_ATTR;
 static void init_tagcache(void)
 {
@@ -5000,7 +5000,7 @@ static void init(void)
     init_dircache(true);
     init_dircache(false);
 #endif
-#if defined(HAVE_TAGCACHE) && !defined(COLORFLY_C4_PRO)
+#if defined(HAVE_TAGCACHE)
     init_tagcache();
 #endif
     tree_mem_init();
@@ -5600,7 +5600,7 @@ static void init(void)
     init_dircache(false);
     CHART("<init_dircache(false)");
 #endif
-#if defined(HAVE_TAGCACHE) && !defined(COLORFLY_C4_PRO)
+#if defined(HAVE_TAGCACHE)
     CHART(">init_tagcache");
     C4PRO_BOOT_STEP("tagcache");
     init_tagcache();
