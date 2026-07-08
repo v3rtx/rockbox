@@ -214,7 +214,7 @@ dir is the current direction of the snake - 0=up, 1=right, 2=down, 3=left;
 
 #elif ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD)) || \
     (CONFIG_KEYPAD == HM801_PAD)
-#define SNAKE_QUIT      BUTTON_POWER
+#define SNAKE_QUIT      BUTTON_BACK
 #define SNAKE_LEFT      BUTTON_LEFT
 #define SNAKE_RIGHT     BUTTON_RIGHT
 #define SNAKE_UP        BUTTON_UP

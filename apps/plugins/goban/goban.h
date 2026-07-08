@@ -386,7 +386,7 @@
 #define  GBN_BUTTON_DOWN               BUTTON_DOWN
 #define  GBN_BUTTON_LEFT               BUTTON_LEFT
 #define  GBN_BUTTON_RIGHT              BUTTON_RIGHT
-#define  GBN_BUTTON_MENU               BUTTON_POWER
+#define  GBN_BUTTON_MENU               BUTTON_BACK
 #define  GBN_BUTTON_PLAY               BUTTON_SELECT
 #define  GBN_BUTTON_RETREAT            (BUTTON_POWER | BUTTON_LEFT)
 #define  GBN_BUTTON_ADVANCE            (BUTTON_POWER | BUTTON_UP)

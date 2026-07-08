@@ -192,7 +192,7 @@
 #elif ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD)) || \
     (CONFIG_KEYPAD == HM801_PAD)
 
-#define ZX_MENU         BUTTON_POWER
+#define ZX_MENU         BUTTON_BACK
 #define ZX_UP           BUTTON_UP
 #define ZX_DOWN         BUTTON_DOWN
 #define ZX_SELECT       BUTTON_SELECT

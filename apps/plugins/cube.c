@@ -282,7 +282,7 @@
 #define CUBE_HIGHSPEED     BUTTON_SELECT
 
 #elif ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD))
-#define CUBE_QUIT          BUTTON_POWER
+#define CUBE_QUIT          BUTTON_BACK
 #define CUBE_NEXT          BUTTON_RIGHT
 #define CUBE_PREV          BUTTON_LEFT
 #define CUBE_INC           BUTTON_UP

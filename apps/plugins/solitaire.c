@@ -517,7 +517,7 @@ CONFIG_KEYPAD == MROBE500_PAD
 #   define HK_REM2STACK    "Power"
 
 #elif ((CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD))
-#   define SOL_QUIT         BUTTON_POWER
+#   define SOL_QUIT         BUTTON_BACK
 #   define SOL_UP           BUTTON_UP
 #   define SOL_DOWN         BUTTON_DOWN
 #   define SOL_LEFT         BUTTON_LEFT

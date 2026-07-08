@@ -355,7 +355,7 @@
 #define FRACTAL_RESET           BUTTON_POWER
 
 #elif (CONFIG_KEYPAD == HM60X_PAD || CONFIG_KEYPAD == C4PRO_PAD)
-#define FRACTAL_QUIT            BUTTON_POWER
+#define FRACTAL_QUIT            BUTTON_BACK
 #define FRACTAL_UP              BUTTON_UP
 #define FRACTAL_DOWN            BUTTON_DOWN
 #define FRACTAL_LEFT            BUTTON_LEFT
