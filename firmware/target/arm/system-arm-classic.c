@@ -196,6 +196,31 @@ void NORETURN_ATTR UIE(unsigned int pc, unsigned int num)
                 thbuf[2 + j] = 0;
             }
 
+            /* Diagnostic for the "repeated plugin loads eventually data-abort
+             * near the SD write path" investigation: show how many plugins
+             * were loaded and how much core-allocator space is free at fault
+             * time, so the NEXT crash tells us whether this is a leak (free
+             * bytes trending down / load count varies) rather than guessing
+             * further. Same minimal hex-only formatting as above -- no
+             * function calls beyond simple read-only accessors, to avoid
+             * double-faulting this handler. */
+            static char lfbuf[24];   /* "L:xxxxxxxx F:xxxxxxxx" */
+            {
+                extern volatile uint32_t c4pro_plugin_load_count;
+                extern size_t core_available(void);
+                static const char hx[] = "0123456789abcdef";
+                uint32_t lc = c4pro_plugin_load_count;
+                uint32_t fr = (uint32_t)core_available();
+                int i;
+                lfbuf[0] = 'L'; lfbuf[1] = ':';
+                for (i = 0; i < 8; i++)
+                    lfbuf[2 + i] = hx[(lc >> ((7 - i) * 4)) & 0xf];
+                lfbuf[10] = ' '; lfbuf[11] = 'F'; lfbuf[12] = ':';
+                for (i = 0; i < 8; i++)
+                    lfbuf[13 + i] = hx[(fr >> ((7 - i) * 4)) & 0xf];
+                lfbuf[21] = 0;
+            }
+
             for (;;)
             {
                 backlight_hw_on();
@@ -213,6 +238,7 @@ void NORETURN_ATTR UIE(unsigned int pc, unsigned int num)
                 lcd_puts(0, 4, thbuf);          /* faulting thread (names a stkov) */
                 lcd_puts(0, 5, phbuf);
                 lcd_puts(0, 6, pcbuf);          /* repeated for legibility */
+                lcd_puts(0, 7, lfbuf);          /* plugin-load count / free core bytes */
                 lcd_update();
                 udelay(200000);   /* ~0.2s; IRQs off, cannot sleep() */
             }

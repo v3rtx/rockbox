@@ -82,6 +82,17 @@ extern unsigned char pluginbuf[];
 /* for actual plugins only, not for codecs */
 static int  plugin_size = 0;
 static int (*pfn_tsr_exit)(bool reenter) = NULL; /* TSR exit callback */
+
+#ifdef COLORFLY_C4_PRO
+/* Diagnostic only: repeated plugin loads (even the trivial ones with no file
+ * I/O of their own, e.g. logo.c) intermittently data-abort in/near the SD
+ * write path after a handful of loads -- looks like a slow leak somewhere in
+ * generic plugin load/unload bookkeeping, not per-plugin logic. Surfaced on
+ * the CPU-fault screen (system-arm-classic.c) so the NEXT crash tells us the
+ * load count and free core-allocator bytes at fault time, instead of guessing
+ * further from static reading alone. */
+volatile uint32_t c4pro_plugin_load_count;
+#endif
 static char current_plugin[MAX_PATH];
 /* NULL if no plugin is loaded, otherwise the handle that lc_open() returned */
 static void *current_plugin_handle;
@@ -978,6 +989,10 @@ int plugin_load(const char* plugin, const void* parameter)
     plugin_size = ALIGN_UP(hdr->end_addr - pluginbuf, 0x8);
 #else
     plugin_size = 0;
+#endif
+
+#ifdef COLORFLY_C4_PRO
+    c4pro_plugin_load_count++;
 #endif
 
     *(p_hdr->api) = &rockbox_api;
