@@ -108,15 +108,29 @@ uint8_t usb_drv_ep_specs_flags = 0;
 static volatile bool set_address = false;
 static volatile bool set_configuration = false;
 
-#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
+/* The C4PRO connect/PHY layer is needed whenever USB runs on C4PRO. It used to
+ * be gated on (DIAG_EXPORT || MSC_ENABLE) because USB only ran via the old
+ * imperative serve; under the stock reactive path usb_drv_init() must assert the
+ * connect on EVERY connection, so these are now enabled for all C4PRO builds. */
+#if defined(COLORFLY_C4_PRO)
 static void udc_phy_reset(void);
 static void udc_soft_connect(void);
-static void c4pro_udc_arm_and_connect(void);
 #endif
 
-#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
+#if defined(COLORFLY_C4_PRO)
 static bool c4pro_usb_did_soft_connect;
 #endif
+
+/* Set by usb_init_device() at boot: was VBUS present (cable inserted) when the
+ * BootROM/loader last hard-reset and calibrated the UDC PHY? The RK27xx PHY's
+ * analog trim (HS terminations / chirp current) is only valid if VBUS is live
+ * during that reset. A device booted with NO cable therefore carries a PHY
+ * calibrated against a dead bus; the later runtime plug only does a soft
+ * SOFT_POR, which does not re-derive the analog trim, so the HS chirp is
+ * corrupted (host "error -71", full-speed fallback). usb_drv_init() consumes
+ * this to redo a full RSTCFG_UDC reset -- with VBUS now live -- on the dry-boot
+ * path only. Defaults to true so the known-good cable-at-boot path is unchanged. */
+volatile bool c4pro_vbus_at_boot = true;
 
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
 void c4pro_usb_diag_force_reattach(void)
@@ -182,7 +196,16 @@ volatile unsigned c4pro_usb_diag_tx_chunks;
 volatile unsigned c4pro_usb_diag_stale_compl_count;
 #endif
 
-#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
+/* The full diag-counter set is compiled for the diag/MSC builds. It is ALSO
+ * needed by the runtime build's RX-stall-kick watchdog, which reads
+ * c4pro_usb_diag_outn_count (bulk-OUT progress) to detect a stalled phase-13
+ * receive -- so pull the set in whenever the stall-kick is active too. */
+#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE) || \
+    (defined(C4PRO_USB_RX_STALL_KICK) && defined(C4PRO_PHASE_MARK))
+#define C4PRO_USB_DIAG_COUNTERS 1
+#endif
+
+#ifdef C4PRO_USB_DIAG_COUNTERS
 volatile unsigned c4pro_usb_diag_irq_count;
 volatile unsigned c4pro_usb_diag_reset_count;
 volatile unsigned c4pro_usb_diag_conn_count;
@@ -234,6 +257,10 @@ void c4pro_usb_diag_sample(void)
 
 #endif
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+volatile unsigned c4pro_usb_setup_seq;   /* monotonic setup-packet counter */
+#endif
+
 #undef ENDPOINT
 
 static void setup_received(void)
@@ -250,6 +277,12 @@ static void setup_received(void)
     c4pro_usb_diag_last_setup1 = setup_data[1];
     if(setup_data[0] == 0 && setup_data[1] == 0)
         return;
+#endif
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    /* Bump a monotonic setup sequence so the C4PRO USB monitor thread can tell a
+     * live (advancing) enumeration from a stalled one and re-present the marginal
+     * HS PHY only when it is genuinely stuck. */
+    c4pro_usb_setup_seq++;
 #endif
 
     /* pass setup data to the upper layer */
@@ -724,7 +757,7 @@ static void out_intr(struct endpoint_t *endp)
         c4pro_rxt_last = _t_entry;
     }
 #endif
-#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
+#ifdef C4PRO_USB_DIAG_COUNTERS
     if(endp->ep_num == 0)
     {
         c4pro_usb_diag_out0_count++;
@@ -809,32 +842,22 @@ static void udc_soft_connect(void)
                DEV_SELF_PWR;
 }
 
-#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
-/* Arm EP0 (and latch CSR_DONE) BEFORE asserting the D+ pull-up, mirroring the
- * stock RK27xx first-stage loader's USB bring-up (init @0x60005438, EP config
- * @0x60004114): EN_INT/INTCON/TX0CON/RX0CON and CSR_DONE are all configured
- * first, and DEV_SOFT_CN (connect) is the very last write.
- *
- * Rockbox's default path instead asserted DEV_SOFT_CN in udc_soft_connect()
- * while EP0's receiver (RX0CON.RXEPEN) was still disarmed and CSR_DONE not yet
- * latched; EP0 only got armed later inside the USBRST ISR. On a cold NAND boot
- * (no MaskROM USB warm-up) the controller therefore had no armed EP0 SETUP
- * receiver when the host began enumeration, so the host's bus resets were seen
- * but the first SETUP was never captured (observed as rst>0, con0, setup0, and
- * no host enumeration). Arming before connect is the fix. */
-static void c4pro_udc_arm_and_connect(void)
+#if defined(COLORFLY_C4_PRO)
+/* Dry-boot PHY recalibration: pulse the full UDC controller/PHY reset with VBUS
+ * now live, reproducing (at plug time) the analog calibration the ROM performs
+ * when a cable is present at boot. Only invoked on the dry-boot path (see
+ * c4pro_vbus_at_boot); the subsequent connect sequence in usb_drv_init() then
+ * runs on a freshly-calibrated PHY. */
+static void c4pro_udc_recalibrate_phy(void)
 {
-    EN_INT = EN_SETUP_INTR | EN_IN0_INTR | EN_OUT0_INTR |
-             EN_USBRST_INTR | EN_RESUME_INTR | EN_SUSP_INTR;
-    INTCON = UDC_INTHIGH_ACT | UDC_INTEN;
-    TX0CON = TXNAK | TXACKINTEN;            /* 0x44 */
-    RX0CON = RXNAK | RXEPEN | RXACKINTEN;   /* 0x98: arm EP0 SETUP/OUT receiver */
-    /* EXPERIMENT: preserve the hardware-set DEV_PHY16BIT (16-bit PHY) rather
-     * than forcing it clear. Clearing it to 0x118 did NOT enable HS (still
-     * full-speed + host error -71), so the PHY may genuinely be 16-bit and need
-     * the bit set for the chirp. Only clear SOFT_POR while latching CSR_DONE. */
-    DEV_CTL = (DEV_CTL & ~SOFT_POR) | CSR_DONE | DEV_SELF_PWR;
-    DEV_CTL |= DEV_SOFT_CN;                 /* assert pull-up LAST */
+    DEV_CTL &= ~DEV_SOFT_CN;               /* detach before resetting */
+    SCU_CLKCFG &= ~CLKCFG_UDC;             /* keep the UDC clock ungated */
+    SCU_RSTCFG |= RSTCFG_UDC;              /* hard-reset controller + PHY... */
+    udelay(10000);
+    SCU_RSTCFG &= ~RSTCFG_UDC;             /* ...recalibrated against live VBUS */
+    udelay(10000);
+    INTC_IMR |= (1<<16);                   /* re-enable the UDC interrupt line */
+    INTC_IECR |= (1<<16);
 }
 #endif
 
@@ -861,7 +884,20 @@ static void udc_helper(void)
         if(dev_info & DEV_EN)
         {
             set_configuration = true;
+#if defined(COLORFLY_C4_PRO)
+            /* The configuration number lives in DEV_INFO[11:8] (see comment
+             * above). The stock formula `(dev_info >> 7) & 0xf` shifts by 7,
+             * which folds DEV_EN (bit 7) INTO the field -> a single-config
+             * device (NUM_CONFIGS==1, field [11:8]==0) is reported as config 2,
+             * which usb_core rejects (new_config > NUM_CONFIGS) so init_connection
+             * never runs and MSC never serves. Extract the documented [11:8]
+             * field and add 1 (the field is the 0-based config index). Other
+             * rk27xx targets define USB_ENABLE_IAP (NUM_CONFIGS==2) so the stock
+             * off-by-one stays in range there; keep this C4-scoped. */
+            usb_core_notify_set_config(((dev_info >> 8) & 0xf) + 1);
+#else
             usb_core_notify_set_config(((dev_info >> 7) & 0xf) + 1);
+#endif
         }
 }
 
@@ -1043,6 +1079,53 @@ void usb_drv_stall(int endpoint, bool stall, bool in)
 }
 
 /* one time init (once per connection) - basicaly enable usb core */
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+/* Production accessor + re-present used by the C4PRO USB monitor thread to
+ * recover the marginal HS PHY (host logs "device descriptor read/64, error -71"
+ * on a failed attempt).
+ *
+ * usb_drv_init()'s recalibrating connect runs only ONCE per boot (guarded by
+ * c4pro_usb_did_soft_connect), so on a runtime REPLUG -- and especially a replug
+ * after a full serve session -- the re-present here is the only connect the host
+ * gets. A light phy_reset+soft_connect ("strategy 4") does NOT re-derive the PHY
+ * analog trim and gets stuck at -71 on the second plug; c4pro_udc_recalibrate_phy
+ * (full RSTCFG_UDC reset, VBUS live) is what re-derives it. So the re-present
+ * mirrors the dry-boot path exactly: detach, hard-reset+recalibrate the PHY, then
+ * the winning STOCK HS connect (SOFT_POR then udc_soft_connect -> DEV_CTL 0x158).
+ * EP0 is re-armed by the USBRST ISR once the host starts enumerating (same as the
+ * boot connect, which also does not arm EP0 itself). */
+bool c4pro_usb_vbus_present(void) { return (DEV_INFO & VBUS_STS) != 0; }
+bool c4pro_usb_configured(void)   { return (DEV_INFO & DEV_EN) != 0; }
+
+void c4pro_usb_represent(void)
+{
+    /* LIGHT re-present nudge: detach, SOFT_POR the PHY, re-assert D+. Deliberately
+     * does NOT do the full RSTCFG_UDC hard controller reset (c4pro_udc_recalibrate_phy)
+     * -- that tears the whole controller down and, fired repeatedly on the
+     * monitor's cadence while the host is mid-retry, prevents enumeration from
+     * ever completing (observed: device number churns, permanent -71). The
+     * once-per-plug analog recalibration is done by usb_drv_init() in the correct
+     * context (re-armed on disconnect via c4pro_usb_arm_reconnect); this is only
+     * the gentle "try again" for a marginal chirp. */
+    DEV_CTL &= ~DEV_SOFT_CN;        /* detach: give the host a clean disconnect */
+    udelay(100000);
+    udc_phy_reset();
+    udelay(10000);
+    udc_soft_connect();             /* STOCK HS connect -> DEV_CTL 0x158 */
+}
+
+/* Re-arm usb_drv_init()'s one-shot connect so the NEXT plug re-runs the full
+ * recalibrating connect (the proven first-plug path) instead of skipping it via
+ * the latch. Called on USB disconnect. Forces recalibration next time because
+ * VBUS will be live at the next plug and the PHY analog trim decays across a
+ * disconnect (a runtime replug otherwise gets stuck at -71). */
+void c4pro_usb_arm_reconnect(void)
+{
+    c4pro_usb_did_soft_connect = false;
+    c4pro_vbus_at_boot = false;
+}
+#endif
+
 void usb_drv_init(void)
 {
     usb_drv_startup();
@@ -1054,31 +1137,37 @@ void usb_drv_init(void)
     for(int ep_num = 1; ep_num < USB_NUM_ENDPOINTS; ep_num++)
         semaphore_init(&endpoints[ep_num].complete, 1, 0);
 
-#if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
+#if defined(COLORFLY_C4_PRO)
     if(!c4pro_usb_did_soft_connect)
     {
         c4pro_usb_did_soft_connect = true;
-#ifdef C4PRO_USB_STOCK_PATH
-        /* A/B EXPERIMENT: stock rk27xx connect path (as HM-801, which does
-         * negotiate high-speed): SOFT_POR the PHY (hardware then sets PHY16BIT,
-         * DEV_CTL->0x158), wait, then standard udc_soft_connect. Tests whether
-         * the C4 'no POR / no PHY16BIT' customisation is what blocks HS. */
+        /* Detach FIRST (drop the D+ pull-up) and let the host see it. Across an
+         * app reboot the cable stays plugged and VBUS stays high, so the host
+         * retains its stale pre-reboot view of the device; re-asserting D+ it
+         * already considers "connected" triggers no fresh enumeration. A clean
+         * disconnect->reconnect forces the host to re-enumerate. (This is what
+         * the old imperative serve did via c4pro_usb_diag_force_reattach; the
+         * dry-boot recalibrate below also detaches, so this is its equivalent
+         * for the cable-at-boot path.) */
+        DEV_CTL &= ~DEV_SOFT_CN;
+        udelay(100000);                /* ~100ms so the host registers the detach */
+        if(!c4pro_vbus_at_boot)
+            /* Booted with no cable: the boot-time PHY calibration ran against a
+             * dead bus. Redo the full hard reset now, with VBUS live, before the
+             * connect sequence below runs -- otherwise the HS chirp is corrupted
+             * (host "error -71", full-speed only) on this runtime plug. */
+            c4pro_udc_recalibrate_phy();
+        /* Connect for the stock reactive path. EMPIRICALLY CONFIRMED (on-device,
+         * via the strategy cycler + a fresh cable plug): the STOCK sequence
+         * -- SOFT_POR the PHY, then udc_soft_connect() -> DEV_CTL=0x158 -- is what
+         * enumerates HIGH-speed. The host reads descriptors, binds usb-storage,
+         * and reports HS. (The "arm EP0 + clear PHY16BIT -> 0x118" variant only
+         * ever reached full-speed + host error -71; 0x158 is correct here.) The
+         * detach above gives the host a clean disconnect->reconnect edge. */
         DEV_CTL = DEV_SELF_PWR;
         udc_phy_reset();
         udelay(10000);
         udc_soft_connect();
-#else
-        /* Do NOT SOFT_POR the PHY here. Boot snapshot proves the BootROM (cold
-         * boot) / MaskROM (s2run) leaves the UDC PHY at DEV_CTL=0x08: an 8-bit
-         * UTMI state (PHY16BIT clear, SOFT_POR clear) that chirps and enumerates
-         * HIGH-speed cleanly. A udc_phy_reset() (SOFT_POR) re-inits the PHY,
-         * after which the hardware re-detects 16-bit mode (DEV_CTL->0x158) and
-         * the high-speed chirp no longer matches what the host saw from the ROM,
-         * so it falls back to corrupted full-speed (host error -71). The stock
-         * RK27xx loader never PORs the PHY either. Inherit the ROM's known-good
-         * HS PHY state and only arm EP0 + assert the pull-up. */
-        c4pro_udc_arm_and_connect();
-#endif
     }
 #endif
 }

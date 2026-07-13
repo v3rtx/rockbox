@@ -33,6 +33,15 @@ int usb_status = USB_EXTRACTED;
 void usb_init_device(void)
 {
     SCU_CLKCFG &= ~CLKCFG_UDC;
+#ifdef COLORFLY_C4_PRO
+    /* Record whether a cable was present (VBUS live) at the moment the PHY is
+     * hard-reset/calibrated below. usb_drv_init() uses this to decide whether a
+     * runtime plug needs its own live-VBUS recalibration (dry boot) or can
+     * inherit the boot-time calibration (cable already in). Reads DEV_INFO,
+     * which is valid now that CLKCFG_UDC is ungated above. */
+    extern volatile bool c4pro_vbus_at_boot;
+    c4pro_vbus_at_boot = (DEV_INFO & VBUS_STS) != 0;
+#endif
 #if !defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_STOCK_PATH)
     /* Hard-reset the UDC controller. NOT done on C4PRO: the BootROM already
      * brought the UDC/PHY up to a working (high-speed-capable) state, and

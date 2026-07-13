@@ -1138,6 +1138,17 @@ static void c4pro_app_native_rockbox_installer(void)
         lcd_putsf(0, 2, "page %lu", (unsigned long)last_payload_start_page);
         lcd_putsf(0, 3, "exp %08lx", (unsigned long)last_payload_expected);
         lcd_putsf(0, 4, "act %08lx", (unsigned long)last_payload_detail);
+        /* Byte-level detail of the write-verify mismatch (last candidate): which
+         * candidate/page, the failing byte offset within the page, and the
+         * expected vs actual byte read back. A 1-bit delta => marginal
+         * program/ECC; act=ff => page never programmed; garbage => bad block. */
+        lcd_putsf(0, 5, "fc%lu fpg%lu foff%lu",
+                  (unsigned long)c4pro_native_fail_candidate,
+                  (unsigned long)c4pro_native_fail_page,
+                  (unsigned long)c4pro_native_fail_off);
+        lcd_putsf(0, 6, "exp_b %02lx act_b %02lx",
+                  (unsigned long)((c4pro_native_fail_expact >> 8) & 0xffu),
+                  (unsigned long)(c4pro_native_fail_expact & 0xffu));
         lcd_update();
         c4pro_installer_halt();
     }
@@ -3990,6 +4001,64 @@ static void c4pro_boot_profile_show(const char *where)
 #define C4PRO_PRE_ROOT_MENU_HALT(step) do { } while (0)
 #endif
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+/* Re-homed from the old c4pro_usb_msc_serve BACK-hold. While the stock USB
+ * screen is shown (gui_usb_screen_run -> handle_usb_events), holding BACK ~2s
+ * reboots into mask-ROM RKUSB download mode (071b:3201) for a CE#-free reflash:
+ * the loader reads the magic from the HANDOFF DRAM slot (survives the WDT reset)
+ * at its fresh post-reset USB entry, the cold-boot condition under which RKUSB
+ * enumerates reliably. Called once per usb_screen event-loop iteration. Reads
+ * the raw button bitmask (button_status) so the action layer can't swallow BACK,
+ * and accumulates by wall-clock so the screen loop's variable wakeups don't
+ * matter. Runs in the runtime build (NOT gated on the retired MSC_ENABLE). */
+void c4pro_usb_screen_reflash_poll(void)
+{
+    static long back_since = -1;
+    static bool hinted = false;
+
+    if (!(button_status() & BUTTON_BACK))
+    {
+        back_since = -1;
+        hinted = false;
+        return;
+    }
+
+    if (back_since < 0)
+    {
+        back_since = current_tick;
+        hinted = false;
+        return;
+    }
+
+    if (!hinted && TIME_AFTER(current_tick, back_since + HZ))
+    {
+        hinted = true;
+        lcd_setfont(FONT_SYSFIXED);
+        lcd_puts(0, 4, "Keep holding BACK...");
+        lcd_update();
+    }
+
+    if (TIME_AFTER(current_tick, back_since + 2 * HZ))
+    {
+        volatile uint32_t *handoff = (volatile uint32_t *)0x606fff00u;
+        lcd_setfont(FONT_SYSFIXED);
+        lcd_clear_display();
+        lcd_puts(0, 0, "Entering USB flash");
+        lcd_puts(0, 1, "mode, rebooting...");
+        lcd_update();
+#ifdef HAVE_STORAGE_FLUSH
+        storage_flush();               /* durability before the reflash reboot */
+#endif
+        handoff[4] = 0xC4E9B00Bu;       /* HANDOFF_RKUSB_MAGIC */
+        commit_discard_dcache_range((void *)handoff, 64);
+        sleep(HZ / 4);
+        commit_discard_dcache_range((void *)handoff, 64);
+        system_reboot();               /* never returns */
+    }
+}
+#endif
+
+
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_USB_MSC_ENABLE)
 /* Serve the owned volume as USB Mass Storage while the cable is connected.
@@ -4682,15 +4751,13 @@ int main(void)
 #endif
     /* Keep the order of this 3
      * Must be done before any code uses the multi-screen API */
-#if defined(HAVE_USBSTACK) && \
-    (!defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_DIAG_EXPORT) || \
-     defined(C4PRO_USB_MSC_ENABLE))
-    /* All threads should be created and public queues registered by now */
+#if defined(HAVE_USBSTACK)
+    /* All threads should be created and public queues registered by now.
+     * C4PRO now uses the stock reactive path: usb_tick (registered in usb_init)
+     * posts USB_INSERTED for both boot-with-cable and runtime cold-plug, and the
+     * usb thread + gui_usb_screen_run drive the exclusive-storage handoff and
+     * usb_storage.c MSC serving -- no imperative c4pro_usb_msc_serve() anymore. */
     usb_start_monitoring();
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_USB_MSC_ENABLE) && !defined(C4PRO_USB_MSC_EARLY)
-    c4pro_usb_msc_serve();
-#endif
 #endif
 
 #if !defined(DISABLE_ACTION_REMAP) && defined(CORE_KEYREMAP_FILE)
@@ -5107,8 +5174,7 @@ static void init(void)
     adc_init();
     C4PRO_BOOT_STEP("adc ok");
 
-#if !defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_DIAG_EXPORT) || \
-    defined(C4PRO_USB_MSC_ENABLE)
+#ifndef USB_NONE
     usb_init();
 #endif
 #if CONFIG_USBOTG == USBOTG_ISP1362
@@ -5188,18 +5254,6 @@ static void init(void)
         panicf("ata: %d", rc);
     }
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
-    defined(C4PRO_USB_MSC_ENABLE) && defined(C4PRO_USB_MSC_EARLY)
-    /* Serve USB-MSC immediately after the mount, before the rest of init and
-     * main()'s list_init/tree_init (which are UI-only). All of
-     * c4pro_usb_msc_serve's dependencies -- usb_init, lcd, adc/button, storage
-     * -- are already up by here, so this reclaims the ~2.9s those later init
-     * steps add before the USB screen appears. On eject it returns and the
-     * normal boot continues; usb_start_monitoring is thus also ordered before
-     * any multi-screen-API use, as required. */
-    usb_start_monitoring();
-    c4pro_usb_msc_serve();
-#endif
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
     defined(C4PRO_FTL_SYNTH_AUDIT)
@@ -5411,22 +5465,15 @@ static void init(void)
                 c4pro_show_usb_diag_loop();
             }
 #endif
-#if defined(C4PRO_USB_MSC_ENABLE)
             /* The owned volume mounted in the FTL but carries no FAT yet (e.g.
              * just reformatted after the v3->v4 ECC migration). Expose the raw
-             * device as USB Mass Storage so the host can lay down a filesystem,
-             * then reboot to mount the new FAT -- instead of dead-looping here,
-             * unreachable, because this branch runs in init() before main()'s
-             * own USB-MSC serving block. */
+             * device via the stock USB screen so the host can lay down a
+             * filesystem, then fall through to system_reboot() to mount the new
+             * FAT. early_usb=true here because this runs in init(), before main()
+             * touches the multi-screen API / fonts / settings. */
             usb_start_monitoring();
-            c4pro_usb_msc_serve();
-#else
-            while (1)
-            {
-                lcd_update();
-                sleep(HZ / 2);
-            }
-#endif
+            while(button_get(true) != SYS_USB_CONNECTED) {};
+            gui_usb_screen_run(true, button_get_data());
 #elif !defined(USB_NONE)
             usb_start_monitoring();
             while(button_get(true) != SYS_USB_CONNECTED) {};

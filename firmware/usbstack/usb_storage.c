@@ -557,6 +557,16 @@ static int usb_storage_init_connection(void)
 
 void usb_storage_disconnect(void)
 {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    /* Durability on a bare cable-pull. Host writes land in the FTL RAM write-back
+     * cache and are only durable once flushed; a bare unplug sends no reliable
+     * SCSI SYNCHRONIZE CACHE, so without this the last FAT/dir/file-tail writes
+     * die on the next reboot -> corrupt volume. This is the single teardown
+     * choke point (fires for both unplug and a host config-0 change) and runs
+     * before storage is handed back to the player. Mirrors the old serve-loop
+     * storage_flush(); usb_storage_flush_media() routes to ftl_sync() here. */
+    usb_storage_flush_media();
+#endif
 #ifndef USB_STATIC_ALLOC
     usb_handle = core_free(usb_handle);
 #endif
@@ -1004,7 +1014,6 @@ static void handle_scsi(struct command_block_wrapper* cbw)
     switch (cbw->command_block[0]) {
         case SCSI_TEST_UNIT_READY:
             logf("scsi test_unit_ready %d",lun);
-#if !(defined(COLORFLY_C4_PRO) && defined(C4PRO_USB_MSC_ENABLE))
             if(!usb_exclusive_storage()) {
                 send_csw(UMS_STATUS_FAIL);
                 cur_sense_data.sense_key=SENSE_NOT_READY;
@@ -1012,7 +1021,6 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                 cur_sense_data.ascq=0;
                 break;
             }
-#endif
             if(lun_present) {
                 send_csw(UMS_STATUS_GOOD);
             }

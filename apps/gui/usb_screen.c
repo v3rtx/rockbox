@@ -108,6 +108,15 @@ static void handle_usb_events(struct viewport *title)
         if (button == SYS_CHARGER_DISCONNECTED)
             reset_runtime();
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+        /* BACK held ~2s on the USB screen -> reboot into RKUSB flash mode.
+         * Re-homed from the old imperative c4pro_usb_msc_serve loop. */
+        {
+            extern void c4pro_usb_screen_reflash_poll(void);
+            c4pro_usb_screen_reflash_poll();
+        }
+#endif
+
 /* USB-MMC bridge can report activity */
 #if (CONFIG_STORAGE & STORAGE_MMC) && !defined(SIMULATOR)
         if(TIME_AFTER(current_tick,next_update))

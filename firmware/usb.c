@@ -95,6 +95,15 @@ static long usb_stack[(DEFAULT_STACK_SIZE*4 + DUMP_BMP_LINESIZE + IAP_EXTRA_STAC
 static const char usb_thread_name[] = "usb";
 static unsigned int usb_thread_entry = 0;
 static bool usb_monitor_enabled = false;
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(USB_FULL_INIT)
+/* C4PRO USB monitor thread -- see usb_init(). Runs two watchdogs: the
+ * marginal-HS-PHY re-present (always) and the sustained-write stall-kick (when
+ * RX_STALL_KICK && PHASE_MARK are configured). */
+#define C4PRO_USB_MONITOR 1
+static long c4pro_usb_mon_stack[DEFAULT_STACK_SIZE/sizeof(long)];
+static const char c4pro_usb_mon_name[] = "c4usbmon";
+#endif
 static bool exclusive_storage_enabled = false;
 static bool exclusive_storage_requested = false;
 static struct event_queue usb_queue SHAREDBSS_ATTR;
@@ -235,6 +244,22 @@ static inline void usb_configure_drivers(int for_state)
 #ifdef USB_ENABLE_STORAGE
         usb_core_enable_driver(USB_DRIVER_MASS_STORAGE, true);
 #endif
+#if defined(COLORFLY_C4_PRO)
+        /* MASS-STORAGE ONLY on C4PRO. A HID (or other) interface makes the Linux
+         * host try to bind usbhid, which times out (-110) on this device and then
+         * RESETS the whole device mid-enumeration, killing the SCSI scan before
+         * the disk appears (observed in host dmesg). The old imperative serve also
+         * force-configured MS-only for the same reason. */
+#ifdef USB_ENABLE_HID
+        usb_core_enable_driver(USB_DRIVER_HID, false);
+#endif
+#ifdef USB_ENABLE_AUDIO
+        usb_core_enable_driver(USB_DRIVER_AUDIO, false);
+#endif
+#ifdef USB_ENABLE_IAP
+        usb_core_enable_driver(USB_DRIVER_IAP, false);
+#endif
+#else
 #ifdef USB_ENABLE_HID
         usb_core_enable_driver(USB_DRIVER_HID, usb_hid);
 #endif
@@ -244,6 +269,7 @@ static inline void usb_configure_drivers(int for_state)
 #ifdef USB_ENABLE_IAP
         usb_core_enable_driver(USB_DRIVER_IAP, true);
 #endif
+#endif /* COLORFLY_C4_PRO */
 #ifdef USB_ENABLE_CHARGING_ONLY
         usb_core_enable_driver(USB_DRIVER_CHARGING_ONLY, false);
 #endif
@@ -466,6 +492,21 @@ static void NORETURN_ATTR usb_thread(void)
 
             usb_state = USB_POWERED;
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+            /* Quiet the NAND BEFORE bringing USB up. The C4 Pro's HS PHY is
+             * marginal and concurrent NAND/AHB activity corrupts the high-speed
+             * chirp/descriptor reads (host "device descriptor read, error -71").
+             * disk_unmount_all() alone (FS layer) is NOT enough -- it is
+             * storage_enable(false) that quiets the NAND controller itself. This
+             * mirrors usb_slave_mode(true)'s storage steps WITHOUT setting the
+             * exclusive-storage flags (letting the normal SET_CONFIG handshake do
+             * that, so usb_storage serving isn't disturbed). The handshake below
+             * re-runs storage_init and re-mounts for the host. */
+            disk_unmount_all();
+            storage_soft_reset();
+            storage_init();
+            storage_enable(false);
+#endif
             usb_stack_enable(true);
 #ifndef BOOTLOADER
 #ifndef HAVE_USB_POWER
@@ -516,6 +557,26 @@ static void NORETURN_ATTR usb_thread(void)
 
             if(usb_state == USB_POWERED || usb_state == USB_INSERTED)
                 usb_stack_enable(false);
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+            {
+                extern void c4pro_usb_arm_reconnect(void);
+                /* Re-arm the recalibrating connect for the next plug (the
+                 * did_soft_connect latch would otherwise skip it on a runtime
+                 * replug -> stuck at -71). */
+                c4pro_usb_arm_reconnect();
+            }
+            /* Restore the storage the player needs. USB_INSERTED quiets the NAND
+             * (disk_unmount_all + storage_enable(false)); if the exclusive
+             * handshake never completed (a plug that failed to enumerate),
+             * usb_slave_mode(false) never ran to undo it -> the player shows no
+             * files. Re-enable + re-mount here for that case. */
+            if(!exclusive_storage_enabled)
+            {
+                storage_enable(true);
+                disk_mount_all();
+            }
+#endif
 
 #ifdef IPOD_ACCESSORY_PROTOCOL
             iap_reset_state(IF_IAP_MP(0));
@@ -728,6 +789,97 @@ void usb_acknowledge(long id, intptr_t seqnum)
 }
 #endif /* USB_FULL_INIT */
 
+#ifdef C4PRO_USB_MONITOR
+/* C4PRO USB monitor: a single PRIORITY_SYSTEM thread at 20ms cadence running two
+ * independent watchdogs that must run even while the usb thread is blocked in
+ * queue_wait.
+ *
+ * 1) MARGINAL-HS-PHY RE-PRESENT. The HS PHY is marginal: a plug enumerates only
+ *    occasionally (host logs "device descriptor read/64, error -71" on a failed
+ *    attempt). Re-present (quiet the NAND, drop D+, reset PHY, re-assert D+)
+ *    whenever the cable is in, the host has NOT configured us (DEV_EN clear), and
+ *    enumeration has STALLED -- i.e. the setup-packet counter hasn't advanced for
+ *    ~5s. A healthy enumeration keeps setups flowing so this never fires
+ *    mid-config (a mid-config detach would force the host to restart -> -71).
+ *
+ * 2) SUSTAINED-WRITE STALL-KICK (re-homed from the old imperative serve loop;
+ *    compiled only when RX_STALL_KICK && PHASE_MARK are configured). The armed
+ *    bulk-OUT receive (phase 13) silently never completes and the host then
+ *    bus-resets at its 30s SCSI timeout; detect "phase 13 with no bulk-OUT
+ *    progress for 100ms" and kick the receive engine (the kick re-validates under
+ *    the IRQ mask, so an early kick on a healthy paused receive is safe).
+ *
+ * Both predicates are false in steady state, so the thread never perturbs the
+ * serving/write hot path. */
+static void c4pro_usb_monitor_thread(void)
+{
+    extern bool c4pro_usb_vbus_present(void);
+    extern bool c4pro_usb_configured(void);
+    extern volatile unsigned c4pro_usb_setup_seq;
+    extern void c4pro_usb_represent(void);
+    unsigned last_setup = 0;
+    long setup_change = 0;
+    long last_represent = 0;
+#if defined(C4PRO_USB_RX_STALL_KICK) && defined(C4PRO_PHASE_MARK)
+    extern volatile uint32_t c4pro_hb_phase;
+    extern volatile unsigned c4pro_usb_diag_outn_count;
+    extern void c4pro_usb_rx_stall_kick(void);
+    unsigned last_outn = 0;
+    long stall_since = -1;
+#endif
+
+    while(1)
+    {
+        /* (1) re-present the marginal HS PHY when enumeration has stalled */
+        {
+            unsigned su = c4pro_usb_setup_seq;
+            if(su != last_setup)
+            {
+                last_setup = su;
+                setup_change = current_tick;
+            }
+            /* Nudge only after the host has had a FULL enumeration+retry window
+             * (~5s) with no progress. usb_drv_init()'s connect (re-armed per plug
+             * via c4pro_usb_arm_reconnect) is the primary connect; a shorter
+             * cadence here would detach mid-enumeration and force the host to
+             * restart every time -> permanent -71 churn. */
+            if(c4pro_usb_vbus_present() && !c4pro_usb_configured() &&
+               TIME_AFTER(current_tick, last_represent + 5 * HZ) &&
+               TIME_AFTER(current_tick, setup_change + 5 * HZ))
+            {
+                last_represent = current_tick;
+                /* storage_enable(false) is the light lever that silences the
+                 * NAND/AHB traffic corrupting the marginal PHY -- do NOT
+                 * storage_soft_reset/init here (that hammers/wedges the NAND). */
+                storage_enable(false);
+                c4pro_usb_represent();
+            }
+        }
+
+        /* (2) sustained-write bulk-OUT stall-kick */
+#if defined(C4PRO_USB_RX_STALL_KICK) && defined(C4PRO_PHASE_MARK)
+        if(c4pro_hb_phase == 13 &&
+           c4pro_usb_diag_outn_count == last_outn)
+        {
+            if(stall_since < 0)
+                stall_since = current_tick;
+            else if(TIME_AFTER(current_tick, stall_since + HZ / 10))
+            {
+                c4pro_usb_rx_stall_kick();
+                stall_since = -1;
+            }
+        }
+        else
+        {
+            last_outn = c4pro_usb_diag_outn_count;
+            stall_since = -1;
+        }
+#endif
+        sleep(HZ / 50);
+    }
+}
+#endif /* C4PRO_USB_MONITOR */
+
 void usb_init(void)
 {
     /* Do required hardware inits first. For software USB the driver has
@@ -743,6 +895,12 @@ void usb_init(void)
     usb_thread_entry = create_thread(usb_thread, usb_stack,
                        sizeof(usb_stack), 0, usb_thread_name
                        IF_PRIO(, PRIORITY_SYSTEM) IF_COP(, CPU));
+
+#ifdef C4PRO_USB_MONITOR
+    create_thread(c4pro_usb_monitor_thread, c4pro_usb_mon_stack,
+                  sizeof(c4pro_usb_mon_stack), 0, c4pro_usb_mon_name
+                  IF_PRIO(, PRIORITY_SYSTEM) IF_COP(, CPU));
+#endif
 
 #ifndef USB_STATUS_BY_EVENT
     tick_add_task(usb_tick);

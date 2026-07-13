@@ -102,6 +102,14 @@ volatile uint32_t c4pro_fault_num;
 volatile uint32_t c4pro_fault_phase;
 #endif
 
+#ifdef COLORFLY_C4_PRO
+/* apps/plugin.c owns the real (strong) definition, read by the visible-fault
+ * handler (system-arm-classic.c). Provide a WEAK fallback here so BOOTLOADER
+ * builds -- which link firmware but not plugin.c -- still resolve the symbol;
+ * the app's strong definition overrides this whenever plugin.c is linked. */
+volatile uint32_t c4pro_plugin_load_count __attribute__((weak));
+#endif
+
 static void UIRQ(void)
 {
 #ifdef C4PRO_BOOT_HEARTBEAT
