@@ -117,6 +117,36 @@ static void handle_usb_events(struct viewport *title)
         }
 #endif
 
+#if defined(COLORFLY_C4_PRO) && defined(C4PRO_USB_RX_TIMING)
+        /* Bulk-OUT write bottleneck breakdown (TMR2 @50MHz -> /50 = us).
+         * w = avg/max us per 512B packet WITHIN a buffer (receive latency),
+         * g = avg/max us at each BUFFER boundary (usb-thread + the SERIALIZED
+         * NAND write). Total per 128KB buffer ~= 256*w + g; whichever term is
+         * bigger is the wall. SW/LD/TP = NAND per-page entry-wait/load/confirm. */
+        {
+            extern volatile uint32_t c4pro_rxt_win_sum, c4pro_rxt_win_cnt, c4pro_rxt_win_max;
+            extern volatile uint32_t c4pro_rxt_gap_sum, c4pro_rxt_gap_cnt, c4pro_rxt_gap_max;
+            extern volatile uint32_t c4pro_wp_load_sum, c4pro_wp_tprog_sum, c4pro_wp_cnt, c4pro_wp_start_sum;
+            if (c4pro_rxt_win_cnt)
+            {
+                lcd_putsf(0, 5, "w%lu/%lu n%lu",
+                          (unsigned long)(c4pro_rxt_win_sum / c4pro_rxt_win_cnt / 50),
+                          (unsigned long)(c4pro_rxt_win_max / 50),
+                          (unsigned long)c4pro_rxt_win_cnt);
+                lcd_putsf(0, 6, "g%lu/%lu n%lu",
+                          (unsigned long)(c4pro_rxt_gap_cnt ? c4pro_rxt_gap_sum / c4pro_rxt_gap_cnt / 50 : 0),
+                          (unsigned long)(c4pro_rxt_gap_max / 50),
+                          (unsigned long)c4pro_rxt_gap_cnt);
+                if (c4pro_wp_cnt)
+                    lcd_putsf(0, 7, "SW%lu LD%lu TP%lu",
+                              (unsigned long)(c4pro_wp_start_sum / c4pro_wp_cnt / 50),
+                              (unsigned long)(c4pro_wp_load_sum / c4pro_wp_cnt / 50),
+                              (unsigned long)(c4pro_wp_tprog_sum / c4pro_wp_cnt / 50));
+                lcd_update();
+            }
+        }
+#endif
+
 /* USB-MMC bridge can report activity */
 #if (CONFIG_STORAGE & STORAGE_MMC) && !defined(SIMULATOR)
         if(TIME_AFTER(current_tick,next_update))
@@ -287,6 +317,14 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
     }
     usb_acknowledge(SYS_USB_CONNECTED_ACK, seqnum);
     usb_screens_draw(usb_screen_vps_ar);
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    /* Flush the initial draw to the LCD. usb_screens_draw() only renders into the
+     * framebuffer; the C4's buffered LCD shows nothing until an lcd_update, so
+     * without this the USB screen stays blank until a button press triggers the
+     * first redraw inside handle_usb_events. */
+    FOR_NB_SCREENS(i)
+        screens[i].update();
+#endif
     handle_usb_events(title);
 
 #if defined(USB_ENABLE_HID)

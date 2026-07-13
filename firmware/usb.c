@@ -31,6 +31,9 @@
 #include "debug.h"
 #include "storage.h"
 #include "disk.h"
+#if defined(COLORFLY_C4_PRO) && !defined(BOOTLOADER)
+#include "audio.h"   /* audio_hard_stop() before the C4 USB NAND-quiet */
+#endif
 #include "panic.h"
 #include "lcd.h"
 #include "usb.h"
@@ -493,18 +496,23 @@ static void NORETURN_ATTR usb_thread(void)
             usb_state = USB_POWERED;
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
-            /* Quiet the NAND BEFORE bringing USB up. The C4 Pro's HS PHY is
-             * marginal and concurrent NAND/AHB activity corrupts the high-speed
-             * chirp/descriptor reads (host "device descriptor read, error -71").
-             * disk_unmount_all() alone (FS layer) is NOT enough -- it is
-             * storage_enable(false) that quiets the NAND controller itself. This
-             * mirrors usb_slave_mode(true)'s storage steps WITHOUT setting the
-             * exclusive-storage flags (letting the normal SET_CONFIG handshake do
-             * that, so usb_storage serving isn't disturbed). The handshake below
-             * re-runs storage_init and re-mounts for the host. */
-            disk_unmount_all();
-            storage_soft_reset();
-            storage_init();
+#ifndef BOOTLOADER
+            /* Stop playback + close files BEFORE quieting the NAND. The audio
+             * buffer thread may be actively reading the disk (continuous
+             * multi-track buffering); quieting storage under a live read is
+             * unsafe. Stock stops audio later via the SYS_USB_CONNECTED
+             * handshake, but our NAND-quiet runs before the connect. */
+            audio_hard_stop();
+#endif
+            /* Quiet the NAND BEFORE bringing USB up: the marginal HS PHY's
+             * chirp/descriptor reads are corrupted by concurrent NAND/AHB traffic
+             * (host "error -71"). storage_enable(false) is the lever that silences
+             * the controller -- the LIGHT quiet. Do NOT storage_soft_reset() /
+             * storage_init() here: that re-runs the full (slow, 1-2 min on a stale
+             * checkpoint) FTL mount scan on every plug -> the player appears to
+             * hang -- and per field notes it also hammers/wedges the NAND. The
+             * SYS_USB_CONNECTED handshake below (usb_slave_mode) does the real
+             * unmount/re-mount once audio is stopped. */
             storage_enable(false);
 #endif
             usb_stack_enable(true);
@@ -838,14 +846,16 @@ static void c4pro_usb_monitor_thread(void)
                 last_setup = su;
                 setup_change = current_tick;
             }
-            /* Nudge only after the host has had a FULL enumeration+retry window
-             * (~5s) with no progress. usb_drv_init()'s connect (re-armed per plug
-             * via c4pro_usb_arm_reconnect) is the primary connect; a shorter
-             * cadence here would detach mid-enumeration and force the host to
-             * restart every time -> permanent -71 churn. */
+            /* Re-present a STALLED enumeration fast to cut plug-to-screen latency
+             * on the marginal HS PHY. The setup_change gate already protects a
+             * PROGRESSING enum (setups keep it fresh), so this only fires when the
+             * host has gone quiet (a failed -71 attempt) -- ~1.5s after the last
+             * setup is enough for the host to have given up, and retrying sooner
+             * shortens the worst case (was 5s -> up to ~10s for two cycles). The
+             * light re-present (no controller reset) does not thrash. */
             if(c4pro_usb_vbus_present() && !c4pro_usb_configured() &&
-               TIME_AFTER(current_tick, last_represent + 5 * HZ) &&
-               TIME_AFTER(current_tick, setup_change + 5 * HZ))
+               TIME_AFTER(current_tick, last_represent + 3 * HZ / 2) &&
+               TIME_AFTER(current_tick, setup_change + 3 * HZ / 2))
             {
                 last_represent = current_tick;
                 /* storage_enable(false) is the light lever that silences the
