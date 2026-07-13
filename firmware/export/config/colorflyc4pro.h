@@ -190,7 +190,12 @@
  * engine has no transfer-length register.) This flag strips our per-packet path
  * toward stock's: no RXCON NAK-clear on bulk re-arm, no per-packet RXCON MMIO
  * read in diag. Freeze-sensitive path -> validate with crash-capture + multiple
- * runs. */
+ * runs. Tested 2026-07-13: no measurable write-speed gain (2.9 vs 3.3, within
+ * variance) since the per-packet cost is IRQ-latency-dominated, not MMIO. Left
+ * OFF -- no benefit, and it sits on the freeze-sensitive path. Multi-packet OUT
+ * DMA is impossible on this SoC and RX/NAND overlap re-arms the PIO-AHB-monopoly
+ * freeze, so NAND write is at its structural ceiling (~3.3 MB/s). */
+/* #define C4PRO_USB_RX_LEAN_REARM */
 
 /* C4PRO_USB_RX_STALL_KICK (OPT-IN): serve-loop watchdog for the residual
  * sustained-write freeze -- the armed bulk-OUT receive (phase 13) silently never
@@ -198,6 +203,11 @@
  * the AHB. On "phase 13 + zero RX completions for 2s" the main thread kicks the
  * receive engine (abort+RXCLR+re-arm at the same position; safe because nothing
  * was ACKed). See c4pro_usb_rx_stall_kick() in usb-drv-rk27xx.c. */
+
+/* TEMP volume diagnostics (kept gated off; re-enable to surface the received
+ * volume + applied pcm factor + DMA'd peak via the USB iProduct string):
+ *   #define C4PRO_SCU_DIAG
+ *   #define C4PRO_PLAYBACK_DIAG   (adds a ~2s on-screen hold before playback) */
 
 /* Phase markers must be live whenever the WDT crash capture is, not only with
  * the LCD heartbeat: a captured freeze with the USB phases (1,2,10-13) compiled
