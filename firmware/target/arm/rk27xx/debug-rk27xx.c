@@ -159,3 +159,76 @@ bool dbg_ports(void)
     lcd_setfont(FONT_UI);
     return false;
 }
+
+#if defined(COLORFLY_C4_PRO)
+/* S/PDIF DAC-input probe. Puts the C4 into "external DAC" mode (coax S/PDIF
+ * on an RCA jack -> CS8422 receiver -> async SRC -> CS4398 -> analog out) and
+ * shows the CS8422 lock/rate/error status live. The physical RX pin the coax
+ * jack is wired to is undocumented, so RIGHT/LEFT cycle candidate Receiver
+ * Input Control (03h) values -- feed a coax source and watch for PLL/RX lock
+ * to identify the wiring. BACK exits and powers the DAC back down. */
+extern int  c4pro_cs8422_read(unsigned char reg);
+extern void c4pro_spdif_dac_enter(unsigned char rx_input_ctl);
+extern void c4pro_spdif_dac_set_rx(unsigned char rx_input_ctl);
+extern void c4pro_spdif_dac_exit(void);
+
+bool dbg_spdif_dac(void)
+{
+    static const struct { unsigned char reg03; const char *name; } cand[] = {
+        { 0x80, "SE   RX0  comp" },
+        { 0xA0, "SE   RX2  comp" },
+        { 0x00, "DIFF RXP0/RXN0" },
+        { 0x40, "DIFF RXP1/RXN1" },
+        { 0x84, "SE   RX0  dig " },
+    };
+    static const char * const rate[4] = { "??", "32k", "44.1k", "48k" };
+    const int ncand = sizeof(cand) / sizeof(cand[0]);
+    int sel = 0;
+    int line;
+
+    c4pro_spdif_dac_enter(cand[sel].reg03);
+    lcd_setfont(FONT_SYSFIXED);
+
+    while (1)
+    {
+        int r13 = c4pro_cs8422_read(0x13);   /* Receiver Error   */
+        int r15 = c4pro_cs8422_read(0x15);   /* PLL Status       */
+        int r16 = c4pro_cs8422_read(0x16);   /* Receiver Status  */
+
+        lcd_clear_display();
+        line = 0;
+        _DEBUG_PRINTF("S/PDIF DAC input");
+        _DEBUG_PRINTF("RX 03h=%02x %s", cand[sel].reg03, cand[sel].name);
+        line++;
+        _DEBUG_PRINTF("PLL_LOCK : %d", (r15 >> 5) & 1);
+        _DEBUG_PRINTF("RX_LOCK  : %d", (r16 >> 4) & 1);
+        _DEBUG_PRINTF("RCVR_RATE: %s", rate[(r16 >> 5) & 3]);
+        _DEBUG_PRINTF("96k/192k : %d/%d", (r15 >> 4) & 1, (r15 >> 3) & 1);
+        _DEBUG_PRINTF("RXerr 13h: %02x", r13 & 0xff);
+        line++;
+        _DEBUG_PRINTF("RIGHT/LEFT: cycle RX");
+        _DEBUG_PRINTF("BACK: exit");
+        lcd_update();
+
+        int btn = button_get_w_tmo(HZ/5);
+        if (btn & BUTTON_REL)
+            continue;                        /* ignore release edges */
+        if (btn & BUTTON_BACK)
+            break;
+        if ((btn & BUTTON_RIGHT) || (btn & BUTTON_NEXT))
+        {
+            sel = (sel + 1) % ncand;
+            c4pro_spdif_dac_set_rx(cand[sel].reg03);
+        }
+        else if ((btn & BUTTON_LEFT) || (btn & BUTTON_PREV))
+        {
+            sel = (sel + ncand - 1) % ncand;
+            c4pro_spdif_dac_set_rx(cand[sel].reg03);
+        }
+    }
+
+    c4pro_spdif_dac_exit();
+    lcd_setfont(FONT_UI);
+    return false;
+}
+#endif /* COLORFLY_C4_PRO */

@@ -2880,6 +2880,9 @@ static const struct {
 #if ((CONFIG_PLATFORM & PLATFORM_NATIVE) || defined(SONY_NWZ_LINUX) || defined(HIBY_LINUX) || defined(FIIO_M3K_LINUX)) && !defined(SIMULATOR)
         { "View HW info", dbg_hw_info },
 #endif
+#if defined(COLORFLY_C4_PRO)
+        { "S/PDIF DAC input", dbg_spdif_dac },
+#endif
 #if (CONFIG_PLATFORM & PLATFORM_NATIVE)
         { "View partitions", dbg_partitions },
 #endif
