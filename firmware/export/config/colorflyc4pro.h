@@ -245,6 +245,16 @@
 #define C4PRO_USB_UDC_IRQ_FIX
 #endif
 
+/* Default-ON. INT_UDC self-guards when idle: usb_init_device() enables the UDC
+ * IRQ at boot and it stays live during normal playback, so a spurious/stale UDC
+ * interrupt (even unplugged) enters INT_UDC and either data-aborts on stale ep0
+ * state (song-open crash) or steals codec time (the ~4s playback crack). With no
+ * VBUS there is no real USB session, so INT_UDC just ACKs and returns. See
+ * INT_UDC() in usb-drv-rk27xx.c. Define C4PRO_USB_NO_IDLE_UDC_GUARD to A/B off. */
+#ifndef C4PRO_USB_NO_IDLE_UDC_GUARD
+#define C4PRO_USB_IDLE_UDC_GUARD
+#endif
+
 /* Default-ON crash guard (active only in the USB-MSC build): when a host USB
  * link-reset lands between commands, INT_UDC finishes the re-init and acks
  * WITHOUT processing stale endpoint completions latched in the same interrupt

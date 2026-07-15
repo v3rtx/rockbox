@@ -1379,6 +1379,31 @@ void INT_UDC(void)
     uint32_t intsrc = INT2FLAG & 0x7fffff;
     if(intsrc == 0)
         return;
+
+#ifdef C4PRO_USB_IDLE_UDC_GUARD
+    /* Root-cause guard for the ~4s playback crack AND the intermittent song-open
+     * INT_UDC data-abort. usb_init_device() enables the UDC IRQ at BOOT and it
+     * stays live all through normal playback, so a spurious/stale UDC interrupt
+     * -- even with NO cable attached -- drops us into INT_UDC. Servicing a stale
+     * SETUP/EP-completion against un-enumerated ep0 state dereferences a bad
+     * pointer -> data abort in IRQ context (the 6006b7xx crash); and the repeated
+     * heavy ISR entry (its EP0/DMA wait loops) steals codec time -> periodic
+     * pcmbuf underrun = the crack. A real USB session REQUIRES VBUS (usb_detect()
+     * polls exactly DEV_INFO & VBUS_STS), so with VBUS ABSENT there is nothing
+     * legitimate to service: ACK whatever latched (INT2FLAG is write-1-to-clear)
+     * and return WITHOUT touching endpoint state. Do NOT mask the IRQ line -- it
+     * is enabled only once at boot in usb_init_device() and is NOT reliably
+     * re-enabled on the next plug, so masking would break USB-MSC. Acking is
+     * enough; a real cable sets VBUS_STS and the normal path below runs untouched.
+     * Disconnect cleanup is done by the polling usb thread (usb_enable(false)),
+     * not here. */
+    if(!(DEV_INFO & VBUS_STS))
+    {
+        INT2FLAG = intsrc;
+        return;
+    }
+#endif
+
 #if defined(C4PRO_USB_DIAG_EXPORT) || defined(C4PRO_USB_MSC_ENABLE)
     c4pro_usb_diag_irq_count++;
     c4pro_usb_diag_last_intsrc = intsrc;
