@@ -113,10 +113,19 @@ static unsigned int c4pro_clockgen_word(int fsel)
 #endif
 #endif
 #ifdef HW_HAVE_48
-    case HW_FREQ_48: return 0x0005;
+    /* 0x0015, NOT 0x0005: 0x0005 is the 44.1kHz word, so 48kHz files were clocked
+     * at 44.1kHz -> ~8% slow + pitched down. The clockgen encodes rate families as
+     * two sequences where doubling the rate adds 2 to the word; the 48kHz family is
+     * 8k=0x10,12k=0x11,16k=0x12,24k=0x13,32k=0x14, so 48k (=24k x2) = 0x15. (An
+     * earlier probe only tried 0x06/0x07, both in the 44.1 bank, and wrongly
+     * settled on 0x0005.) */
+    case HW_FREQ_48: return 0x0015;
 #endif
 #ifdef HW_HAVE_96
-    case HW_FREQ_96: return 0x0007;
+    /* 0x0017, NOT 0x0007: 0x0007 is the 88.2kHz word (44.1 family: 11k=0x01,
+     * 22k=0x03, 44.1k=0x05, 88.2k=0x07), so 96kHz played ~8% slow. 96k = 48k x2 in
+     * the 48kHz family (0x15 -> 0x17). */
+    case HW_FREQ_96: return 0x0017;
 #endif
     default: return 0x0001;
     }
