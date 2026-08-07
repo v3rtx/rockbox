@@ -1003,6 +1003,32 @@ static void c4pro_ftl_build_hash_map(void)
 #endif
 #endif
 
+#if defined(COLORFLY_C4_PRO) && (defined(C4PRO_PHASE_MARK) || \
+    defined(C4PRO_BOOT_HEARTBEAT) || defined(C4PRO_FAULT_VISIBLE) || \
+    defined(C4PRO_WDT_CRASH_CAPTURE))
+/* Write-path phase marker for the heartbeat freeze localizer (also read by the
+ * visible-fault handler to tag WHICH stage faulted). Set at entry of each
+ * sustained-write stage (all run in usb-thread context, so no IRQ race). On a
+ * silent freeze the frozen value = the innermost stage the usb thread reached:
+ *   1  USB (usb_storage, between/after a write)   2  usb_storage write dispatch
+ *   3  c4own_write_logical_block                  4  superblock/checkpoint flush
+ *   5  c4own_write_page (NAND hwecc program)      6  c4own_erase_pblk (erase)
+ *   7  COW-fill / cache-load NAND read (between programs; previously reported
+ *      as 5, hiding whether the read or the program engine wedged)
+ *   10 send_csw (about to send CSW)               11 bulk-IN sync sender (CSW DMA)
+ *   12 CSW sent, arming next-command receive     13 armed, waiting for host
+ *                                                    bulk-OUT WRITE data (the
+ *                                                    exact state usbmon
+ *                                                    caught wedged 2026-07-02,
+ *                                                    see freeze doc s5.1/5.2)
+ *
+ * Defined outside the owned-RW block below because its readers (UIE in
+ * system-arm-classic.c, usb.c, usb_storage.c, usb-drv-rk27xx.c) are gated on
+ * C4PRO_PHASE_MARK alone, which colorflyc4pro.h enables unconditionally -- a
+ * build without C4PRO_FTL_ROCKBOX_OWNED_RW used to fail to link on this. */
+volatile uint32_t c4pro_hb_phase;
+#endif
+
 #if defined(COLORFLY_C4_PRO) && defined(C4PRO_FTL_ROCKBOX_OWNED_RW)
 
 #define C4OWN_MAGIC_SB 0x31465443u /* CTF1 */
@@ -1359,26 +1385,6 @@ static int c4own_read_phys_sector_uncached(uint32_t pblk, uint32_t sector,
            512);
     return 0;
 }
-
-#if defined(C4PRO_BOOT_HEARTBEAT) || defined(C4PRO_FAULT_VISIBLE) || \
-    defined(C4PRO_WDT_CRASH_CAPTURE)
-/* Write-path phase marker for the heartbeat freeze localizer (also read by the
- * visible-fault handler to tag WHICH stage faulted). Set at entry of each
- * sustained-write stage (all run in usb-thread context, so no IRQ race). On a
- * silent freeze the frozen value = the innermost stage the usb thread reached:
- *   1  USB (usb_storage, between/after a write)   2  usb_storage write dispatch
- *   3  c4own_write_logical_block                  4  superblock/checkpoint flush
- *   5  c4own_write_page (NAND hwecc program)      6  c4own_erase_pblk (erase)
- *   7  COW-fill / cache-load NAND read (between programs; previously reported
- *      as 5, hiding whether the read or the program engine wedged)
- *   10 send_csw (about to send CSW)               11 bulk-IN sync sender (CSW DMA)
- *   12 CSW sent, arming next-command receive     13 armed, waiting for host
- *                                                    bulk-OUT WRITE data (the
- *                                                    exact state usbmon
- *                                                    caught wedged 2026-07-02,
- *                                                    see freeze doc s5.1/5.2) */
-volatile uint32_t c4pro_hb_phase;
-#endif
 
 #ifdef C4PRO_PHASE_MARK
 #define C4PRO_SET_PHASE(n) do { c4pro_hb_phase = (n); } while (0)
