@@ -4034,7 +4034,7 @@ void c4pro_usb_screen_reflash_poll(void)
     {
         hinted = true;
         lcd_setfont(FONT_SYSFIXED);
-        lcd_puts(0, 4, "Keep holding BACK...");
+        lcd_puts(0, 8, "Keep holding BACK...");
         lcd_update();
     }
 
@@ -4055,6 +4055,30 @@ void c4pro_usb_screen_reflash_poll(void)
         commit_discard_dcache_range((void *)handoff, 64);
         system_reboot();               /* never returns */
     }
+}
+
+/* PLAY tapped on the USB screen -> drop the host connection and go back to the
+ * player with the cable still in (charging). Reads the raw bitmask like the
+ * reflash poll above, and arms only after PLAY has been seen released, so the
+ * press that started playback (or opened this screen) cannot trigger it. */
+void c4pro_usb_screen_chargeonly_poll(void)
+{
+    static bool armed = false;
+
+    if (!(button_status() & BUTTON_PLAY))
+    {
+        armed = true;
+        return;
+    }
+
+    if (!armed)
+        return;
+
+    armed = false;
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_puts(0, 8, "Charge only...      ");
+    lcd_update();
+    c4pro_usb_charge_only();
 }
 #endif
 

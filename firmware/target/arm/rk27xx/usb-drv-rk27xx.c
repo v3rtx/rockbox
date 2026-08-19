@@ -1114,6 +1114,16 @@ void c4pro_usb_represent(void)
     udc_soft_connect();             /* STOCK HS connect -> DEV_CTL 0x158 */
 }
 
+/* Make sure D+ is NOT asserted. Used by the plug paths that do not bring the
+ * stack up (charge-only, and the window before a deferred attach): if a
+ * previous session or the loader left DEV_SOFT_CN set, the host would start
+ * enumerating into an uninitialised driver -- and the INT_UDC idle-guard
+ * cannot catch that, because VBUS is present. */
+void c4pro_usb_detach(void)
+{
+    DEV_CTL &= ~DEV_SOFT_CN;
+}
+
 /* Re-arm usb_drv_init()'s one-shot connect so the NEXT plug re-runs the full
  * recalibrating connect (the proven first-plug path) instead of skipping it via
  * the latch. Called on USB disconnect. Forces recalibration next time because

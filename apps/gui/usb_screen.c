@@ -23,6 +23,7 @@
 #include <stdbool.h>
 #include "action.h"
 #include "font.h"
+#include "lcd.h"
 #ifdef HAVE_REMOTE_LCD
 #include "lcd-remote.h"
 #endif
@@ -44,6 +45,17 @@
 #include "icons.h"
 
 #include "bitmaps/usblogo.h"
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+/* HID is force-disabled for this target in usb_configure_drivers() (the host's
+ * usbhid bind times out and resets the device mid-enumeration), so the keypad-
+ * mode title is dead UI here -- and its "ensure the USB mode strings get
+ * cached" loop faults glyphs in off the NAND before the screen is painted.
+ */
+#define USB_SCREEN_HID_ACTIVE   false
+#else
+#define USB_SCREEN_HID_ACTIVE   (global_settings.usb_hid)
+#endif
 
 #ifdef HAVE_REMOTE_LCD
 #include "bitmaps/remote_usblogo.h"
@@ -89,7 +101,7 @@ static void handle_usb_events(struct viewport *title)
 #ifndef USB_ENABLE_HID
         (void)title;
 #else
-        if (global_settings.usb_hid)
+        if (USB_SCREEN_HID_ACTIVE)
         {
             button = get_hid_usb_action();
             if (button == ACTION_USB_HID_MODE_SWITCH_NEXT ||
@@ -113,7 +125,9 @@ static void handle_usb_events(struct viewport *title)
          * Re-homed from the old imperative c4pro_usb_msc_serve loop. */
         {
             extern void c4pro_usb_screen_reflash_poll(void);
+            extern void c4pro_usb_screen_chargeonly_poll(void);
             c4pro_usb_screen_reflash_poll();
+            c4pro_usb_screen_chargeonly_poll();
         }
 #endif
 
@@ -159,6 +173,19 @@ static void handle_usb_events(struct viewport *title)
 #endif /* STORAGE_MMC */
     }
 }
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+/* What this screen can do besides serving the host. Lines 0-2 sit under the
+ * status bar and are not readable, so the legend starts at 4. */
+static void c4pro_usb_screen_hints(void)
+{
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_puts(0, 4, "PLAY:  charge only");
+    lcd_puts(0, 5, "BACK held 2s: flash");
+    lcd_update();
+}
+
+#endif
 
 static void usb_screen_fix_viewports(struct screen *screen,
         struct usb_screen_vps_t *usb_screen_vps)
@@ -211,7 +238,7 @@ static void usb_screen_fix_viewports(struct screen *screen,
     logo->height = logo_height;
 
 #ifdef USB_ENABLE_HID
-    if (global_settings.usb_hid)
+    if (USB_SCREEN_HID_ACTIVE)
     {
         struct viewport *title = &usb_screen_vps->title;
         int char_height = font_get(parent->font)->height;
@@ -259,7 +286,7 @@ static void usb_screens_draw(struct usb_screen_vps_t *usb_screen_vps_ar)
         screen->set_viewport(last_vp);
     }
 #ifdef USB_ENABLE_HID
-    if (global_settings.usb_hid)
+    if (USB_SCREEN_HID_ACTIVE)
         draw_usb_keypad_mode(&usb_screen_vps_ar[SCREEN_MAIN].title);
 #endif
 }
@@ -285,10 +312,13 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
 
     push_current_activity(ACTIVITY_USBSCREEN);
 
-#ifdef USB_ENABLE_HID
+#if defined(USB_ENABLE_HID) && \
+    !(defined(COLORFLY_C4_PRO) && !defined(SIMULATOR))
     usb_keypad_mode = global_settings.usb_keypad_mode;
     title = &usb_screen_vps_ar[SCREEN_MAIN].title;
 #else
+    /* usb_screen_fix_viewports() never initialises the title viewport when HID
+     * is inert, so there is nothing valid to point at. */
     title = NULL;
 #endif
 
@@ -310,25 +340,60 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
     send_event(GUI_EVENT_ACTIONUPDATE, NULL);
 #endif
 
+#if !(defined(COLORFLY_C4_PRO) && !defined(SIMULATOR))
     if(!early_usb)
     {
         /* The font system leaves the .fnt fd's open, so we need for force close them all */
         font_disable_all();
     }
-    usb_acknowledge(SYS_USB_CONNECTED_ACK, seqnum);
-    usb_screens_draw(usb_screen_vps_ar);
+#endif
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
-    /* Flush the initial draw to the LCD. usb_screens_draw() only renders into the
-     * framebuffer; the C4's buffered LCD shows nothing until an lcd_update, so
-     * without this the USB screen stays blank until a button press triggers the
-     * first redraw inside handle_usb_events. */
+    /* PAINT FIRST, then do the slow work, then ack. default_event_handler()
+     * used to run system_flush() (playlist_shutdown + tree_flush +
+     * open_plugin_cache_flush + the storage idle notifys -- seconds of NAND
+     * writes on this device) and check_bootfile() BEFORE calling us, so the
+     * screen trailed the plug by that whole flush. Both now happen here, after
+     * the screen is on the LCD and still before the acknowledge -- the ack is
+     * what releases the usb thread to unmount, so files are closed in time.
+     *
+     * usb_screens_draw() only renders into the framebuffer; the C4's buffered
+     * LCD shows nothing until an lcd_update, hence the explicit update.
+     */
+    usb_screens_draw(usb_screen_vps_ar);
     FOR_NB_SCREENS(i)
         screens[i].update();
+    c4pro_usb_screen_hints();
+
+    /* Everything that has to finish before the volume moves, but that the user
+     * should not have to wait to SEE the screen. font_disable_all() is in here
+     * because font_disable() calls glyph_cache_save() -- a file write per
+     * loaded font, i.e. NAND writes; it was the bulk of the 8.4s plug-to-paint
+     * gap.
+     */
+    if(!early_usb)
+    {
+        font_disable_all();
+#ifndef USB_NONE
+        /* Guarded like its definition in misc.c. early_usb runs from init(),
+         * before the playlist/tree/plugin-cache subsystems system_flush()
+         * would touch exist -- stock only ever ran it from
+         * default_event_handler().
+         */
+        {
+            extern void c4pro_usb_pre_ack_flush(void);
+            c4pro_usb_pre_ack_flush();
+        }
+#endif
+    }
+    usb_acknowledge(SYS_USB_CONNECTED_ACK, seqnum);
+#else
+    usb_acknowledge(SYS_USB_CONNECTED_ACK, seqnum);
+    usb_screens_draw(usb_screen_vps_ar);
 #endif
     handle_usb_events(title);
 
 #if defined(USB_ENABLE_HID)
-    if (global_settings.usb_hid)
+    if (USB_SCREEN_HID_ACTIVE)
         screens[SCREEN_MAIN].scroll_stop_viewport(title);
     if (global_settings.usb_keypad_mode != usb_keypad_mode)
     {
@@ -347,7 +412,20 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
         /* Not pretty, reload all settings so fonts are loaded again correctly */
         settings_apply(true);
         /* Reload playlist */
-        playlist_resume();
+        int resume = playlist_resume();
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+        /* Charge-only was picked here: the cable is still in and storage is
+         * back, so pick the music up where the plug's audio_hard_stop() left
+         * it.
+         */
+        if(usb_powered_only() && resume != -1 &&
+           global_status.resume_index != -1)
+            playlist_start(global_status.resume_index,
+                           global_status.resume_elapsed,
+                           global_status.resume_offset);
+#else
+        (void)resume;
+#endif
     }
 
     FOR_NB_SCREENS(i)

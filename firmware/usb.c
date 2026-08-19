@@ -123,6 +123,17 @@ static uint32_t usb_broadcast_seqnum = 0x80000000;
 static int usb_mode = USBMODE_DEFAULT;
 static bool usb_power_only = false;
 #endif
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(USB_FULL_INIT)
+/* rk27xx driver hooks (firmware/target/arm/rk27xx/usb-drv-rk27xx.c) */
+void c4pro_usb_detach(void);
+void c4pro_usb_arm_reconnect(void);
+
+/* Set at USB_INSERTED once the connect has been broadcast (so the USB screen is
+ * up in step with the audio stop); cleared when the acks land and the real
+ * bring-up runs. See the USB_INSERTED comment. */
+static bool c4pro_attach_deferred = false;
+static long c4pro_attach_deadline = 0;
+#endif
 
 #if defined(USB_FIREWIRE_HANDLING)
 static void try_reboot(void)
@@ -445,6 +456,52 @@ static void usb_set_host_present(bool present)
     usb_configure_drivers(USB_INSERTED);
 }
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(USB_FULL_INIT)
+/* The deferred half of a C4 plug, run once every thread has acked the connect
+ * (or, as a backstop, when the monitor thread's deadline expires). Ordered so
+ * that ALL filesystem and NAND work is finished before the PHY goes live:
+ *   unmount (with storage still alive, so the FAT flush actually lands)
+ *   -> quiet the NAND (the marginal HS PHY cannot enumerate through NAND/AHB
+ *      traffic -- host "error -71")
+ *   -> attach.
+ * Doing this the other way round -- attaching first and unmounting underneath a
+ * live enumeration -- desyncs ep0: the usb thread blocks in the unmount while
+ * EP0 completions keep arriving from INT_UDC, and the backlog it then replays
+ * panics usb_core ("invalid control response ep_state=4"). */
+static void c4pro_finish_deferred_attach(void)
+{
+    if(!c4pro_attach_deferred)
+        return;
+    c4pro_attach_deferred = false;
+
+    /* Retire the outstanding handshake BEFORE acting on it. On the backstop
+     * path some thread has not acked and may still ack later; left live, that
+     * late ack would decrement the counter to zero and take the
+     * SYS_USB_CONNECTED_ACK handler's first branch (usb_host_present is true
+     * by then), re-running usb_slave_mode(true) -- a disk_unmount_all() in the
+     * middle of a live MSC session. Bumping the sequence number makes every
+     * outstanding ack stale.
+     */
+    usb_broadcast_seqnum += 1;
+    usb_num_acks_to_expect = 0;
+
+    usb_slave_mode(true);            /* disk_unmount_all */
+    exclusive_storage_enabled = true;
+    storage_enable(false);
+    usb_stack_enable(true);
+
+    /* Enable the class drivers NOW rather than waiting for the first transfer
+     * completion to set usb_host_present (USB_DETECT_BY_REQUEST).
+     * usb_core_init() has just cleared every driver's enabled flag, so if the
+     * host reads the configuration descriptor before the usb thread dequeues
+     * that completion it sees an EMPTY configuration -- host dmesg "config 1
+     * has no interfaces?", device enumerates as 071b:3203 and no disk ever
+     * appears.
+     */
+    usb_configure_drivers(USB_INSERTED);
+}
+#endif
+
 /*--- General driver code ---*/
 static void NORETURN_ATTR usb_thread(void)
 {
@@ -497,13 +554,79 @@ static void NORETURN_ATTR usb_thread(void)
 
 #if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
 #ifndef BOOTLOADER
-            /* Stop playback + close files BEFORE quieting the NAND. The audio
-             * buffer thread may be actively reading the disk (continuous
-             * multi-track buffering); quieting storage under a live read is
-             * unsafe. Stock stops audio later via the SYS_USB_CONNECTED
-             * handshake, but our NAND-quiet runs before the connect. */
+            /* CHARGE-ONLY (System > USB > USB mode = Charge, or picked on the
+             * USB screen for the rest of this plug). Decided HERE, before
+             * anything destructive: the C4 charges from VBUS in hardware
+             * (CHARGING_MONITOR), so charge-only means doing nothing at all --
+             * playback keeps running, the NAND stays mounted and D+ is never
+             * asserted, so the host sees no device. Do NOT fall through to
+             * usb_configure_drivers(USB_POWERED): rk27xx has
+             * USB_HAS_INTERRUPT, so config.h gives it USB_ENABLE_HID instead
+             * of USB_ENABLE_CHARGING_ONLY, and a HID interface is exactly what
+             * this device cannot survive (see the USB_INSERTED driver gate).
+             * No button flip either (USBPOWER_BTN_IGNORE): the C4's single-
+             * ADC-line pad can read a phantom press, and silently not
+             * enumerating looks like broken hardware. The setting and the
+             * screen are the only two levers.
+             */
+            usb_power_only = (usb_mode != USB_MODE_MASS_STORAGE);
+            if(usb_power_only)
+            {
+                c4pro_usb_detach();
+                break;
+            }
+
+            /* Hand storage over NOW, in step with the audio_hard_stop() above,
+             * and DEFER the rest of the bring-up until every thread has acked.
+             *
+             * Stock only reaches usb_request_exclusive_storage() from
+             * usb_core's SET_CONFIGURATION handler, i.e. after the host has
+             * finished enumerating -- which on this marginal HS PHY takes
+             * 3-10s of re-present retries, so the music died long before the
+             * USB screen appeared. Requesting here shows the screen in step
+             * with the stop.
+             *
+             * It must NOT be a plain early request, though: with
+             * USB_DETECT_BY_REQUEST, usb_host_present is still false at this
+             * point (it is set on the first transfer completion), so the
+             * SYS_USB_CONNECTED_ACK handler's usb_host_present gate would drop
+             * the handover on the floor -- the volume stays mounted and
+             * exclusive_storage_enabled stays false. c4pro_attach_deferred
+             * makes the ack completion do the unmount, quiet the NAND and only
+             * THEN bring the PHY up, so the whole filesystem/NAND settling
+             * happens with the bus still dark. The host sees us a beat later;
+             * that is the intended trade (the screen is what has to be
+             * instant).
+             */
+            /* Keep D+ down for the whole deferred window: usb_core is not
+             * initialised until the attach, and the loader (or a previous
+             * session) may have left SOFT_CN asserted -- the INT_UDC idle-guard
+             * cannot cover that, VBUS being present. Same premise as the
+             * charge-only detach below. */
+            c4pro_usb_detach();
+
+            /* Stop playback + close files BEFORE the storage handover. The
+             * audio buffer thread may be actively reading the disk (continuous
+             * multi-track buffering); moving storage under a live read is
+             * unsafe. Measured fast on device (the plug-to-screen gap was
+             * never here).
+             */
             audio_hard_stop();
-#endif
+
+            send_event(SYS_EVENT_USB_INSERTED, &usb_mode);
+            /* Backstop only for a thread that NEVER acks -- deliberately far
+             * longer than the slowest legitimate ack. The main thread's ack
+             * trails system_flush() + check_bootfile() (playlist/tree/plugin
+             * cache writes: measured 5-9s on this device), so a tight deadline
+             * fires mid-flush and unmounts the volume underneath the thread
+             * still writing to it, then attaches into that NAND traffic --
+             * enumeration fails and ep0 desyncs into
+             * "usb_core: invalid control response". */
+            c4pro_attach_deadline = current_tick + 60 * HZ;
+            c4pro_attach_deferred = true;
+            usb_request_exclusive_storage();
+            break;
+#else /* BOOTLOADER: no threads to hand storage over to -- stock ordering. */
             /* Quiet the NAND BEFORE bringing USB up: the marginal HS PHY's
              * chirp/descriptor reads are corrupted by concurrent NAND/AHB traffic
              * (host "error -71"). storage_enable(false) is the lever that silences
@@ -514,7 +637,8 @@ static void NORETURN_ATTR usb_thread(void)
              * SYS_USB_CONNECTED handshake below (usb_slave_mode) does the real
              * unmount/re-mount once audio is stopped. */
             storage_enable(false);
-#endif
+#endif /* BOOTLOADER */
+#endif /* COLORFLY_C4_PRO */
             usb_stack_enable(true);
 #ifndef BOOTLOADER
 #ifndef HAVE_USB_POWER
@@ -522,7 +646,8 @@ static void NORETURN_ATTR usb_thread(void)
 #endif
             send_event(SYS_EVENT_USB_INSERTED, &usb_mode);
 #endif
-#ifdef HAVE_USB_POWER
+#if defined(HAVE_USB_POWER) && \
+    !(defined(COLORFLY_C4_PRO) && !defined(SIMULATOR))
             /* Power (charging-only) button */
             usb_power_only = usb_mode != USB_MODE_MASS_STORAGE;
             if(button_status() & ~USBPOWER_BTN_IGNORE) {
@@ -536,6 +661,37 @@ static void NORETURN_ATTR usb_thread(void)
 #endif
             break;
             /* USB_INSERTED */
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(USB_FULL_INIT)
+        case USB_C4PRO_ATTACH_NOW:
+            /* Backstop: a thread never acked the connect. Bring USB up anyway
+             * -- a late screen beats a plug that never enumerates.
+             */
+            c4pro_finish_deferred_attach();
+            break;
+
+        case USB_C4PRO_CHARGE_ONLY:
+            /* "Charge only" picked on the USB screen: detach and give the
+             * player its storage back, without waiting for the cable to be
+             * pulled. usb_stack_enable(false) -> usb_core_exit ->
+             * set_config(0) -> usb_release_exclusive_storage(), which remounts
+             * and broadcasts SYS_USB_DISCONNECTED -- the same exit the USB
+             * screen already waits for. Re-enable the NAND first: the release
+             * path mounts through it.
+             */
+            if(usb_state == USB_EXTRACTED || usb_power_only)
+                break;
+            c4pro_attach_deferred = false;
+            usb_power_only = true;
+            storage_enable(true);
+            usb_stack_enable(false);
+            /* usb_drv_exit() detaches only if it had initialised */
+            c4pro_usb_detach();
+            c4pro_usb_arm_reconnect();
+            usb_state = USB_POWERED;
+            break;
+            /* USB_C4PRO_CHARGE_ONLY */
+#endif
 
         case SYS_USB_CONNECTED_ACK:
             if((uint32_t)ev.data != usb_broadcast_seqnum) {
@@ -556,6 +712,11 @@ static void NORETURN_ATTR usb_thread(void)
                 usb_slave_mode(true);
                 exclusive_storage_enabled = true;
             }
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+            else if(c4pro_attach_deferred) {
+                c4pro_finish_deferred_attach();
+            }
+#endif
             break;
             /* SYS_USB_CONNECTED_ACK */
 
@@ -579,11 +740,13 @@ static void NORETURN_ATTR usb_thread(void)
              * handshake never completed (a plug that failed to enumerate),
              * usb_slave_mode(false) never ran to undo it -> the player shows no
              * files. Re-enable + re-mount here for that case. */
-            if(!exclusive_storage_enabled)
+            if(!exclusive_storage_enabled && !usb_power_only)
             {
                 storage_enable(true);
                 disk_mount_all();
             }
+            usb_power_only = false;
+            c4pro_attach_deferred = false;
 #endif
 
 #ifdef IPOD_ACCESSORY_PROTOCOL
@@ -853,7 +1016,20 @@ static void c4pro_usb_monitor_thread(void)
              * setup is enough for the host to have given up, and retrying sooner
              * shortens the worst case (was 5s -> up to ~10s for two cycles). The
              * light re-present (no controller reset) does not thrash. */
-            if(c4pro_usb_vbus_present() && !c4pro_usb_configured() &&
+            if(c4pro_attach_deferred)
+            {
+                /* Bring-up is waiting on the connect acks -- the driver is not
+                 * initialised yet, so a re-present here would poke a dark PHY.
+                 */
+                if(TIME_AFTER(current_tick, c4pro_attach_deadline))
+                {
+                    /* fire once */
+                    c4pro_attach_deadline = current_tick + 60 * HZ;
+                    queue_post(&usb_queue, USB_C4PRO_ATTACH_NOW, 0);
+                }
+            }
+            else if(!usb_powered_only() &&
+               c4pro_usb_vbus_present() && !c4pro_usb_configured() &&
                TIME_AFTER(current_tick, last_represent + 3 * HZ / 2) &&
                TIME_AFTER(current_tick, setup_change + 3 * HZ / 2))
             {
@@ -1140,6 +1316,13 @@ bool usb_powered_only(void)
 {
     return usb_power_only;
 }
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && !defined(BOOTLOADER)
+void c4pro_usb_charge_only(void)
+{
+    queue_post(&usb_queue, USB_C4PRO_CHARGE_ONLY, 0);
+}
+#endif
 #endif /* HAVE_USB_POWER */
 
 #endif /* HAVE_USBSTACK && defined(USB_FULL_INIT) */

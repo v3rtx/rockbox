@@ -352,6 +352,18 @@ static void system_restore(void)
     tree_restore();
 }
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && !defined(USB_NONE)
+/* Called by gui_usb_screen_run() after the USB screen is on the LCD and before
+ * it acknowledges the connect -- see the comment there. */
+void c4pro_usb_pre_ack_flush(void)
+{
+    system_flush();
+#if defined(BOOTFILE) && !defined(USB_HANDLED_BY_OF)
+    check_bootfile(false); /* gets initial size */
+#endif
+}
+#endif
+
 static bool clean_shutdown(enum shutdown_type sd_type,
                            void (*callback)(void *), void *parameter)
 {
@@ -662,10 +674,19 @@ long default_event_handler_ex(long event, void (*callback)(void *), void *parame
             intptr_t seqnum = button_get_data();
             if (callback != NULL)
                 callback(parameter);
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && !defined(USB_NONE)
+            /* system_flush() + check_bootfile() moved into
+             * gui_usb_screen_run(), which runs them via
+             * c4pro_usb_pre_ack_flush() once the screen is actually on the
+             * LCD. Doing them here delayed the screen by the length of the
+             * flush (seconds of NAND writes).
+             */
+#else
             system_flush();
 #ifdef BOOTFILE
 #if !defined(USB_NONE) && !defined(USB_HANDLED_BY_OF)
             check_bootfile(false); /* gets initial size */
+#endif
 #endif
 #endif
             gui_usb_screen_run(false, seqnum);

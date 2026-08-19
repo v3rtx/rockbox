@@ -507,3 +507,167 @@ PATH=/home/groove/.local/armshim:$PATH \
     -DC4PRO_USB_TIMER_PRIO -DC4PRO_BOOT_HEARTBEAT -DC4PRO_FAULT_VISIBLE" \
   scripts/c4_build_native_rockbox_installer.sh
 ```
+
+## 11. Plug-time behaviour: charge-only and screen timing (2026-08-19)
+
+Two things a user sees at the moment the cable goes in, and what drives them.
+
+**The USB screen used to lag the music stop by 3-10s.** They were driven by two
+different events. The audio stop is at *plug* time: `usb_tick` debounces VBUS ->
+posts `USB_INSERTED` -> the C4 block in `firmware/usb.c` calls `audio_hard_stop()`
+within a few hundred ms. The screen is at *enumeration* time: with
+`HAVE_USBSTACK`, the `SYS_USB_CONNECTED` broadcast that makes the main thread run
+`gui_usb_screen_run()` comes only from `usb_request_exclusive_storage()`, which
+`usb_core_do_set_config()` calls when the host sends SET_CONFIGURATION. On the
+marginal HS PHY that is 1-2 rounds of the monitor thread's 1.5s re-present retry.
+
+FIX: the C4 `USB_INSERTED` path broadcasts the connect itself
+(`usb_request_exclusive_storage()`) right after `audio_hard_stop()`, and **defers
+the rest of the bring-up** (`c4pro_attach_deferred`) until every thread has acked.
+The screen therefore appears in step with the music stopping, and the ack
+completion then runs `disk_unmount_all()` -> `storage_enable(false)` ->
+`usb_stack_enable(true)`: all filesystem work finishes with the bus still dark,
+and the host sees the device a beat later. The `SYS_USB_CONNECTED_ACK` handler
+gets a C4 `else if(c4pro_attach_deferred)` arm, and the monitor thread carries a
+60s backstop (`USB_C4PRO_ATTACH_NOW`) in case a thread never acks. The late
+SET_CONFIGURATION finds `usb_exclusive_storage()` already true and does not
+re-request.
+
+FIRST ATTEMPT, WRONG (2026-08-19) — kept because the failure is instructive.
+Simply calling `usb_request_exclusive_storage()` early and letting
+`usb_stack_enable(true)` run immediately **panics on connect**: `usb_core: invalid
+control response ep_state=4` (PC in `usb_core_transfer_complete`, `A` =
+`usb_clear_pending_transfer_completion_events`, i.e. around SET_CONFIGURATION).
+Two reasons, both worth remembering:
+
+- With `USB_DETECT_BY_REQUEST`, `usb_host_present` is still **false** at
+  `USB_INSERTED` (it is set on the first transfer completion), so the ack
+  handler's `if(usb_host_present && exclusive_storage_requested)` gate drops the
+  handover on the floor: the volume stays mounted and `exclusive_storage_enabled`
+  stays false. MSC then serves a mounted volume.
+- "Hardening" `usb_core_do_set_config()` to skip a re-request while one is
+  outstanding made that permanent — the real handover then never happened at all.
+  Reverted; that re-request is load-bearing.
+
+SECOND HALF OF THE LATENCY (2026-08-19). Moving the broadcast earlier was not
+enough on its own: `default_event_handler()` runs `system_flush()` --
+`playlist_shutdown()`, `tree_flush()`, `open_plugin_cache_flush()`,
+`call_storage_idle_notifys(true)`, i.e. several NAND WRITES -- and then
+`check_bootfile()`, all *before* it calls `gui_usb_screen_run()`. On this device
+that is the residual ~5s between the audio stop and the screen. Fix:
+both moved OUT of `default_event_handler()` and into `gui_usb_screen_run()`, which
+now PAINTS FIRST, then runs them via `c4pro_usb_pre_ack_flush()`, then
+acknowledges. The flush still finishes before the ack (the ack is what releases
+the usb thread to unmount, so files must be closed by then) -- but the user no
+longer waits for it to see the screen. The screen carries a button legend
+(PLAY = charge only, BACK held 2s = flash mode).
+
+A first attempt put a lightweight *splash* in front of `system_flush()` instead.
+That proved the diagnosis -- the splash appeared instantly while the real screen
+still trailed by ~5s -- but it only covered the gap. Painting the real screen
+before the flush closes it. (The same readout also cleared `audio_hard_stop()` of
+suspicion: it costs ~350ms, and the plug handler's original ordering around it
+was restored.)
+
+WHERE THE PLUG-TO-PAINT TIME ACTUALLY WENT (2026-08-19, measured on device). The
+screen's own readout, split into `stop` (audio teardown) / `ev` (broadcast ->
+screen entry) / `ui` (screen entry -> pixels), read **`stop0 ev0 ui8400`**:
+`audio_hard_stop()` and the dispatch are free, and the entire gap was inside
+`gui_usb_screen_run()` before the draw. Two NAND-write culprits there:
+
+- `font_disable_all()` -> `font_disable()` -> **`glyph_cache_save()`**, a file
+  write per loaded font. Moved to after the paint (it only has to precede the
+  ack, exactly like the flush).
+- `usb_screen_fix_viewports()`'s HID branch, whose "ensure the USB mode strings
+  get cached" loop calls `font_getstringsize()` over every keypad-mode name,
+  faulting glyphs in off the NAND. HID is force-disabled for this target in
+  `usb_configure_drivers()` anyway, so the whole keypad-mode UI is now inert here
+  (`USB_SCREEN_HID_ACTIVE`), and `title` is NULL rather than pointing at a
+  viewport that `usb_screen_fix_viewports()` never fills in.
+
+Result after both fixes, measured on device: **`stop350 ev20 ui20`** -- ~390ms
+plug to painted USB screen, against ~9s before. (The readout was a temporary
+diagnostic and has since been removed; the screen keeps the button legend.)
+
+Lesson, third time in this file: on this device, ANY file write on the
+plug-to-screen path costs seconds. The rule is that the screen paints first and
+everything that must precede the storage handover runs between the paint and the
+acknowledge.
+
+WHERE THE HANDSHAKE CONTRACT LIVES. `docs/usb-api.md` covers only control-request
+handling -- it says nothing about `SYS_USB_CONNECTED`, the ack, or exclusive
+storage. The ordering this section depends on is documented solely in the comment
+block above `usb_request_exclusive_storage()` in `firmware/usb.c`. Read that
+before touching any of this.
+
+THE BACKSTOP MUST RETIRE THE HANDSHAKE IT ABANDONS. When the backstop attaches
+without all acks, the request is still outstanding: `exclusive_storage_requested`
+stays true and `usb_num_acks_to_expect` stays >0 on the same
+`usb_broadcast_seqnum`. If the missing thread then acks -- mid-session, with the
+host streaming -- the counter reaches zero and the ACK handler takes its FIRST
+branch (`usb_host_present` is true by now), re-running `usb_slave_mode(true)`:
+`disk_unmount_all()` underneath a live MSC transfer, the same failure mode as the
+panics above. `c4pro_finish_deferred_attach()` therefore bumps
+`usb_broadcast_seqnum` and zeroes the counter before it acts, so every
+outstanding ack lands as stale.
+
+BACKSTOP DEADLINE MUST BE GENEROUS (2026-08-19). The deferred attach carries a
+monitor-thread backstop for "a thread never acked". Armed at 5s it fired on
+ordinary plugs, because the main thread's ack trails `system_flush()` +
+`check_bootfile()` (5-9s of NAND writes here). Firing mid-flush runs
+`disk_unmount_all()` underneath the thread still writing to that volume and then
+attaches into the resulting NAND traffic -> failed enumeration, bus resets, and
+`usb_core: invalid control response ep_state=2`. Raised to 60s: it is a
+never-acked backstop, not a slow-ack timeout. Any deadline shorter than the
+worst-case flush re-introduces the panic.
+
+ZERO-INTERFACE ENUMERATION. Host dmesg `config 1 has no interfaces?` with the
+device present as 071b:3203 and no disk: `usb_core_init()` clears every driver's
+`enabled` flag, and the drivers are only re-enabled by
+`usb_configure_drivers(USB_INSERTED)` from `usb_set_host_present(true)` -- which
+under `USB_DETECT_BY_REQUEST` waits for the usb thread to dequeue the first
+transfer completion. A host that reads the configuration descriptor inside that
+window gets an empty config. `c4pro_finish_deferred_attach()` now calls
+`usb_configure_drivers(USB_INSERTED)` immediately after `usb_stack_enable(true)`,
+closing the window to a single function call.
+
+General lesson: do not leave a long blocking storage operation in the same thread
+as the EP0 state machine while the host is enumerating. EP0 completions keep
+arriving from `INT_UDC` while the usb thread is blocked, and the backlog it
+replays afterwards desyncs `ep0_state`.
+
+**Charge-only.** Rockbox's stock mechanism is `HAVE_USB_POWER` (already set for
+this target) routing the plug to `USB_POWERED` instead of `USB_INSERTED`, driven
+by the `usb_mode` setting (System > USB > USB mode) and a button held during the
+plug. It was inert here for two reasons: the C4 block stopped audio and quieted
+the NAND *before* the power-only decision was made, and rk27xx has
+`USB_HAS_INTERRUPT`, so `config.h` gives it `USB_ENABLE_HID` rather than
+`USB_ENABLE_CHARGING_ONLY` -- `usb_configure_drivers(USB_POWERED)` would attach a
+HID interface, the one thing this device cannot survive (host `usbhid` times out
+at -110 and resets the device mid-enumeration).
+
+The C4 answer is to attach nothing at all: charging is `CHARGING_MONITOR`, i.e.
+hardware off VBUS, so charge-only means skipping the whole bring-up. The decision
+now happens first in `USB_INSERTED`; when it is charge-only the path calls
+`c4pro_usb_detach()` (clear `DEV_SOFT_CN`, in case the loader or a previous
+session left D+ asserted -- the `INT_UDC` idle-guard cannot cover that, VBUS being
+present) and breaks. Playback keeps running, the NAND stays mounted, the host sees
+no device. The stock button flip is deliberately not used on the C4: the
+single-ADC-line pad can read a phantom press, and silently not enumerating looks
+like broken hardware.
+
+Two ways in:
+
+- System > USB > USB mode = Charge — every plug is charge-only, no screen, no
+  interruption to playback.
+- PLAY tapped on the USB screen — posts `USB_C4PRO_CHARGE_ONLY` to the usb thread,
+  which re-enables the NAND and calls `usb_stack_enable(false)`; `usb_core_exit()`
+  -> `set_config(0)` -> `usb_release_exclusive_storage()` remounts and broadcasts
+  `SYS_USB_DISCONNECTED`, the exit the USB screen already waits for.
+  `gui_usb_screen_run()` then restarts playback from `global_status.resume_*`, so
+  the track picks up where the plug's `audio_hard_stop()` left it. Going back to
+  mass storage from there needs a replug.
+
+The monitor thread's re-present watchdog is gated on `!usb_powered_only()` so it
+cannot re-assert D+ (or quiet the NAND) behind a charge-only plug, and the
+`USB_EXTRACTED` storage-restore is skipped for a plug that never quieted storage.
