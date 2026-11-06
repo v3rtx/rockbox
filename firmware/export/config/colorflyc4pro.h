@@ -361,6 +361,10 @@
 #define C4PRO_USB_RX_STALL_KICK
 #define C4PRO_USB_IRQ_DRAIN
 #define C4PRO_FAULT_VISIBLE
+/* Run RK27xx I2S as slave; CS8422/CPLD clockgen provides master clock. */
+#if !defined(C4PRO_NO_RK_I2S_SLAVE) && !defined(C4PRO_RK_I2S_SLAVE_TEST)
+#define C4PRO_RK_I2S_SLAVE_TEST 1
+#endif
 
 /* C4PRO_WDT_CRASH_CAPTURE (opt-in, not default-on): JTAG-free freeze-forensics
  * tool used to root-cause the fix above (docs/c4-usb-msc-write-freeze.md s7).

@@ -379,8 +379,8 @@ void lcd_update_rect(int x, int y, int width, int height)
         create_llp(x, y, width, height);
         lcdctrl_bypass(0);
 
-        /* whole framebuffer for now */
-        commit_discard_dcache_range(FBADDR(0,0), 2*LCD_WIDTH*LCD_HEIGHT);
+        commit_discard_dcache_range(scr_llp, height * sizeof(struct llp_t));
+        commit_discard_dcache_range(FBADDR(0, y), 2 * LCD_WIDTH * height);
 
         if (!lcdif_wait_mcu_idle())
             continue;

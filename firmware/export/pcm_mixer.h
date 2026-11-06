@@ -40,6 +40,9 @@
 /* iBasso Devices: Match Rockbox PCM buffer size to ALSA PCM buffer size
    to minimize memory transfers. */
 #define MIX_FRAME_SAMPLES 2048
+#elif defined(COLORFLY_C4_PRO)
+/* C4 Pro: larger PCM buffer runway to avoid shallow HW FIFO underrun */
+#define MIX_FRAME_SAMPLES 1024
 #elif (CONFIG_PLATFORM & PLATFORM_HOSTED)
 /* Hosted targets need larger buffers for decent performance due to
    OS locking/scheduling overhead */
