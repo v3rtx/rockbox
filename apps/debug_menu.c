@@ -2998,6 +2998,9 @@ static const struct {
 #ifdef FTL_SYS_ON_USB
         { "NAND SYS on next USB", dbg_nand_sys_usb },
 #endif
+#if defined(COLORFLY_C4_PRO)
+        { "S/PDIF DAC input", dbg_spdif_dac },
+#endif
 #if (CONFIG_PLATFORM & PLATFORM_NATIVE)
         { "View partitions", dbg_partitions },
 #endif

@@ -345,5 +345,8 @@ bool dbg_ports(void);
 #if (CONFIG_PLATFORM & PLATFORM_NATIVE) || defined(SONY_NWZ_LINUX) || defined(HIBY_LINUX)
 bool dbg_hw_info(void);
 #endif
+#if defined(COLORFLY_C4_PRO)
+bool dbg_spdif_dac(void);
+#endif
 
 #endif /* __SYSTEM_H__ */

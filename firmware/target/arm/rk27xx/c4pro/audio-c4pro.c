@@ -341,3 +341,78 @@ void audiohw_set_filter_roll_off(int value)
 
     cs4398_write_reg(CS4398_REG_RAMPFILT, ramp);
 }
+
+/* ----------------------------------------------------------------------- *
+ * S/PDIF DAC-input mode: coax S/PDIF into an RCA jack -> CS8422 AES3
+ * receiver -> async SRC -> CS4398 -> AD823 -> analog out. The output half
+ * (SRC -> SDOUT1 -> CS4398, clocked from the clockgen/TCXO on XTI) is
+ * identical to normal playback; the only change is the SRC's *input* source,
+ * which switches from the RK27xx I2S (SDIN) to the on-chip AES3 receiver
+ * (0Ah SRCD bit). The async SRC reclocks any incoming coax rate to the fixed
+ * output rate, so no per-rate tracking is needed.
+ *
+ * The physical RX pin the coax jack is wired to is not documented, so the
+ * caller passes a candidate Receiver Input Control (03h) value and watches
+ * the CS8422 lock/rate status to identify it. See the CS8422 datasheet
+ * (register map 02h/03h/09h/0Ah, status 15h/16h).
+ * ----------------------------------------------------------------------- */
+
+int c4pro_cs8422_read(unsigned char reg)
+{
+    unsigned char val = 0xff;
+    rk27xx_i2c_read(c4pro_cs8422_addr, reg, 1, &val);
+    return val;
+}
+
+/* Point the CS8422 SRC at the AES3 receiver with the given 03h (RX input)
+ * value. PDN-cycles around the format change as the datasheet requires. */
+static void cs8422_receiver_route(unsigned char rx_input_ctl)
+{
+    cs8422_write_reg(0x02, 0x80);          /* PDN=1: reconfigure           */
+    cs8422_write_reg(0x03, rx_input_ctl);  /* receiver input select        */
+    cs8422_write_reg(0x04, 0x40);          /* HOLD last sample on rx error */
+    cs8422_write_reg(0x09, 0x08);          /* SRC soft-mute on unlock      */
+    cs8422_write_reg(0x0a, 0x02);          /* SRCD=1: SRC src = AES3 rx,   */
+                                           /* SDOUT1 still sourced by SRC  */
+    cs8422_write_reg(0x02, 0x00);          /* PDN=0, RMCK from recov. rate */
+}
+
+void c4pro_spdif_dac_enter(unsigned char rx_input_ctl)
+{
+    if (!c4pro_codecs_detected)
+        c4pro_detect_audio_codecs();
+
+    /* Fixed 48kHz SRC output master clock (XTI from the clockgen). The async
+     * SRC converts any coax input rate to this; 48k keeps the CS4398 in its
+     * known-good single-speed (FM_SINGLE) configuration. */
+    c4pro_clockgen_write(0x0015);
+
+    /* Known-good CS4398 + SAO/clock/format bring-up (as for playback) ... */
+    audiohw_init();
+    /* ... then re-point the SRC input from SDIN to the AES3 receiver. */
+    cs8422_receiver_route(rx_input_ctl);
+
+    /* Amp on into a muted DAC, then unmute -- pop-free, same as postinit. */
+    c4pro_amp_enable(false);
+    sleep(HZ / 20);
+    c4pro_amp_enable(true);
+    sleep(HZ / 20);
+    c4pro_cs4398_unmute();
+}
+
+/* Live-switch the receiver input candidate without a full re-init. */
+void c4pro_spdif_dac_set_rx(unsigned char rx_input_ctl)
+{
+    cs8422_receiver_route(rx_input_ctl);
+}
+
+void c4pro_spdif_dac_exit(void)
+{
+    /* Mute, kill the amp in silence, then power the DAC down (as audiohw_close). */
+    cs4398_write_reg(CS4398_REG_MUTE, CS4398_MUTE_A | CS4398_MUTE_B |
+                     CS4398_DAMUTE | CS4398_PAMUTE | CS4398_MUTEC_A_EQ_B);
+    sleep(HZ / 20);
+    c4pro_amp_enable(false);
+    sleep(HZ / 50);
+    cs4398_write_reg(CS4398_REG_MISC, CS4398_CPEN | CS4398_PDN);
+}
