@@ -93,6 +93,28 @@ struct nand_device_info_type
 uint32_t nand_read_page(uint32_t bank, uint32_t page, void* databuffer,
                         void* sparebuffer, uint32_t doecc,
                         uint32_t checkempty);
+#ifdef COLORFLY_C4_PRO
+uint32_t c4pro_nand_read_sector(uint32_t bank, uint32_t page,
+                                uint32_t sector, void* databuffer,
+                                void* sparebuffer);
+uint32_t c4pro_nand_read_linear_page(uint32_t bank, uint32_t page,
+                                     void* databuffer);
+uint32_t c4pro_nand_write_page(uint32_t bank, uint32_t page,
+                               const void* databuffer,
+                               const void* sparebuffer);
+uint32_t c4pro_nand_write_page_hwecc(uint32_t bank, uint32_t page,
+                                     const void* databuffer, uint32_t nsec);
+uint32_t c4pro_nand_read_page_hwecc(uint32_t bank, uint32_t page,
+                                    void* databuffer, uint32_t nsec);
+#ifdef C4PRO_NAND_2PLANE
+uint32_t c4pro_nand_write_page_2plane(uint32_t bank, uint32_t row0, uint32_t row1,
+                                      const void* buf0, const void* buf1,
+                                      uint32_t nsec);
+#endif
+uint32_t c4pro_nand_erase_block(uint32_t bank, uint32_t page);
+uint32_t c4pro_nand_erase_blocks_multi(const uint32_t *banks,
+                                       const uint32_t *pages, uint32_t n);
+#endif
 uint32_t nand_write_page(uint32_t bank, uint32_t page, void* databuffer,
                          void* sparebuffer, uint32_t doecc);
 uint32_t nand_block_erase(uint32_t bank, uint32_t page);

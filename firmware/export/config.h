@@ -161,6 +161,7 @@
 #define HIBY_R3PROII_PAD   79
 #define HIDIZS_AP80MAX_PAD 80
 #define PSP_PAD            81
+#define C4PRO_PAD          82
 
 /* CONFIG_REMOTE_KEYPAD */
 #define H100_REMOTE   1
@@ -279,6 +280,7 @@
 #define LCD_ECHO_R1       72 /* ILI9342, as used by the Echo R1 */
 #define LCD_AGPTEK_ROCKER 73 /* ST7735S, as used by the Agptek Rocker (native) */
 #define LCD_HIBY_R1       74 /* as used by the HiBy R1 (native) */
+#define LCD_ILI9341_C4    75 /* ILI9341 as used by the Colorfly Pocket HiFi C4 Pro */
 
 /* LCD_PIXELFORMAT */
 #define HORIZONTAL_PACKING 1
@@ -501,6 +503,8 @@ Lyre prototype 1 */
 #include "config/hifimanhm60x.h"
 #elif defined(HM801)
 #include "config/hifimanhm801.h"
+#elif defined(COLORFLY_C4_PRO)
+#include "config/colorflyc4pro.h"
 #elif defined(SANSA_CONNECT)
 #include "config/sansaconnect.h"
 #elif defined(SDLAPP)
@@ -913,7 +917,7 @@ Lyre prototype 1 */
  * storage_flush() commits them at shutdown, ROLO and wherever else it is
  * called. */
 #if (CONFIG_STORAGE & STORAGE_NAND) && defined(CONFIG_NAND) \
-    && (CONFIG_NAND == NAND_RK27XX) \
+    && (CONFIG_NAND == NAND_RK27XX) && defined(CONFIG_RK27XX_FTL) \
     && (CONFIG_RK27XX_FTL == RK27XX_FTL_SCHEME_A) \
     && !defined(HAVE_STORAGE_FLUSH)
 #define HAVE_STORAGE_FLUSH

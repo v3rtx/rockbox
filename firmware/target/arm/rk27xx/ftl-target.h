@@ -36,7 +36,7 @@
 #define FTL_NUM_DRIVES  1
 #endif
 
-#if !defined(HAVE_RK27XX_NAND_SYS) && !defined(BOOTLOADER) \
+#if !defined(COLORFLY_C4_PRO) && !defined(HAVE_RK27XX_NAND_SYS) && !defined(BOOTLOADER) \
     && defined(USB_ENABLE_STORAGE)
 /* Without SYS as a drive of its own, the debug menu can ask for it to be
  * shown to a USB host in place of USER, for one connection: the next one,
@@ -46,6 +46,18 @@ void ftl_set_sys_on_usb(bool on);
 bool ftl_get_sys_on_usb(void);
 #endif
 
+#ifdef COLORFLY_C4_PRO
+/* Pointer to an info structure regarding the flash type used */
+extern const struct nand_device_info_type* ftl_nand_type;
+/* Number of banks we detected a chip on */
+extern uint32_t ftl_banks;
+
+uint32_t ftl_init(void);
+uint32_t ftl_read(uint32_t sector, uint32_t count, void* buffer);
+uint32_t ftl_write(uint32_t sector, uint32_t count, const void* buffer);
+uint32_t ftl_sync(void);
+uint32_t ftl_total_sectors(void);
+#else
 uint32_t ftl_init(void);
 uint32_t ftl_read(int drive, uint32_t sector, uint32_t count, void* buffer);
 uint32_t ftl_write(int drive, uint32_t sector, uint32_t count,
@@ -58,6 +70,6 @@ uint32_t ftl_get_sectors(int drive);
 
 /* Whether a drive shows the SYS volume right now */
 bool ftl_drive_is_sys(int drive);
-
+#endif
 
 #endif

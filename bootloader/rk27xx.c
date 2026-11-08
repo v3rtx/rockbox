@@ -102,6 +102,28 @@ static void enter_rkusb(void)
     );
 }
 
+#ifdef COLORFLY_C4_PRO
+#define C4PRO_RAM_IMAGE_INFO   ((volatile unsigned long *)0x606fff00)
+#define C4PRO_RAM_IMAGE_MAGIC  0x42523443 /* "C4RB" */
+
+static void c4pro_quiesce_usb(void)
+{
+    EN_INT = 0;
+    INTCON = UDC_INTHIGH_ACT;
+    DEV_CTL = DEV_SELF_PWR;
+    INTC_IMR &= ~IRQ_ARM_UDC;
+    INTC_IECR &= ~IRQ_ARM_UDC;
+    INTC_ICCR = IRQ_ARM_UDC;
+}
+
+static bool c4pro_has_ram_image(void)
+{
+    return C4PRO_RAM_IMAGE_INFO[0] == C4PRO_RAM_IMAGE_MAGIC &&
+           C4PRO_RAM_IMAGE_INFO[1] > 0 &&
+           C4PRO_RAM_IMAGE_INFO[1] <= LOAD_SIZE;
+}
+#endif
+
 
 void main(void) NORETURN_ATTR;
 void main(void)
@@ -116,17 +138,37 @@ void main(void)
     system_init();
     kernel_init();
     i2c_init();
+#ifdef COLORFLY_C4_PRO
+    c4pro_quiesce_usb();
+#endif
     enable_irq();
 
     adc_init();
     lcd_init();
+#ifndef COLORFLY_C4_PRO
     backlight_init();
+#endif
     button_init_device();
 
     font_init();
     lcd_setfont(FONT_SYSFIXED);
 
     show_logo();
+
+#ifdef COLORFLY_C4_PRO
+    if (c4pro_has_ram_image())
+    {
+        printf("RAM image: %lu bytes", C4PRO_RAM_IMAGE_INFO[1]);
+        sleep(HZ);
+        kernel_entry = (void*)DRAM_ORIG;
+        kernel_entry();
+
+        printf("ERR: RAM image returned");
+        lcd_update();
+        while (1)
+            sleep(HZ);
+    }
+#endif
 
     int btn = button_read_device();
 
@@ -136,7 +178,7 @@ void main(void)
     if ((btn & ~POWEROFF_BUTTON))
         boot = of;
 
-#ifndef FTL_ALLOW_WRITE
+#if !defined(FTL_ALLOW_WRITE) && !defined(COLORFLY_C4_PRO)
     /* if we are woken up by USB insert boot into OF: only it can give
      * the host write access to the NAND
      */

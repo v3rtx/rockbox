@@ -1749,7 +1749,7 @@ cat <<EOF
  ==HiFiMAN==               ==MPIO==              210) MA9
  190) HM-60x               170) HD200            211) MA9C
  191) HM-801               171) HD300            212) MA8
-                                                 213) MA8C
+ 192) Colorfly C4 Pro                            213) MA8C
  ==Sony==                  ==Application==
  219) NWZ-E350 series      200) SDL (Generic)    ==IHIFI==
  220) NWZ-E370/E380 series 201) Android (ARM)    230) 760
@@ -3226,6 +3226,25 @@ fi
     t_cpu="arm"
     t_manufacturer="rk27xx"
     t_model="hm801"
+    ;;
+
+   192|colorflyc4pro)
+    target_id=83
+    modelname="colorflyc4pro"
+    target="COLORFLY_C4_PRO"
+    memory=16
+    arm7ejscc
+    tool="$rootdir/tools/scramble -rkw -modelnum=83"
+    bmp2rb_mono="$rootdir/tools/bmp2rb -f 0"
+    bmp2rb_native="$rootdir/tools/bmp2rb -f 4"
+    output="rockbox.rkw"
+    bootoutput="bootloader.rkw"
+    appextra="recorder:gui"
+    plugins=""
+    toolset="$genericbitmaptools"
+    t_cpu="arm"
+    t_manufacturer="rk27xx"
+    t_model="c4pro"
     ;;
 
    200|sdlapp)
