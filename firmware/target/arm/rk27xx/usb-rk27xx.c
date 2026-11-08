@@ -31,6 +31,32 @@ int usb_status = USB_EXTRACTED;
 
 void usb_init_device(void)
 {
+    SCU_CLKCFG &= ~CLKCFG_UDC;
+#ifdef COLORFLY_C4_PRO
+    /* Record whether a cable was present (VBUS live) at the moment the PHY is
+     * hard-reset/calibrated below. usb_drv_init() uses this to decide whether a
+     * runtime plug needs its own live-VBUS recalibration (dry boot) or can
+     * inherit the boot-time calibration (cable already in). Reads DEV_INFO,
+     * which is valid now that CLKCFG_UDC is ungated above. */
+    extern volatile bool c4pro_vbus_at_boot;
+    c4pro_vbus_at_boot = (DEV_INFO & VBUS_STS) != 0;
+#endif
+#if !defined(COLORFLY_C4_PRO) || defined(C4PRO_USB_STOCK_PATH)
+    /* Hard-reset the UDC controller. NOT done on C4PRO: the BootROM already
+     * brought the UDC/PHY up to a working (high-speed-capable) state, and
+     * pulsing RSTCFG_UDC wipes that analog/PHY setup, leaving corrupted
+     * signaling (host "error -71", full-speed only). The stock RK27xx loader
+     * likewise never re-pulses RSTCFG_UDC (its udc_reset routine is dead code),
+     * relying on the BootROM init - so match that and only ungate the clock. */
+    SCU_RSTCFG |= RSTCFG_UDC;
+    udelay(10000);
+    SCU_RSTCFG &= ~RSTCFG_UDC;
+    udelay(10000);
+#endif
+
+    /* enable UDC interrupt */
+    INTC_IMR |= (1<<16);
+    INTC_IECR |= (1<<16);
     EN_INT = EN_SUSP_INTR   |  /* Enable Suspend Interrupt */
              EN_RESUME_INTR |  /* Enable Resume Interrupt */
              EN_USBRST_INTR |  /* Enable USB Reset Interrupt */

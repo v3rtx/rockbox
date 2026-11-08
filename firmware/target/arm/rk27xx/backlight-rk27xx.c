@@ -81,6 +81,23 @@ static const unsigned short lin_brightness[] = {
     16133, 17963, 19968, 22156, 24534, 27110, 29893, 32890,
     36109, 39559, 43246, 47180, 51368, 55817, 60537, 65535
 };
+#elif defined(COLORFLY_C4_PRO)
+/* C4 Pro PWMT0 backlight has INVERTED polarity vs the sibling rk27xx targets:
+ * HRC=0 = full brightness, HRC=LRC(=1000) = off (confirmed on-device — driving
+ * HRC=1000 killed the backlight). So this table holds the HRC values directly
+ * and is DESCENDING (index 0 = dimmest .. index 31 = brightest). LRC is fixed
+ * at 1000 in backlight_hw_init (NOT taken from this table, whose [MAX] is 0).
+ *
+ * On-device the LED stays dark for HRC > ~666, so the usable HRC window is only
+ * [0..~650]; the whole 0..31 slider is mapped into it, gamma-shaped (MA9 duty),
+ * level 0 = HRC 649 (dimmest visible) .. level 31 = HRC 0 (brightest). Tune
+ * these values on-device as needed. */
+static const unsigned short lin_brightness[] = {
+    649, 647, 645, 644, 640, 636, 632, 627,
+    620, 612, 603, 593, 582, 569, 555, 539,
+    521, 502, 481, 458, 433, 406, 376, 344,
+    311, 274, 235, 194, 150, 103,  53,   0
+};
 #endif
 
 bool backlight_hw_init(void)
@@ -99,7 +116,13 @@ bool backlight_hw_init(void)
 
     /* set pwm frequency */
     /* (apb_freq/pwm_freq)/pwm_div = (50 000 000/pwm_freq)/2 */
+#ifdef COLORFLY_C4_PRO
+    /* fixed PWM period; the C4 lin_brightness table holds HRC directly (inverted
+     * polarity, descending), so lin_brightness[MAX] is 0 and unusable as LRC */
+    PWMT0_LRC = 1000;
+#else
     PWMT0_LRC = lin_brightness[MAX_BRIGHTNESS_SETTING];
+#endif
     PWMT0_HRC = lin_brightness[brightness];
 
     /* reset counter */
@@ -128,6 +151,17 @@ void backlight_hw_on(void)
 
 void backlight_hw_off(void)
 {
+#ifdef COLORFLY_C4_PRO
+    /* INVERTED polarity: PD4 low = LED fully ON. The default path below parks
+     * PD4 as a pulled-low GPIO, which on this panel blasts the backlight to MAX
+     * on every timeout/fade-down. Drive PD4 HIGH (GPIO) so OFF is really off;
+     * backlight_hw_on() re-muxes to PWM and restores the user's brightness. */
+    SCU_IOMUXB_CON &= ~(1<<11);
+    GPIO_PDCON |= (1<<4);
+    GPIO_PDDR |= (1<<4);
+    PWMT0_CTRL &= ~((1<<3) | (1<<0));
+    SCU_CLKCFG |= CLKCFG_PWM;
+#else
     /* setup PWM0 pin as GPIO which is pulled low */
     SCU_IOMUXB_CON &= ~(1<<11);
 
@@ -136,6 +170,7 @@ void backlight_hw_off(void)
 
     /* disable PWM clock */
     SCU_CLKCFG |= CLKCFG_PWM;
+#endif
 #ifdef HAVE_LCD_ENABLE
     lcd_enable(false);
 #endif

@@ -28,9 +28,16 @@
 unsigned short adc_read(int channel)
 {
     unsigned short result;
+#ifdef COLORFLY_C4_PRO
+    int old_irq = disable_irq_save();
+#endif
 
     /* ungate lsadc clocks */
     SCU_CLKCFG &= ~(CLKCFG_LSADC|CLKCFG_PCLK_LSADC);
+
+#ifdef COLORFLY_C4_PRO
+    restore_irq(old_irq);
+#endif
 
     /* wait a bit for clock to stabilize */
     udelay(10);
@@ -49,8 +56,15 @@ unsigned short adc_read(int channel)
     /* 10bits result */
     result = (ADC_DATA & 0x3ff);
 
+#ifdef COLORFLY_C4_PRO
+    old_irq = disable_irq_save();
+#endif
     /* turn off lsadc clock when not in use */
     SCU_CLKCFG |= (CLKCFG_LSADC|CLKCFG_PCLK_LSADC);
+
+#ifdef COLORFLY_C4_PRO
+    restore_irq(old_irq);
+#endif
 
     return result; 
 }

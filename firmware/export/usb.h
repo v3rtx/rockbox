@@ -124,6 +124,10 @@ enum
     USB_REQUEST_REBOOT,      /* Event */
 #endif
     USB_QUIT,                /* Event */
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    USB_C4PRO_CHARGE_ONLY,   /* Event */
+    USB_C4PRO_ATTACH_NOW,    /* Event */
+#endif
 #if defined(HAVE_USB_CHARGING_ENABLE) && defined(HAVE_USBSTACK)
     USB_CHARGER_UPDATE,      /* Event */
 #endif
@@ -209,6 +213,11 @@ void usb_status_event(int current_status);
 #ifdef HAVE_USB_POWER
 /* returns whether the USB is in powered-only state */
 bool usb_powered_only(void);
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && !defined(BOOTLOADER)
+/* Switch a live USB connection to charge-only (picked on the USB screen):
+ * detaches, remounts storage and broadcasts SYS_USB_DISCONNECTED. */
+void c4pro_usb_charge_only(void);
+#endif
 #ifdef HAVE_USB_CHARGING_ENABLE
 enum {
     USB_CHARGING_DISABLE, /* the USB code will never ask for more than 100mA */

@@ -110,8 +110,29 @@ static bool i2c_read_byte(unsigned char *data)
  * access to this address is routed to internal bus.
  * All other addresses are routed to external pads
  */
+#ifdef COLORFLY_C4_PRO
+/* Saved NAND CS pin-mux bits (14..18) wiped for a clean codec I2C transaction;
+ * restored by the i2c_iomux_restore() call at the end of each transaction. */
+static unsigned long c4_iomux_saved;
+#endif
+
 static void i2c_iomux(unsigned char slave)
 {
+#ifdef COLORFLY_C4_PRO
+    /* On the C4 Pro, IOMUXA bits 14/16 are SHARED: they are the codec-I2C
+     * routing bits AND the upper NAND chip-selects (IOMUX_NAND_CS2/CS3) that
+     * nand_device_init() sets for the 4-die / 32 GB layout. Leaving them set
+     * while routing the codec to the external bus (bit 18) puts the I2C mux in a
+     * conflicting state -> the CS8422/CS4398 register writes are corrupted and
+     * playback carries continuous signal-proportional static. So give the codec
+     * a CLEAN external bus for the transaction (clear 14..17, set 18), and
+     * restore the NAND CS bits afterwards (i2c_iomux_restore) so dies 2/3 stay
+     * reachable. The transaction is mutex-serialised, so the brief CS-clear
+     * window cannot race a concurrent NAND op on the same bus. */
+    (void)slave;
+    c4_iomux_saved = SCU_IOMUXA_CON & (0x1ful << 14);
+    SCU_IOMUXA_CON = (SCU_IOMUXA_CON & ~(0x1ful << 14)) | (1u << 18);
+#else
     unsigned long muxa = SCU_IOMUXA_CON & ~(0x1f<<14);
 
     if ((slave & 0xfe) == (0x27<<1))
@@ -124,7 +145,17 @@ static void i2c_iomux(unsigned char slave)
         /* external I2C bus */
         SCU_IOMUXA_CON = (muxa | (1<<18));
     }
+#endif
 }
+
+#ifdef COLORFLY_C4_PRO
+/* Restore the NAND CS2/CS3 pin-mux bits that i2c_iomux() cleared so the codec
+ * transaction had a clean bus. Called at the end of every I2C transaction. */
+static void i2c_iomux_restore(void)
+{
+    SCU_IOMUXA_CON = (SCU_IOMUXA_CON & ~(0x1ful << 14)) | c4_iomux_saved;
+}
+#endif
 
 void i2c_init(void)
 {
@@ -209,10 +240,19 @@ int i2c_write(unsigned char slave, int address, int len,
     }
 
 end:
+#ifdef COLORFLY_C4_PRO
+    i2c_iomux_restore();
+#endif
     mutex_unlock(&i2c_mtx);
     SCU_CLKCFG |= CLKCFG_I2C;
 
     return ret;
+}
+
+int rk27xx_i2c_write(unsigned char slave, int address, int len,
+                     const unsigned char *data)
+{
+    return i2c_write(slave, address, len, data);
 }
 
 int i2c_read(unsigned char slave, int address, int len, unsigned char *data)
@@ -280,8 +320,17 @@ int i2c_read(unsigned char slave, int address, int len, unsigned char *data)
     }
 
 end:
+#ifdef COLORFLY_C4_PRO
+    i2c_iomux_restore();
+#endif
     mutex_unlock(&i2c_mtx);
     SCU_CLKCFG |= CLKCFG_I2C;
 
     return ret;
+}
+
+int rk27xx_i2c_read(unsigned char slave, int address, int len,
+                    unsigned char *data)
+{
+    return i2c_read(slave, address, len, data);
 }

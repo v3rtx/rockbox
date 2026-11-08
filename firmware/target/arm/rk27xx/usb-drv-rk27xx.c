@@ -78,6 +78,7 @@ struct endpoint_t
 #define DMAINCTL(endp)      *(3 + (endp)->stat)
 #define DMAINLMADDR(endp)   *(4 + (endp)->stat)
 
+
 #define ENDPOINT(num, type, dir, reg) \
     {num, USB_ENDPOINT_XFER_##type, USB_DIR_##dir, reg, false, NULL, 0, 0, \
      true, false, false, 0, {{0, 0}, 0, 0}}
@@ -110,6 +111,45 @@ static struct endpoint_t endpoints[16] =
 
 static volatile bool set_address = false;
 static volatile bool set_configuration = false;
+
+/* The C4PRO connect/PHY layer is needed whenever USB runs on C4PRO. It used to
+ * be gated on (DIAG_EXPORT || MSC_ENABLE) because USB only ran via the old
+ * imperative serve; under the stock reactive path usb_drv_init() must assert the
+ * connect on EVERY connection, so these are now enabled for all C4PRO builds. */
+#if defined(COLORFLY_C4_PRO)
+static void udc_phy_reset(void);
+static void udc_soft_connect(void);
+#endif
+
+#if defined(COLORFLY_C4_PRO)
+static bool c4pro_usb_did_soft_connect;
+#endif
+
+/* Set by usb_init_device() at boot: was VBUS present (cable inserted) when the
+ * BootROM/loader last hard-reset and calibrated the UDC PHY? The RK27xx PHY's
+ * analog trim (HS terminations / chirp current) is only valid if VBUS is live
+ * during that reset. A device booted with NO cable therefore carries a PHY
+ * calibrated against a dead bus; the later runtime plug only does a soft
+ * SOFT_POR, which does not re-derive the analog trim, so the HS chirp is
+ * corrupted (host "error -71", full-speed fallback). usb_drv_init() consumes
+ * this to redo a full RSTCFG_UDC reset -- with VBUS now live -- on the dry-boot
+ * path only. Defaults to true so the known-good cable-at-boot path is unchanged. */
+volatile bool c4pro_vbus_at_boot = true;
+
+#ifdef C4PRO_USB_TX_WEDGE_GUARD
+#ifndef C4PRO_USB_TX_WEDGE_ITERS
+#define C4PRO_USB_TX_WEDGE_ITERS 2000000u  /* ~tens of ms at 200 MHz, bounded */
+#endif
+#endif /* C4PRO_USB_TX_WEDGE_GUARD */
+
+#if defined(C4PRO_USB_RX_STALL_KICK) && defined(C4PRO_PHASE_MARK)
+/* Progress counter for bulk-OUT transfers used by the watchdog kick. */
+volatile unsigned c4pro_usb_diag_outn_count;
+#endif
+
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+volatile unsigned c4pro_usb_setup_seq;   /* monotonic setup-packet counter */
+#endif
 
 #undef ENDPOINT
 
@@ -175,6 +215,13 @@ static void ep0_setup_received(void)
     if(setup.words[0] == 0 && setup.words[1] == 0)
         return;
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    /* Bump a monotonic setup sequence so the C4PRO USB monitor thread can tell a
+     * live (advancing) enumeration from a stalled one and re-present the marginal
+     * HS PHY only when it is genuinely stuck. */
+    c4pro_usb_setup_seq++;
+#endif
+
     /* a SETUP ends a protocol stall */
     TX0CON &= ~TXSTALL;
     RX0CON &= ~RXSTALL;
@@ -197,9 +244,136 @@ static int max_pkt_size(struct endpoint_t *endp)
     }
 }
 
+#if defined(COLORFLY_C4_PRO)
+/* Chunk size for the synchronous bulk-IN sender. One USB max-packet (512) per
+ * DMA is the simplest, guaranteed-aligned choice. The stock firmware uses a
+ * runtime halfword chunk (var [0x6070F510], <=2047 = TXLEN field width) and
+ * lets the controller auto-packetize each chunk into 512-byte USB packets;
+ * bump this to a larger <=2047 value later if a single multi-packet DMA per
+ * chunk is desired. */
+#define C4PRO_SYNC_IN_CHUNK   512
+
+/* Return true for the bulk-IN data endpoints whose send is diverted to the
+ * synchronous polled path (ep != 0, IN, BULK). EP0/control and OUT stay on the
+ * stock interrupt-driven path. */
+static inline bool c4pro_is_sync_in_ep(struct endpoint_t *endp)
+{
+    return endp->ep_num != 0 &&
+           endp->dir == USB_DIR_IN &&
+           endp->type == USB_ENDPOINT_XFER_BULK;
+}
+
+/* Synchronous, polled bulk-IN (device->host) sender mirroring the stock
+ * Colorfly C4 Pro firmware's single-DMA send @0x607041BC, looped over the whole
+ * transfer (@0x60704990). The interrupt-driven per-packet ep_write() path does
+ * not transmit >=512-byte reads reliably on this controller; the stock path
+ * never depends on TXACK to advance packets.
+ *
+ * Per chunk, exactly per 0x607041BC:
+ *   1. wait while(DMAINCTL & DMA_START)   ; previous DMA engine idle
+ *   2. wait while(TXBUF & TXFULL)         ; FIFO not full
+ *   3. TXSTAT  = chunk count              ; byte count for this DMA
+ *   4. DMAINLMADDR = src                  ; source buffer address
+ *   5. DMAINCTL = DMA_START               ; fire the DMA (GO bit) and continue
+ *
+ * Like stock, a chunk does NOT wait for its own DMA to self-clear: the wait at
+ * step 1 of the NEXT send (including the CSW, which uses this same bulk-IN ep)
+ * serialises it. Every poll is tick-bounded (HZ/10) so a stuck controller can't
+ * hang the thread. The data has already been committed out of the D-cache by
+ * _usb_drv_send()/commit_discard_dcache_range() before we get here. */
+static void c4pro_ep_write_sync(struct endpoint_t *endp)
+{
+    int remaining = endp->cnt;
+
+#ifdef C4PRO_PHASE_MARK
+    /* phase 11 = inside the polled bulk-IN sender (CSW/data DMA + TX FIFO
+     * waits). A freeze frozen at P11 pinpoints this loop despite its iteration
+     * caps (e.g. a fault mid-loop after a host link reset). */
+    extern volatile uint32_t c4pro_hb_phase;
+    c4pro_hb_phase = 11;
+#endif
+
+    while(remaining > 0)
+    {
+        int chunk = MIN(C4PRO_SYNC_IN_CHUNK, remaining);
+#ifdef C4PRO_USB_TX_WEDGE_GUARD
+        unsigned int guard;
+
+        /* 1. DMA engine idle */
+        guard = C4PRO_USB_TX_WEDGE_ITERS;
+        while((DMAINCTL(endp) & DMA_START) && --guard)
+            ;
+
+        /* 2. FIFO not full */
+        guard = C4PRO_USB_TX_WEDGE_ITERS;
+        while((TXBUF(endp) & TXFULL) && --guard)
+            ;
+#else
+        unsigned int timeout;
+
+        /* 1. DMA engine idle */
+        timeout = current_tick + HZ/10;
+        while(DMAINCTL(endp) & DMA_START)
+            if(TIME_AFTER(current_tick, timeout)) break;
+
+        /* 2. FIFO not full */
+        timeout = current_tick + HZ/10;
+        while(TXBUF(endp) & TXFULL)
+            if(TIME_AFTER(current_tick, timeout)) break;
+#endif
+
+        TXSTAT(endp)      = chunk;
+        DMAINLMADDR(endp) = (uint32_t)endp->buf;
+        DMAINCTL(endp)    = DMA_START;
+
+        endp->buf += chunk;
+        remaining -= chunk;
+    }
+
+#ifdef C4PRO_USB_DEFER_WRITE
+    {
+        unsigned int guard =
+#ifdef C4PRO_USB_TX_WEDGE_ITERS
+            C4PRO_USB_TX_WEDGE_ITERS;
+#else
+            2000000u;
+#endif
+        while((DMAINCTL(endp) & DMA_START) && --guard)
+            ;
+    }
+#endif /* C4PRO_USB_DEFER_WRITE */
+
+    /* The whole payload has been drained synchronously. Complete the transfer
+     * WITHOUT relying on the TXACK interrupt, mirroring exactly what in_intr()
+     * does on the final TXACK so the usb_storage state machine advances to the
+     * CSW. endp->len is the total length set in _usb_drv_send(). */
+    endp->cnt = 0;
+    endp->busy = false;
+    endp->result = 0;
+    usb_core_transfer_complete(endp->ep_num, endp->dir, 0, endp->len);
+    if(endp->block)
+        semaphore_release(&endp->complete);
+}
+#endif /* COLORFLY_C4_PRO */
+
 static void ep_write(struct endpoint_t *endp)
 {
     int xfer_size = MIN(max_pkt_size(endp), endp->cnt);
+#if defined(COLORFLY_C4_PRO) && !defined(C4PRO_USB_STANDARD_TRANSFER)
+    /* Divert bulk-IN data endpoints to the synchronous polled sender (stock
+     * @0x607041BC). EP0/control and OUT stay on the interrupt-driven path.
+     *
+     * C4PRO_USB_STANDARD_TRANSFER (default OFF) REVERTS this to the upstream
+     * rk27xx behaviour: bulk-IN uses the normal IRQ-driven ep_write below (fire
+     * ONE packet + DMA, return) and in_intr()'s TXACK handler chains the next
+     * packet - no polled sender, no per-transfer busy-waits held in the caller.
+     * The enumeration path (c4pro_udc_arm_and_connect) is unaffected. */
+    if(c4pro_is_sync_in_ep(endp))
+    {
+        c4pro_ep_write_sync(endp);
+        return;
+    }
+#endif
 
     /* Bounded by iterations, not by current_tick: this also runs in the
      * interrupt handler (the next packet of a transfer), where the tick
@@ -214,6 +388,29 @@ static void ep_write(struct endpoint_t *endp)
     TXSTAT(endp) = xfer_size;
     DMAINLMADDR(endp) = (uint32_t)endp->buf; /* local buffer address */
     DMAINCTL(endp) = DMA_START;
+#if defined(COLORFLY_C4_PRO)
+    /* Wait for the DMA engine to finish loading the TX FIFO before the packet
+     * is clocked out. The stock bulk-IN sender (@0x607041BC) polls the
+     * DMA_START bit until it self-clears after every chunk; without this wait
+     * the controller can transmit before the DMA has filled the FIFO and clock
+     * out stale FIFO residue for >=512-byte transfers. */
+#ifdef C4PRO_USB_TX_WEDGE_GUARD
+    {
+        unsigned int guard = C4PRO_USB_TX_WEDGE_ITERS;
+        while((DMAINCTL(endp) & DMA_START) && --guard)
+            ;
+    }
+#else
+    {
+        unsigned int dma_to = current_tick + HZ/10;
+        while(DMAINCTL(endp) & DMA_START)
+        {
+            if(TIME_AFTER(current_tick, dma_to))
+                break;
+        }
+    }
+#endif
+#endif
     /* Decrement by max packet size is intentional.
      * This way if we have final packet short one we will get negative len
      * after transfer, which in turn indicates we *don't* need to send
@@ -229,22 +426,69 @@ static void ep_write(struct endpoint_t *endp)
 
 static void ep_read(struct endpoint_t *endp)
 {
+#ifdef C4PRO_USB_RX_DMA_GUARD
+    {
+        unsigned guard =
+#ifdef C4PRO_USB_TX_WEDGE_ITERS
+            C4PRO_USB_TX_WEDGE_ITERS;
+#else
+            2000000u;
+#endif
+        if(DMAOUTCTL(endp) & DMA_START)
+        {
+            while((DMAOUTCTL(endp) & DMA_START) && --guard)
+                ;
+            if(!guard)
+            {
+                DMAOUTCTL(endp) = 0;
+                RXCON(endp) |= RXCLR;
+                RXCON(endp) &= ~RXCLR;
+            }
+        }
+    }
+
+    DMAOUTLMADDR(endp) = (uint32_t)endp->buf; /* local buffer address */
+    DMAOUTCTL(endp) = DMA_START;
+    RXCON(endp) &= ~RXNAK;
+#else
+    int xfer_size = MIN(max_pkt_size(endp), endp->cnt);
+
     /* setup DMA */
+    RXSTAT(endp) = xfer_size;
     DMAOUTLMADDR(endp) = (uint32_t)endp->buf; /* local buffer address */
     DMAOUTCTL(endp) = DMA_START;
     /* clear NAK */
     RXCON(endp) &= ~RXNAK;
+#endif
 }
 
 static void in_intr(struct endpoint_t *endp)
 {
     uint32_t txstat = TXSTAT(endp);
+#ifdef C4PRO_USB_RESET_STALE_GUARD
+    if(endp->ep_num != 0 && usb_core_bus_reset_pending())
+        return;
+#endif
     /* check if clear feature was sent by host */
     if(txstat & TXCFINT)
     {
         logf("clear_stall: %d", endp->ep_num);
         usb_drv_stall(endp->ep_num, false, true);
     }
+#if defined(COLORFLY_C4_PRO) && !defined(C4PRO_USB_STANDARD_TRANSFER)
+    /* Bulk-IN data endpoints are sent synchronously in c4pro_ep_write_sync(),
+     * which already drained the whole transfer and called
+     * usb_core_transfer_complete() exactly once. The hardware still raises a
+     * TXACK per packet afterwards; ignore those here so the transfer is not
+     * completed (and the next one not re-armed) a second time. Control EP0 and
+     * the OUT path are untouched.
+     *
+     * With C4PRO_USB_STANDARD_TRANSFER we DO NOT early-return: the TXACK handler
+     * below drives the standard IRQ-driven multi-packet bulk-IN (chain next
+     * packet via ep_write, or complete on the last) - the upstream behaviour. */
+    if(c4pro_is_sync_in_ep(endp))
+        return;
+#endif
     /* check if a transfer has finished */
     if(txstat & TXACK)
     {
@@ -271,6 +515,14 @@ static void in_intr(struct endpoint_t *endp)
 static void out_intr(struct endpoint_t *endp)
 {
     uint32_t rxstat = RXSTAT(endp);
+#if defined(C4PRO_USB_RX_STALL_KICK) && defined(C4PRO_PHASE_MARK)
+    if(endp->ep_num != 0)
+        c4pro_usb_diag_outn_count++;
+#endif
+#ifdef C4PRO_USB_RESET_STALE_GUARD
+    if(endp->ep_num != 0 && usb_core_bus_reset_pending())
+        return;
+#endif
     logf("udc: out intr(%d)", endp->ep_num);
     /* check if clear feature was sent by host */
     if(rxstat & RXCFINT)
@@ -293,7 +545,8 @@ static void out_intr(struct endpoint_t *endp)
         {
             endp->busy = false;
             endp->result = 0;
-            usb_core_transfer_complete(endp->ep_num, endp->dir, 0, endp->len);
+            usb_core_transfer_complete(endp->ep_num, endp->dir, 0,
+                                       endp->len - endp->cnt);
             if(endp->block)
                 semaphore_release(&endp->complete);
             /* EP0: a status OUT while the data IN is still going means the
@@ -327,6 +580,25 @@ static void udc_soft_connect(void)
                DEV_SOFT_CN |
                DEV_SELF_PWR;
 }
+
+#if defined(COLORFLY_C4_PRO)
+/* Dry-boot PHY recalibration: pulse the full UDC controller/PHY reset with VBUS
+ * now live, reproducing (at plug time) the analog calibration the ROM performs
+ * when a cable is present at boot. Only invoked on the dry-boot path (see
+ * c4pro_vbus_at_boot); the subsequent connect sequence in usb_drv_init() then
+ * runs on a freshly-calibrated PHY. */
+static void c4pro_udc_recalibrate_phy(void)
+{
+    DEV_CTL &= ~DEV_SOFT_CN;               /* detach before resetting */
+    SCU_CLKCFG &= ~CLKCFG_UDC;             /* keep the UDC clock ungated */
+    SCU_RSTCFG |= RSTCFG_UDC;              /* hard-reset controller + PHY... */
+    udelay(10000);
+    SCU_RSTCFG &= ~RSTCFG_UDC;             /* ...recalibrated against live VBUS */
+    udelay(10000);
+    INTC_IMR |= (1<<16);                   /* re-enable the UDC interrupt line */
+    INTC_IECR |= (1<<16);
+}
+#endif
 
 static void udc_helper(void)
 {
@@ -433,10 +705,25 @@ void usb_drv_ep_init(const struct usb_drv_ep_alloc_ctx* ctx, int ep)
     struct endpoint_t *endp = &endpoints[ep_num];
 
     if(EP_DIR(ep) == DIR_IN)
+#if defined(COLORFLY_C4_PRO)
+        /* Match the stock C4 firmware's bulk-IN endpoint config (TX2CON=0x248):
+         * TXEPEN|TXACKINTEN, with NO TXNAK and NO TXCFINTE. Leaving TXNAK set
+         * (Rockbox default 0x124C) makes the controller transmit stale FIFO/DMA
+         * residue for >=512-byte bulk reads instead of the freshly-DMA'd data
+         * (host saw a {sector,~sector} pattern). Verified against stock EP-config
+         * routine @0x60704114. */
+        TXCON(endp) = (ep_num << 8) | TXEPEN | TXACKINTEN;
+#else
         TXCON(endp) = (ep_num << 8) | TXEPEN | TXNAK | TXACKINTEN | TXCFINTE;
+#endif
     else
+#if defined(COLORFLY_C4_PRO)
+        /* Stock bulk-OUT config (RX1CON=0x190): RXEPEN|RXACKINTEN, no RXNAK. */
+        RXCON(endp) = (ep_num << 8) | RXEPEN | RXACKINTEN;
+#else
         RXCON(endp) = (ep_num << 8) | RXEPEN | RXNAK | RXACKINTEN | RXCFINTE |
                       RXERRINTEN;
+#endif
     endp->enabled = true;
     EN_INT |= 1 << (ep_num + 7);
     logf("add: ep%d %s", ep_num, XFER_DIR_STR(EP_DIR(ep) == DIR_IN));
@@ -665,11 +952,70 @@ void usb_drv_stall(int endpoint, bool stall, bool in)
     }
 }
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+/* Production accessor + re-present used by the C4PRO USB monitor thread to
+ * recover the marginal HS PHY (host logs "device descriptor read/64, error -71"
+ * on a failed attempt).
+ *
+ * usb_drv_init()'s recalibrating connect runs only ONCE per boot (guarded by
+ * c4pro_usb_did_soft_connect), so on a runtime REPLUG -- and especially a replug
+ * after a full serve session -- the re-present here is the only connect the host
+ * gets. A light phy_reset+soft_connect ("strategy 4") does NOT re-derive the PHY
+ * analog trim and gets stuck at -71 on the second plug; c4pro_udc_recalibrate_phy
+ * (full RSTCFG_UDC reset, VBUS live) is what re-derives it. So the re-present
+ * mirrors the dry-boot path exactly: detach, hard-reset+recalibrate the PHY, then
+ * the winning STOCK HS connect (SOFT_POR then udc_soft_connect -> DEV_CTL 0x158).
+ * EP0 is re-armed by the USBRST ISR once the host starts enumerating (same as the
+ * boot connect, which also does not arm EP0 itself). */
+bool c4pro_usb_vbus_present(void) { return (DEV_INFO & VBUS_STS) != 0; }
+bool c4pro_usb_configured(void)   { return (DEV_INFO & DEV_EN) != 0; }
+
+void c4pro_usb_represent(void)
+{
+    /* LIGHT re-present nudge: detach, SOFT_POR the PHY, re-assert D+. Deliberately
+     * does NOT do the full RSTCFG_UDC hard controller reset (c4pro_udc_recalibrate_phy)
+     * -- that tears the whole controller down and, fired repeatedly on the
+     * monitor's cadence while the host is mid-retry, prevents enumeration from
+     * ever completing (observed: device number churns, permanent -71). The
+     * once-per-plug analog recalibration is done by usb_drv_init() in the correct
+     * context (re-armed on disconnect via c4pro_usb_arm_reconnect); this is only
+     * the gentle "try again" for a marginal chirp. */
+    DEV_CTL &= ~DEV_SOFT_CN;        /* detach: give the host a clean disconnect */
+    udelay(100000);
+    udc_phy_reset();
+    udelay(10000);
+    udc_soft_connect();             /* STOCK HS connect -> DEV_CTL 0x158 */
+}
+
+/* Make sure D+ is NOT asserted. Used by the plug paths that do not bring the
+ * stack up (charge-only, and the window before a deferred attach): if a
+ * previous session or the loader left DEV_SOFT_CN set, the host would start
+ * enumerating into an uninitialised driver -- and the INT_UDC idle-guard
+ * cannot catch that, because VBUS is present. */
+void c4pro_usb_detach(void)
+{
+    DEV_CTL &= ~DEV_SOFT_CN;
+}
+
+/* Re-arm usb_drv_init()'s one-shot connect so the NEXT plug re-runs the full
+ * recalibrating connect (the proven first-plug path) instead of skipping it via
+ * the latch. Called on USB disconnect. Forces recalibration next time because
+ * VBUS will be live at the next plug and the PHY analog trim decays across a
+ * disconnect (a runtime replug otherwise gets stuck at -71). */
+void c4pro_usb_arm_reconnect(void)
+{
+    c4pro_usb_did_soft_connect = false;
+    c4pro_vbus_at_boot = false;
+}
+#endif
+
 /* Transfer-completion semaphores start fresh at every stack init. Never from
  * the interrupt handler: re-initialising a semaphore a thread is blocked on
  * loses that thread for good - a bus reset cancels transfers instead. */
 static void udc_reset_semaphores(void)
 {
+    usb_drv_startup();
+
     /* init semaphore of ep0 */
     semaphore_init(&ctrlep[DIR_OUT].complete, 1, 0);
     semaphore_init(&ctrlep[DIR_IN].complete, 1, 0);
@@ -709,11 +1055,45 @@ void usb_drv_init(void)
  * the PHY and reconnect: the host sees a fresh device either way. */
 void usb_drv_connect(void)
 {
+#if defined(COLORFLY_C4_PRO)
+    if(!c4pro_usb_did_soft_connect)
+    {
+        c4pro_usb_did_soft_connect = true;
+        /* Detach FIRST (drop the D+ pull-up) and let the host see it. Across an
+         * app reboot the cable stays plugged and VBUS stays high, so the host
+         * retains its stale pre-reboot view of the device; re-asserting D+ it
+         * already considers "connected" triggers no fresh enumeration. A clean
+         * disconnect->reconnect forces the host to re-enumerate. (This is what
+         * the old imperative serve did via c4pro_usb_diag_force_reattach; the
+         * dry-boot recalibrate below also detaches, so this is its equivalent
+         * for the cable-at-boot path.) */
+        DEV_CTL &= ~DEV_SOFT_CN;
+        udelay(100000);                /* ~100ms so the host registers the detach */
+        if(!c4pro_vbus_at_boot)
+            /* Booted with no cable: the boot-time PHY calibration ran against a
+             * dead bus. Redo the full hard reset now, with VBUS live, before the
+             * connect sequence below runs -- otherwise the HS chirp is corrupted
+             * (host "error -71", full-speed only) on this runtime plug. */
+            c4pro_udc_recalibrate_phy();
+        /* Connect for the stock reactive path. EMPIRICALLY CONFIRMED (on-device,
+         * via the strategy cycler + a fresh cable plug): the STOCK sequence
+         * -- SOFT_POR the PHY, then udc_soft_connect() -> DEV_CTL=0x158 -- is what
+         * enumerates HIGH-speed. The host reads descriptors, binds usb-storage,
+         * and reports HS. (The "arm EP0 + clear PHY16BIT -> 0x118" variant only
+         * ever reached full-speed + host error -71; 0x158 is correct here.) The
+         * detach above gives the host a clean disconnect->reconnect edge. */
+        DEV_CTL = DEV_SELF_PWR;
+        udc_phy_reset();
+        udelay(10000);
+        udc_soft_connect();
+    }
+#else
     DEV_CTL &= ~DEV_SOFT_CN;
     udelay(20000);
     udc_phy_reset();
     udelay(10000);
     udc_soft_connect();
+#endif
 }
 
 /* turn off usb core */
@@ -739,14 +1119,163 @@ int usb_detect(void)
         return USB_EXTRACTED;
 }
 
+#ifdef C4PRO_USB_RESET_DMA_ABORT
+/* Abort every in-flight UDC DMA engine and flush the per-endpoint FIFOs.
+ *
+ * ROOT-CAUSE HYPOTHESIS (sustained-write/format hard hang preceded by host bus
+ * RESETs, R climbs then freeze; F=0, T=D frozen together => IRQs-masked
+ * busy-spin, screen blank): when a host USBRST arrives while a bulk-OUT receive
+ * DMA (DMAOUTCTL) or bulk-IN send DMA (DMAINCTL) is IN FLIGHT, the link dies
+ * mid-burst and that DMA's GO/busy bit (DMA_START) never self-clears, leaving
+ * the UDC's DMA engine holding the AHB bus. The very next bus/cache access or
+ * DMA arm then spins forever with IRQs masked -> the F=0 / T=D lockup. The old
+ * C4PRO_USB_RESET_GUARD re-inits + ACKs but NEVER releases the wedged master.
+ *
+ * Fix: on every USBRST, BEFORE any re-init, force DMA_START low on all DMA
+ * control registers (the write is the abort - DMA_START is both the GO command
+ * and the busy status on this controller) and pulse the FIFO-clear bits
+ * (TXCLR / RXCLR, exactly as the RESUME handler already does for EP0) so no DMA
+ * is left mid-burst and no FIFO residue survives into the re-armed link.
+ *
+ * IRQ-SAFE / BOUNDED: this is pure register writes - no polling, no wait, no
+ * dependence on the (frozen) tick. Every UDC DMA engine that physically exists
+ * is covered: EP0 (TX0/RX0) plus endpoints[1..15], each of which is fixed to a
+ * single direction by the hardware endpoint map, so iterating by endp->dir
+ * touches exactly one real DMA control register per endpoint number. */
+#ifdef C4PRO_USB_RX_STALL_KICK
+void c4pro_usb_rx_stall_kick(void)
+{
+    struct endpoint_t *endp = &endpoints[1];   /* BOUT1 = the MSC OUT pipe */
+    int oldlevel = disable_irq_save();
+    unsigned long ctl = DMAOUTCTL(endp);
+    uint32_t rxstat = (uint32_t)RXSTAT(endp);
+
+    if (ctl & DMA_START)
+    {
+        if ((INT2FLAG & 0x100u) || !(DMAOUTCTL(endp) & DMA_START))
+        {
+            restore_irq(oldlevel);
+            return;
+        }
+        DMAOUTCTL(endp) = 0;
+        RXCON(endp) |= RXCLR;
+        RXCON(endp) &= ~RXCLR;
+        RXCON(endp) &= ~RXNAK;
+        DMAOUTLMADDR(endp) = (uint32_t)endp->buf;
+        DMAOUTCTL(endp) = DMA_START;
+    }
+    else
+    {
+        if (INT2FLAG & 0x100u)
+        {
+            restore_irq(oldlevel);
+            return;
+        }
+        if (rxstat & RXACK)
+        {
+            int xfer_size = rxstat & 0xffff;
+            endp->cnt -= xfer_size;
+            endp->buf += xfer_size;
+            if (endp->cnt <= 0 || xfer_size < max_pkt_size(endp))
+            {
+                endp->busy = false;
+                endp->result = 0;
+                usb_core_transfer_complete(endp->ep_num, endp->dir, 0,
+                                           endp->len - endp->cnt);
+                if (endp->block)
+                    semaphore_release(&endp->complete);
+            }
+            else
+                ep_read(endp);   /* arms at the advanced buf */
+        }
+        else
+        {
+            /* Idle with no ACK latched: nothing to account, clean re-arm. */
+            DMAOUTCTL(endp) = 0;
+            RXCON(endp) |= RXCLR;
+            RXCON(endp) &= ~RXCLR;
+            RXCON(endp) &= ~RXNAK;
+            DMAOUTLMADDR(endp) = (uint32_t)endp->buf;
+            DMAOUTCTL(endp) = DMA_START;
+        }
+    }
+
+    restore_irq(oldlevel);
+}
+#endif /* C4PRO_USB_RX_STALL_KICK */
+
+static void c4pro_usb_reset_dma_abort(void)
+{
+    /* EP0 control endpoint: both TX0 and RX0 DMA engines + FIFOs. */
+    TX0DMAINCTL = 0;                 /* clear IN  DMA GO -> release AHB master */
+    RX0DMACTLO  = 0;                 /* clear OUT DMA GO -> release AHB master */
+    TX0CON |= TXCLR;  TX0CON &= ~TXCLR;   /* flush EP0 TX FIFO */
+    RX0CON |= RXCLR;  RX0CON &= ~RXCLR;   /* flush EP0 RX FIFO */
+
+    for(int ep_num = 1; ep_num < 16; ep_num++)
+    {
+        struct endpoint_t *endp = &endpoints[ep_num];
+        if(endp->stat == NULL)       /* unmapped (ep0 stub) */
+            continue;
+        if(endp->dir == USB_DIR_IN)
+        {
+            DMAINCTL(endp) = 0;      /* abort in-flight bulk/int IN DMA */
+            TXCON(endp) |= TXCLR;    /* pulse TX FIFO clear (preserves epnum) */
+            TXCON(endp) &= ~TXCLR;
+        }
+        else
+        {
+            DMAOUTCTL(endp) = 0;     /* abort in-flight bulk OUT DMA */
+            RXCON(endp) |= RXCLR;    /* pulse RX FIFO clear (preserves epnum) */
+            RXCON(endp) &= ~RXCLR;
+        }
+    }
+}
+#endif /* C4PRO_USB_RESET_DMA_ABORT */
+
 /* UDC ISR function */
 void INT_UDC(void)
 {
     /* read what caused UDC irq */
     uint32_t intsrc = INT2FLAG & 0x7fffff;
+    if(intsrc == 0)
+        return;
+
+#ifdef C4PRO_USB_IDLE_UDC_GUARD
+    /* Root-cause guard for the ~4s playback crack AND the intermittent song-open
+     * INT_UDC data-abort. usb_init_device() enables the UDC IRQ at BOOT and it
+     * stays live all through normal playback, so a spurious/stale UDC interrupt
+     * -- even with NO cable attached -- drops us into INT_UDC. Servicing a stale
+     * SETUP/EP-completion against un-enumerated ep0 state dereferences a bad
+     * pointer -> data abort in IRQ context (the 6006b7xx crash); and the repeated
+     * heavy ISR entry (its EP0/DMA wait loops) steals codec time -> periodic
+     * pcmbuf underrun = the crack. A real USB session REQUIRES VBUS (usb_detect()
+     * polls exactly DEV_INFO & VBUS_STS), so with VBUS ABSENT there is nothing
+     * legitimate to service: ACK whatever latched (INT2FLAG is write-1-to-clear)
+     * and return WITHOUT touching endpoint state. Do NOT mask the IRQ line -- it
+     * is enabled only once at boot in usb_init_device() and is NOT reliably
+     * re-enabled on the next plug, so masking would break USB-MSC. Acking is
+     * enough; a real cable sets VBUS_STS and the normal path below runs untouched.
+     * Disconnect cleanup is done by the polling usb thread (usb_enable(false)),
+     * not here. */
+    if(!(DEV_INFO & VBUS_STS))
+    {
+        INT2FLAG = intsrc;
+        return;
+    }
+#endif
 
     if(intsrc & USBRST_INTR) /* usb reset */
     {
+#ifdef C4PRO_USB_RESET_DMA_ABORT
+        /* FIRST thing on a reset: release any in-flight UDC DMA (AHB bus
+         * master) and flush the FIFOs, BEFORE touching EN_INT / re-init. A host
+         * link reset that lands mid-burst otherwise leaves DMA_START stuck ->
+         * wedged AHB master -> the F=0 / T=D IRQs-masked lockup. Pure register
+         * writes: bounded, IRQ-safe (no tick dependence). Runs on every USBRST
+         * regardless of C4PRO_USB_RESET_GUARD. */
+        c4pro_usb_reset_dma_abort();
+#endif
         logf("udc_int: reset, %ld", current_tick);
 
         EN_INT = EN_SUSP_INTR   |  /* Enable Suspend Irq */
@@ -763,14 +1292,10 @@ void INT_UDC(void)
                  TXNAK;            /* Set as one to response NAK handshake */
 
         RX0CON = RXACKINTEN |
-                 RXEPEN     |      /* Endpoint 0 Enable. When cleared the
-                                    * endpoint does not respond to an SETUP
-                                    * or OUT token */
-                 RXNAK;            /* Set as one to response NAK handshake */
+                 RXEPEN;           /* Keep EP0 OUT/SETUP receptive after reset. */
 
         set_address = false;
         set_configuration = false;
-
         /* before any SETUP in this same interrupt is handled: whatever
          * was in flight is gone, including the control request */
         usb_drv_cancel_all_transfers();
@@ -810,12 +1335,50 @@ void INT_UDC(void)
     }
     if(intsrc & CONN_INTR)
     {
+#if defined(COLORFLY_C4_PRO)
+        /* C4 (no-POR path) is already armed and connected from init
+         * (c4pro_udc_arm_and_connect). The stock RK27xx loader's CONN handler
+         * only reads DEV_SPEED; it does NOT pulse SOFT_POR. Re-resetting the
+         * PHY here would tear the link down mid-enumeration, so skip it. */
+#else
         /* usb connect */
         udc_phy_reset();
         udelay(10000);         /* wait at least 10ms */
         udc_soft_connect();
+#endif
     }
     /* other endpoints */
+#ifdef C4PRO_USB_IRQ_DRAIN
+    /* DRAIN: service every endpoint completion, INCLUDING ones that land while
+     * we are still in this handler, all within this single interrupt. Acking at
+     * exit (original) writes back the entry snapshot and ERASES a completion that
+     * arrived mid-handler -> lost RXACK -> phase-13 sustained-write stall. Acking
+     * at entry (early-ACK) fixes the loss but makes each such completion cost a
+     * whole FRESH interrupt -> ~halves throughput on this interrupt-latency-bound
+     * RX. Draining does neither: ack the control bits once, then per endpoint-bit
+     * batch ack-then-service and re-read, until no completion remains -- no bit
+     * lost, no redundant IRQ. (Endpoint completions = bits 8..22; control/one-time
+     * events = bits 1..7, handled once above.) */
+    INT2FLAG = intsrc & ~0x7fff00u;   /* ack control/one-time bits once */
+    {
+        uint32_t epbits = intsrc & 0x7fff00u;
+        while(epbits)
+        {
+            INT2FLAG = epbits;        /* ack this batch BEFORE servicing */
+            for(int ep_num = 1; ep_num < 16; ep_num++)
+            {
+                if(!(epbits & (1 << (ep_num + 7))))
+                    continue;
+                struct endpoint_t *endp = &endpoints[ep_num];
+                if(endp->dir == USB_DIR_IN)
+                    in_intr(endp);
+                else
+                    out_intr(endp);
+            }
+            epbits = INT2FLAG & 0x7fff00u;   /* completions that arrived meanwhile */
+        }
+    }
+#else
     for(int ep_num = 1; ep_num < 16; ep_num++)
     {
         if(!(intsrc & (1 << (ep_num + 7))))
@@ -826,4 +1389,7 @@ void INT_UDC(void)
         else
             out_intr(endp);
     }
+
+    INT2FLAG = intsrc;
+#endif
 }

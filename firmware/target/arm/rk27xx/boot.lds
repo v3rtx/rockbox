@@ -71,6 +71,10 @@ SECTIONS
      _fiqstackbegin = .;
      . += 0x400;
      _fiqstackend = .;
+     /* Dedicated ABORT/UNDEF-mode stack (crt0.S) - see app.lds. */
+     _abortstackbegin = .;
+     . += 0x1000;
+     _abortstackend = .;
   } > DRAM
 
   .bss (NOLOAD) : {

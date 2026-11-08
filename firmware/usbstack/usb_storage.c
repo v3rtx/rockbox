@@ -110,6 +110,7 @@
 #define USB_UFI_READ_FORMAT_CAPACITY 0x23
 #define SCSI_READ_10              0x28
 #define SCSI_WRITE_10             0x2a
+#define SCSI_SYNCHRONIZE_CACHE_10 0x35
 #define SCSI_START_STOP_UNIT      0x1b
 #define SCSI_REPORT_LUNS          0xa0
 #define SCSI_WRITE_BUFFER         0x3b
@@ -119,9 +120,14 @@
 
 #define SCSI_READ_16              0x88
 #define SCSI_WRITE_16             0x8a
+#define SCSI_SYNCHRONIZE_CACHE_16 0x91
 
 #define UMS_STATUS_GOOD            0x00
 #define UMS_STATUS_FAIL            0x01
+
+#ifdef C4PRO_PHASE_MARK
+extern volatile uint32_t c4pro_hb_phase;
+#endif
 
 #define SENSE_NOT_READY             0x02
 #define SENSE_MEDIUM_ERROR          0x03
@@ -461,7 +467,8 @@ static int usb_storage_get_config_descriptor(unsigned char *dest,int max_packet_
 }
 #if (CONFIG_CPU == IMX31L || defined(CPU_TCC780X) || \
      CONFIG_CPU == S5L8702 || CONFIG_CPU == S5L8701 || CONFIG_CPU == AS3525v2 || \
-     defined(BOOTLOADER) || CONFIG_CPU == DM320) && !defined(CPU_PP502x)
+     defined(BOOTLOADER) || CONFIG_CPU == DM320 || defined(COLORFLY_C4_PRO)) && \
+     !defined(CPU_PP502x)
 #define USB_STATIC_ALLOC
 #else
 static int usb_handle = 0;
@@ -545,6 +552,9 @@ static int usb_storage_init_connection(void)
 
 void usb_storage_disconnect(void)
 {
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(HAVE_STORAGE_FLUSH)
+    storage_flush();
+#endif
 #ifndef USB_STATIC_ALLOC
     usb_handle = core_free(usb_handle);
 #endif
@@ -591,11 +601,13 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                              MIN(cur_cmd.count,WRITE_BUFFER_SIZE/cur_cmd.block_size);
                 int next_select = !cur_cmd.data_select;
 
+#ifndef C4PRO_USB_SERIALIZE_WRITE
                 if(next_count!=0) {
                     /* Ask the host to send more, to the other buffer */
                     receive_block_data(cur_cmd.data[next_select],
                                        MIN(WRITE_BUFFER_SIZE,next_count*cur_cmd.block_size));
                 }
+#endif
 
                 /* Now write the data that just came in, while the host is
                    sending the next bit */
@@ -607,10 +619,16 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                 int result = USBSTOR_WRITE_SECTORS_FILTER();
 
                 if (result == 0) {
+#ifdef C4PRO_PHASE_MARK
+                    c4pro_hb_phase = 2;
+#endif
                     result = storage_write_sectors(IF_MD(cur_cmd.lun,)
                         cur_cmd.sector,
                         MIN(WRITE_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
+#ifdef C4PRO_PHASE_MARK
+                    c4pro_hb_phase = 1;
+#endif
                 }
 
                 if(result != 0) {
@@ -619,6 +637,12 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                     cur_sense_data.asc=ASC_WRITE_ERROR;
                     cur_sense_data.ascq=0;
                     break;
+                }
+#endif
+#ifdef C4PRO_USB_SERIALIZE_WRITE
+                if(next_count!=0) {
+                    receive_block_data(cur_cmd.data[next_select],
+                                       MIN(WRITE_BUFFER_SIZE,next_count*cur_cmd.block_size));
                 }
 #endif
                 if(next_count==0) {
@@ -1112,6 +1136,23 @@ static void handle_scsi_ready(struct command_block_wrapper* cbw)
             send_csw(UMS_STATUS_GOOD);
             break;
 
+        case SCSI_SYNCHRONIZE_CACHE_10:
+#ifdef STORAGE_64BIT_SECTOR
+        case SCSI_SYNCHRONIZE_CACHE_16:
+#endif
+            logf("scsi sync_cache %d",lun);
+#ifdef HAVE_STORAGE_FLUSH
+            if(storage_flush() != 0) {
+                send_csw(UMS_STATUS_FAIL);
+                cur_sense_data.sense_key=SENSE_MEDIUM_ERROR;
+                cur_sense_data.asc=ASC_WRITE_ERROR;
+                cur_sense_data.ascq=0;
+                break;
+            }
+#endif
+            send_csw(UMS_STATUS_GOOD);
+            break;
+
         case SCSI_ALLOW_MEDIUM_REMOVAL:
             logf("scsi allow_medium_removal %d",lun);
             if((cbw->command_block[4] & 0x03) == 0) {
@@ -1537,6 +1578,9 @@ static void receive_time(void)
 
 static void receive_block_data(void *data,int size)
 {
+#ifdef C4PRO_PHASE_MARK
+    c4pro_hb_phase = 13;
+#endif
     usb_drv_recv_nonblocking(EP_OUT, data, size);
     state = RECEIVING_BLOCKS;
 }
@@ -1548,10 +1592,16 @@ static void send_csw(int status)
     tb.csw->data_residue = htole32(cur_cmd.data_residue);
     tb.csw->status = status;
 
+#ifdef C4PRO_PHASE_MARK
+    c4pro_hb_phase = 10;
+#endif
     usb_drv_send_nonblocking(EP_IN, tb.csw,
             sizeof(struct command_status_wrapper));
     state = WAITING_FOR_CSW_COMPLETION_OR_COMMAND;
     //logf("CSW: %X",status);
+#ifdef C4PRO_PHASE_MARK
+    c4pro_hb_phase = 12;
+#endif
     /* Already start waiting for the next command */
     usb_drv_recv_nonblocking(EP_OUT, cbw_buffer, MAX_CBW_SIZE);
     /* The next completed transfer will be either the CSW one

@@ -34,6 +34,9 @@
 #include "panic.h"
 #include "stdbool.h"
 #include "storage.h"
+#ifdef COLORFLY_C4_PRO
+#include "adc.h"        /* C4 card-detect is on LSADC ch2 (ADC_EXTRA) */
+#endif
 #include "timeout.h"
 #include "lcd.h"
 #include <stdarg.h>
@@ -155,6 +158,12 @@ static inline bool card_detect_target(void)
 #elif defined(IHIFI760) || defined(IHIFI960)
     /* TODO: find out pin */
     return true;
+#elif defined(COLORFLY_C4_PRO)
+    /* C4 microSD detect is LSADC channel 2 (ADC_EXTRA), NOT a GPIO and NOT the
+     * SD controller's CD/DAT3. Present when the ADC reads below ~512 -- from the
+     * stock SYSTEM_BASE.RKW card_detect routine @0x6002bec0 (reads adc ch2,
+     * cmp #0x200, branch-if-<= to "present"). */
+    return (adc_read(ADC_EXTRA) < 512);
 #else
 #error "Unknown target"
 #endif
@@ -384,6 +393,19 @@ int sd_init(void)
     semaphore_init(&command_completion_signal, 1, 0);
 
     init_controller();
+
+#ifdef COLORFLY_C4_PRO
+    /* C4 has no HAVE_HOTSWAP, so disk_mount_all() unconditionally tries to mount
+     * every drive including SD. sd_init_card() legitimately fails (times out
+     * waiting for card responses) when no card is inserted -- that used to
+     * propagate up through storage_init() and HALT THE ENTIRE BOOT with a fatal
+     * "ATA error" screen, even though the NAND is perfectly fine. A missing
+     * removable card is not a hardware fault; skip the card handshake entirely
+     * and let disk_mount() fail the SD drive alone later, same as a normal
+     * mount-failure on any other drive. */
+    if (!card_detect_target())
+        return 0;
+#endif
 
     ret = sd_init_card();
     if(ret < 0)

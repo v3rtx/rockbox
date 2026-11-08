@@ -83,7 +83,14 @@ SECTIONS
      *(.stack)
      _stackbegin = .;
      stackbegin = .;
+#ifdef COLORFLY_C4_PRO
+     /* C4: the multi-volume (NAND+SD) + database (tagtree recursion -> tagcache ->
+      * SD storage) main-thread call chain overflows the stock 8K stack -> data abort
+      * in sd_write_sectors (str to a stack local past stackend, T:main). 32K. */
+     . += 0x8000;
+#else
      . += 0x2000;
+#endif
      _stackend = .;
      stackend = .;
      _irqstackbegin = .;
@@ -92,6 +99,13 @@ SECTIONS
      _fiqstackbegin = .;
      . += 0x400;
      _fiqstackend = .;
+     /* Dedicated ABORT/UNDEF-mode stack (crt0.S). The fault handler UIE runs in
+      * abort mode and paints the fault frame; sharing the 1 KB IRQ stack (which
+      * already holds the interrupted IRQ frames) overflowed and double-faulted,
+      * so give it its own 4 KB. */
+     _abortstackbegin = .;
+     . += 0x1000;
+     _abortstackend = .;
   } > DRAM
 
   .bss (NOLOAD) : {

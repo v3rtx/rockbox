@@ -84,6 +84,18 @@ static const char * const irqname[] =
 static void UIRQ(void)
 {
     unsigned int offset = INTC_ISR & 0x1f;
+
+    /* The RK27xx interrupt controller reports source 0x1f (INT_SW_INT3, which
+     * nothing in this port enables) when the interrupt that asserted the IRQ
+     * line has already deasserted by the time the handler reads INTC_ISR. This
+     * spurious read happens under heavy concurrent IRQ load - e.g. sustained
+     * USB mass-storage writes alongside audio (HDMA) and timer interrupts - and
+     * is harmless. Ignore it instead of panicking; the dispatcher clears the
+     * (already inactive) source on return. Genuine unhandled sources at other
+     * indices still panic so real bugs stay visible. */
+    if (offset == 0x1f)
+        return;
+
     panicf("Unhandled IRQ %02X: %s", offset, irqname[offset]);
 }
 
@@ -141,6 +153,7 @@ void system_init(void)
     core_sleep_init();
 
 #ifndef BOOTLOADER
+#ifndef COLORFLY_C4_PRO
     /* turn off clock for unused modules - not the NAND controller's: the
      * FTL uses it, and a register access with its HCLK gated aborts */
     SCU_CLKCFG |= CLKCFG_WDT        |        /* WDT pclk */
@@ -156,12 +169,22 @@ void system_init(void)
                   CLKCFG_UHC        |        /* USB host HCLK */
                   CLKCFG_DSP        |        /* DSP clock */
                   CLKCFG_OTP;                /* OTP clock (dunno what it is */
+#else
+    /* C4PRO: do NOT gate any clocks. MaskROM leaves SCU_CLKCFG = 0x00100000
+     * (almost everything on) and USB enumerates at high-speed; Rockbox's
+     * gating (0xc7bcc003) was starving the USB device PHY's clock domain,
+     * corrupting signalling (host error -71, full-speed only). Leaving the
+     * inherited clock config intact costs a little idle power but keeps USB
+     * working. */
+#endif
 
+#ifndef COLORFLY_C4_PRO
     /* turn off DSP pll */
     SCU_PLLCON2 |= (1<<22);
 
     /* turn off codec pll */
     SCU_PLLCON3 |= (1<<22);
+#endif
 #endif
 }
 
@@ -285,15 +308,30 @@ void udelay(unsigned usecs)
     );
 }
 
-/* No whole-cache invalidate at run time, as in the original firmware: it
- * invalidates the ways once, at power-on with the cache off (crt0.S), and
- * after that only single lines. Invalidating the ways while running from
- * cached SDRAM crashed depending on where code happened to lie - with the
- * cache on in the poll loop, and with it off later, as code was fetched
- * again. None is needed: the cache is unified and write-through, so what
- * the CPU writes, code included, is in memory and in any cached copy, and
- * every DMA into memory discards the lines of its own buffer first
- * (commit_discard_dcache_range()). */
+#ifdef C4PRO_CACHE_SPIN_CAP
+/* Iteration-capped wait for a cache op to finish (CACHEOP bits[1:0]). The raw
+ * `while (CACHEOP & 0x03)` is an UNCAPPED hardware-poll that runs with IRQs
+ * MASKED in two paths: commit_discard_idcache() wraps it in disable_irq_save(),
+ * and commit_discard_dcache_range() is reached from usb_core check_for_new_setup
+ * -> process_setup_request -> usb_drv_recv_nonblocking while IRQs are disabled.
+ * If a bus master (a wedged UDC/NAND DMA after a host link reset) never releases
+ * the AHB, CACHEOP never clears and the CPU spins forever with IRQs masked ->
+ * the T=D-frozen "busy-spin" hang (F=0, no CPU fault). Bound it: on timeout,
+ * give up on the (best-effort) cache op and proceed - a rare cache incoherence
+ * is far better than a dead device. Counts timeouts for the heartbeat. */
+volatile uint32_t c4pro_cache_spin_timeouts;
+#ifndef C4PRO_CACHE_SPIN_ITERS
+#define C4PRO_CACHE_SPIN_ITERS 8000000u   /* ~tens of ms ceiling; normal op << */
+#endif
+#define C4PRO_CACHE_WAIT() do {                         \
+        uint32_t _g = C4PRO_CACHE_SPIN_ITERS;           \
+        while ((CACHEOP & 0x03) && --_g)                \
+            ;                                           \
+        if (!_g) c4pro_cache_spin_timeouts++;           \
+    } while (0)
+#else
+#define C4PRO_CACHE_WAIT() do { while (CACHEOP & 0x03) ; } while (0)
+#endif
 void commit_discard_idcache(void)
 {
 }
@@ -305,13 +343,44 @@ void commit_discard_dcache_range (const void *base, unsigned int size)
     uint32_t end_opcode = (uint32_t)((uintptr_t)base + size) | 0x01;
     uint32_t opcode = (uint32_t)((uintptr_t)base & 0xffffffe0) | 0x01;
 
+#ifdef COLORFLY_C4_PRO
+    /* Batch IRQ-masked cache-line ops into 16-line (512B) windows and wait for
+     * CACHEOP completion before unmasking so INT_HDMA is never starved by a
+     * 4,800-line full-framebuffer flush nor able to race an in-flight CACHEOP. */
     while (opcode <= end_opcode)
     {
-        while (CACHEOP & 0x03);
+        int old_irq = disable_irq_save();
+        uint32_t batch_end;
+        if (end_opcode - opcode < (16u * 32u))
+            batch_end = end_opcode;
+        else
+            batch_end = opcode + (15u * 32u);
+
+        while (opcode <= batch_end)
+        {
+            C4PRO_CACHE_WAIT();
+            CACHEOP = opcode;
+            opcode += 32;
+        }
+        C4PRO_CACHE_WAIT();
+        restore_irq(old_irq);
+    }
+#else
+    while (opcode <= end_opcode)
+    {
+        C4PRO_CACHE_WAIT();
 
         CACHEOP = opcode;
         opcode += 32;
     }
+
+    /* The loop waits for the PREVIOUS op at the top of each iteration, so the
+     * final opcode issued above is never waited on. Without this, the last
+     * cache line's commit-discard can still be in flight when the caller starts
+     * a DMA from the just-flushed buffer (the rk27xx UDC IN DMA is a separate
+     * bus master). Wait for it here, matching cache_invalidate_way(). */
+    C4PRO_CACHE_WAIT();
+#endif
 }
 
 #if !defined(BOOTLOADER) && defined(HAVE_ADJUSTABLE_CPU_FREQ)

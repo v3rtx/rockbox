@@ -21,7 +21,15 @@
 #ifndef _CS4398_H
 #define _CS4398_H
 
+#if defined(COLORFLY_C4_PRO)
+/* C4 Pro: the software master volume stacks UNDER the analog ALPS potentiometer
+ * (the physical slider does fine control). Below ~-50 dB the digital output is
+ * effectively inaudible, so expose a compact, fully-useful -50..0 dB range
+ * instead of the DAC's full -127..0 dB. */
+#define CS4398_VOLUME_MIN	-500
+#else
 #define CS4398_VOLUME_MIN	-1270
+#endif
 #define CS4398_VOLUME_MAX	0
 
 #define AUDIOHW_CAPS (FILTER_ROLL_OFF_CAP | LINEOUT_CAP)
@@ -31,7 +39,11 @@ AUDIOHW_SETTING(FILTER_ROLL_OFF, "", 0, 1, 0, 1, 0)
 void cs4398_write_reg(uint8_t reg, uint8_t val);
 uint8_t cs4398_read_reg(uint8_t reg);
 
+#ifdef COLORFLY_C4_PRO
+#define CS4398_I2C_ADDR		0x4c /* AD0..2 low on the C4 board */
+#else
 #define CS4398_I2C_ADDR		0x4f /* 1001111 */
+#endif
 
 #define CS4398_REG_CHIPID       0x01
 #define CS4398_REG_MODECTL      0x02

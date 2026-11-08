@@ -129,13 +129,17 @@ static void sink_dma_start(const void *addr, size_t size)
     hdma_i2s_transfer(addr, size);
 }
 
+#ifdef CODEC_SLAVE
+#define RK27XX_I2S_MASTER
+#endif
+
 #define I2S_FORMAT  ((1<<16) |  /* LRCK/SCLK = 64 */ \
                      (4<<8)  |  /* MCLK/SCLK = 4 */ \
                      (1<<4)  |  /* 16bit samples */ \
                      (0<<3)  |  /* stereo */ \
                      (0<<1)  |  /* I2S IF */ \
                      I2S_MASTER)
-#ifdef CODEC_SLAVE
+#ifdef RK27XX_I2S_MASTER
 #define I2S_MASTER  (1<<0)     /* master mode */
 #else
 #define I2S_MASTER  (0<<0)     /* slave mode */
@@ -154,11 +158,15 @@ static void i2s_init(void)
 #else
     /* iomux I2S external */
     SCU_IOMUXA_CON |= (1<<19);   /* i2s external bit */
+#if defined(COLORFLY_C4_PRO)
+    SCU_IOMUXB_CON = (SCU_IOMUXB_CON & ~0x1f) | 0x0b;
+#else
     SCU_IOMUXB_CON |= ((1<<4) |  /* i2s_mclk */
                        (1<<3) |  /* i2s_sdo */
                        (1<<2) |  /* i2s_sdi */
                        (1<<1) |  /* i2s_lrck */
                        (1<<0));  /* i2s_bck */
+#endif
 #endif
 
     /* enable i2s clocks */
@@ -186,7 +194,7 @@ static void i2s_init(void)
               (0<<4)  |  /* Req1 for Tx fifo */
               (1<<3)  |  /* Req2 for Rx fifo */
               (0<<2)  |  /* normal operation */
-#ifdef CODEC_SLAVE
+#ifdef RK27XX_I2S_MASTER
               (1<<1)  |  /* start Tx (master mode) */
               (0<<0);    /* do not start Rx (master mode) */
                          /* setting Rx bit to 1 result in choppy audio */
@@ -196,7 +204,7 @@ static void i2s_init(void)
 #endif
 }
 
-#if defined(CODEC_SLAVE) || defined(RK27XX_I2S_MCLK)
+#if defined(RK27XX_I2S_MASTER) || defined(RK27XX_I2S_MCLK)
 /* When codec is slave, or master off our MCLK (RK27XX_I2S_MCLK), we need
  * to setup i2s MCLK clock using codec pll.
  * The MCLK frequency is 256*codec frequency as i2s setup is:
@@ -279,7 +287,7 @@ static void sink_dma_init(void)
 
 static void sink_set_freq(uint16_t freq)
 {
-#if defined(CODEC_SLAVE) || defined(RK27XX_I2S_MCLK)
+#if defined(RK27XX_I2S_MASTER) || defined(RK27XX_I2S_MCLK)
     set_codec_freq(freq);
 #endif
 
@@ -357,7 +365,7 @@ struct pcm_sink builtin_pcm_sink = {
 /* I2S_OPR while playing only, and while recording too. In master mode the
  * Rx side runs only while recording: started with nothing reading its FIFO
  * it upsets playback. */
-#ifdef CODEC_SLAVE
+#ifdef RK27XX_I2S_MASTER
 #define I2S_OPR_START_TX    (1<<1)
 #define I2S_OPR_START_RX    (1<<0)
 #else
