@@ -470,11 +470,30 @@ void I_ShutdownGraphics(void)
 #define DOOMBUTTON_LEFT    BUTTON_LEFT
 #define DOOMBUTTON_RIGHT   BUTTON_RIGHT
 #define DOOMBUTTON_OPEN    (BUTTON_POWER | BUTTON_SELECT)
-#define DOOMBUTTON_ESC     (BUTTON_POWER | BUTTON_UP)
+#define DOOMBUTTON_ESC     BUTTON_BACK
 #define DOOMBUTTON_ENTER   BUTTON_SELECT
 #define DOOMBUTTON_SHOOT   BUTTON_SELECT
 #define DOOMBUTTON_WEAPON  (BUTTON_POWER | BUTTON_LEFT)
 #define DOOMBUTTON_MAP     (BUTTON_POWER | BUTTON_RIGHT)
+
+#elif CONFIG_KEYPAD == C4PRO_PAD
+/* Colorfly C4 Pro: the ADC keypad only ever produces MENU, SELECT, BACK, LEFT,
+ * SRC, EQ, UP, DOWN, RIGHT (never POWER/NEXT/PREV), so every doom action gets
+ * its own discrete front-panel key -- no unreachable combos or dead buttons.
+ * SELECT is fire in-game and confirm in the menu (KEY_RCTRL + KEY_ENTER), so the
+ * doom menu's Quit entry can be confirmed with SELECT. BACK opens the menu (ESC);
+ * doom runs its own button loop, so BACK does not trigger the plugin-quit path.
+ * The automap (DOOMBUTTON_MAP) is intentionally left unbound -- EQ must not open
+ * it -- so it never fires accidentally. */
+#define DOOMBUTTON_UP      BUTTON_UP
+#define DOOMBUTTON_DOWN    BUTTON_DOWN
+#define DOOMBUTTON_LEFT    BUTTON_LEFT
+#define DOOMBUTTON_RIGHT   BUTTON_RIGHT
+#define DOOMBUTTON_SHOOT   BUTTON_SELECT
+#define DOOMBUTTON_ENTER   BUTTON_SELECT
+#define DOOMBUTTON_OPEN    BUTTON_MENU
+#define DOOMBUTTON_ESC     BUTTON_BACK
+#define DOOMBUTTON_WEAPON  BUTTON_SRC
 
 #elif CONFIG_KEYPAD == HM801_PAD
 #define DOOMBUTTON_UP      BUTTON_UP

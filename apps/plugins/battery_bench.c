@@ -225,6 +225,13 @@ struct battery_tables_t {
 
 #define BATTERY_OFF_TXT "POWER"
 
+#elif CONFIG_KEYPAD == C4PRO_PAD
+#define BATTERY_ON BUTTON_SELECT
+#define BATTERY_OFF BUTTON_BACK
+#define BATTERY_ON_TXT  "SELECT - start"
+
+#define BATTERY_OFF_TXT "BACK"
+
 #elif CONFIG_KEYPAD == DX50_PAD
 #define BATTERY_ON      BUTTON_PLAY
 #define BATTERY_OFF     BUTTON_POWER_LONG

@@ -189,10 +189,18 @@
 #define ZX_LEFT         BUTTON_LEFT
 #define ZX_RIGHT        BUTTON_RIGHT
 
-#elif (CONFIG_KEYPAD == HM60X_PAD) || \
-    (CONFIG_KEYPAD == HM801_PAD)
+#elif (CONFIG_KEYPAD == HM60X_PAD) || (CONFIG_KEYPAD == HM801_PAD)
 
 #define ZX_MENU         BUTTON_POWER
+#define ZX_UP           BUTTON_UP
+#define ZX_DOWN         BUTTON_DOWN
+#define ZX_SELECT       BUTTON_SELECT
+#define ZX_LEFT         BUTTON_LEFT
+#define ZX_RIGHT        BUTTON_RIGHT
+
+#elif CONFIG_KEYPAD == C4PRO_PAD
+
+#define ZX_MENU         BUTTON_BACK
 #define ZX_UP           BUTTON_UP
 #define ZX_DOWN         BUTTON_DOWN
 #define ZX_SELECT       BUTTON_SELECT
