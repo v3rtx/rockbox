@@ -57,6 +57,13 @@ static void c4pro_gpio_set_pc(int bit, bool high)
 
 static void c4pro_clockgen_write(unsigned int word)
 {
+    static unsigned int current_word = 0;
+    static bool current_word_valid = false;
+    if (current_word_valid && word == current_word)
+        return;
+    current_word = word;
+    current_word_valid = true;
+
     c4pro_gpio_out_pc(1);
     c4pro_gpio_out_pc(4);
     c4pro_gpio_out_pc(6);
@@ -190,8 +197,6 @@ static void c4pro_detect_audio_codecs(void)
 static void cs8422_init(void)
 {
     cs8422_write_reg(0x02, 0x80);
-#ifdef C4PRO_RK_I2S_SLAVE_TEST
-    /* Exact T1 tone-test route: RK I2S slave, CS8422 SAI master/SRC I2S. */
     cs8422_write_reg(0x03, 0x08);
     cs8422_write_reg(0x04, 0x84);
     cs8422_write_reg(0x07, 0x40);
@@ -202,18 +207,6 @@ static void cs8422_init(void)
     cs8422_write_reg(0x0c, 0x84);
     cs8422_write_reg(0x0d, 0x84);
     cs8422_write_reg(0x02, 0x08);
-#else
-    cs8422_write_reg(0x03, 0x84);
-    cs8422_write_reg(0x04, 0x40);
-    cs8422_write_reg(0x07, 0x40);
-    cs8422_write_reg(0x08, 0x40);
-    cs8422_write_reg(0x09, 0x00);
-    cs8422_write_reg(0x0a, 0x00);
-    cs8422_write_reg(0x0b, 0x88);
-    cs8422_write_reg(0x0c, 0x84);
-    cs8422_write_reg(0x0d, 0x84);
-    cs8422_write_reg(0x02, 0x08);
-#endif
 }
 
 static void c4pro_cs4398_unmute(void)

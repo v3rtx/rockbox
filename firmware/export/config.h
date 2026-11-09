@@ -1005,7 +1005,7 @@ Lyre prototype 1 */
  * plenty of RAM. Both features can be enabled independently. */
 #if (MEMORYSIZE >= 8) && !defined(BOOTLOADER) && (defined(CHECKWPS) || !defined(__PCTOOL__)) \
     && !defined(APPLICATION)
-#ifndef SIMULATOR
+#if !defined(SIMULATOR) && !defined(COLORFLY_C4_PRO)
 #define HAVE_DIRCACHE
 #endif
 #ifdef HAVE_TAGCACHE

@@ -18,7 +18,6 @@
                          SAMPR_CAP_16 | SAMPR_CAP_12 | SAMPR_CAP_11 | SAMPR_CAP_8)
 
 #define HAVE_CS4398
-#define CODEC_SLAVE
 
 /* define this if you have a colour LCD */
 #define HAVE_LCD_COLOR

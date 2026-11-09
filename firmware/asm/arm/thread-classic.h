@@ -35,6 +35,8 @@ struct regs
 #else
   #define DEFAULT_STACK_SIZE 0x1000 /* Bytes */
 #endif
+#elif defined(COLORFLY_C4_PRO)
+  #define DEFAULT_STACK_SIZE 0x2000 /* Bytes */
 #else
   #define DEFAULT_STACK_SIZE 0x400  /* Bytes */
 #endif

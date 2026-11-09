@@ -1440,6 +1440,12 @@ static int add_track_to_playlist_unlocked(struct playlist_info* playlist,
             return result;
     }
 
+#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+    if (seek_pos < 0)
+        seek_pos = 0;
+    seek_pos &= PLAYLIST_SEEK_MASK;
+#endif
+
     playlist->indices[insert_position] = flags | seek_pos;
     dc_init_filerefs(playlist, insert_position, 1);
 

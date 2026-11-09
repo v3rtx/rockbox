@@ -81,8 +81,6 @@ static void sink_dma_stop(void)
 {
     HDMA_CON0 = 0x00;
     hdma_isr_update(HDMA_CH0_ISR_BITS, HDMA_CH0_ISR_STOP);
-
-    locked = 1;
 }
 
 static void hdma_i2s_transfer(const void *addr, size_t size)
