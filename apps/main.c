@@ -1510,10 +1510,6 @@ static void init(void)
         }
     }
 
-#if defined(HAVE_MULTIVOLUME) && defined(COLORFLY_C4_PRO)
-    init_volume_names();
-#endif
-
     pcm_init();
     dsp_init();
 

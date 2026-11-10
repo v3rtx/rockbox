@@ -49,8 +49,6 @@
 #define HAVE_SW_VOLUME_CONTROL
 
 #define NUM_DRIVES 2
-#define HAVE_MULTIDRIVE
-#define HAVE_MULTIVOLUME
 #define SECTOR_SIZE 512
 
 /* for small(ish) SD cards */
@@ -139,11 +137,6 @@
 #define C4PRO_USB_DEFER_WRITE
 #define C4PRO_USB_RX_STALL_KICK
 #define C4PRO_USB_IRQ_DRAIN
-
-/* Run RK27xx I2S as slave; CS8422/CPLD clockgen provides master clock. */
-#if !defined(C4PRO_NO_RK_I2S_SLAVE) && !defined(C4PRO_RK_I2S_SLAVE_TEST)
-#define C4PRO_RK_I2S_SLAVE_TEST 1
-#endif
 
 #ifndef C4PRO_USB_NO_RESET_STALE_GUARD
 #define C4PRO_USB_RESET_STALE_GUARD
