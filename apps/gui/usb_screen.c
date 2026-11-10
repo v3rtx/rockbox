@@ -45,7 +45,7 @@
 
 #include "bitmaps/usblogo.h"
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
 #include "system.h"
 #include "storage.h"
 /* HID is force-disabled for this target in usb_configure_drivers() (the host's
@@ -187,7 +187,7 @@ static void handle_usb_events(struct viewport *title)
         if (button == SYS_CHARGER_DISCONNECTED)
             reset_runtime();
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
         c4pro_usb_screen_reflash_poll();
         c4pro_usb_screen_chargeonly_poll();
 #endif
@@ -206,7 +206,7 @@ static void handle_usb_events(struct viewport *title)
     }
 }
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
 /* What this screen can do besides serving the host. Lines 0-2 sit under the
  * status bar and are not readable, so the legend starts at 4. */
 static void c4pro_usb_screen_hints(void)
@@ -345,7 +345,7 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
     push_current_activity(ACTIVITY_USBSCREEN);
 
 #if defined(USB_ENABLE_HID) && \
-    !(defined(COLORFLY_C4_PRO) && !defined(SIMULATOR))
+    !defined(COLORFLY_C4_PRO)
     usb_keypad_mode = global_settings.usb_keypad_mode;
     title = &usb_screen_vps_ar[SCREEN_MAIN].title;
 #else
@@ -372,14 +372,14 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
     send_event(GUI_EVENT_ACTIONUPDATE, NULL);
 #endif
 
-#if !(defined(COLORFLY_C4_PRO) && !defined(SIMULATOR))
+#if !defined(COLORFLY_C4_PRO)
     if(!early_usb)
     {
         /* The font system leaves the .fnt fd's open, so we need for force close them all */
         font_disable_all();
     }
 #endif
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
     /* PAINT FIRST, then do the slow work, then ack. default_event_handler()
      * used to run system_flush() (playlist_shutdown + tree_flush +
      * open_plugin_cache_flush + the storage idle notifys -- seconds of NAND
@@ -445,7 +445,7 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
         settings_apply(true);
         /* Reload playlist */
         int resume = playlist_resume();
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
         /* Charge-only was picked here: the cable is still in and storage is
          * back, so pick the music up where the plug's audio_hard_stop() left
          * it.

@@ -147,7 +147,7 @@ volatile bool c4pro_vbus_at_boot = true;
 volatile unsigned c4pro_usb_diag_outn_count;
 #endif
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
 volatile unsigned c4pro_usb_setup_seq;   /* monotonic setup-packet counter */
 #endif
 
@@ -215,7 +215,7 @@ static void ep0_setup_received(void)
     if(setup.words[0] == 0 && setup.words[1] == 0)
         return;
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
     /* Bump a monotonic setup sequence so the C4PRO USB monitor thread can tell a
      * live (advancing) enumeration from a stalled one and re-present the marginal
      * HS PHY only when it is genuinely stuck. */
@@ -952,7 +952,7 @@ void usb_drv_stall(int endpoint, bool stall, bool in)
     }
 }
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
 /* Production accessor + re-present used by the C4PRO USB monitor thread to
  * recover the marginal HS PHY (host logs "device descriptor read/64, error -71"
  * on a failed attempt).

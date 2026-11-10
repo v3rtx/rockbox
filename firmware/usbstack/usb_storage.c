@@ -552,7 +552,7 @@ static int usb_storage_init_connection(void)
 
 void usb_storage_disconnect(void)
 {
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(HAVE_STORAGE_FLUSH)
+#if defined(COLORFLY_C4_PRO) && defined(HAVE_STORAGE_FLUSH)
     storage_flush();
 #endif
 #ifndef USB_STATIC_ALLOC

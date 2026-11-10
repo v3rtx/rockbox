@@ -80,11 +80,11 @@
 #if defined(HAVE_DEVICEDATA)
 #include "devicedata.h"
 #endif
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
 #include "nand-target.h"
 #endif
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+#if defined(COLORFLY_C4_PRO) && \
     defined(C4PRO_APP_SYSTEM_INSTALLER) && \
     defined(C4PRO_APP_NATIVE_ROCKBOX_INSTALLER)
 #ifdef C4PRO_APP_SYSTEM_INSTALLER_EMBEDDED
@@ -1349,7 +1349,7 @@ static void init(void)
 #endif
 
     backlight_init();
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
     backlight_on();
 #endif
 
@@ -1402,7 +1402,7 @@ static void init(void)
         panicf("disk: %d", rc);
     }
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && \
+#if defined(COLORFLY_C4_PRO) && \
     defined(C4PRO_APP_SYSTEM_INSTALLER) && \
     defined(C4PRO_APP_NATIVE_ROCKBOX_INSTALLER)
     c4pro_app_native_rockbox_installer();
@@ -1520,7 +1520,7 @@ static void init(void)
     CHART(">settings_load");
     settings_load();
     CHART("<settings_load");
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
     global_settings.dirfilter = SHOW_ALL;
 #endif
 

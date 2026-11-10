@@ -115,7 +115,7 @@ static const char usb_thread_name[] = "usb";
 static unsigned int usb_thread_entry = 0;
 static bool usb_monitor_enabled = false;
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(USB_FULL_INIT)
+#if defined(COLORFLY_C4_PRO) && defined(USB_FULL_INIT)
 /* C4PRO USB monitor thread -- see usb_init(). Runs two watchdogs: the
  * marginal-HS-PHY re-present (always) and the sustained-write stall-kick (when
  * RX_STALL_KICK && PHASE_MARK are configured). */
@@ -138,7 +138,7 @@ static int usb_audio = 0;
 static bool usb_host_present = false;
 static int usb_num_acks_to_expect = 0;
 static uint32_t usb_broadcast_seqnum = 0x80000000;
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(USB_FULL_INIT)
+#if defined(COLORFLY_C4_PRO) && defined(USB_FULL_INIT)
 /* rk27xx driver hooks (firmware/target/arm/rk27xx/usb-drv-rk27xx.c) */
 void c4pro_usb_detach(void);
 void c4pro_usb_arm_reconnect(void);
@@ -454,7 +454,7 @@ static void usb_set_host_present(bool present)
     usb_configure_drivers(USB_INSERTED);
 }
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(USB_FULL_INIT)
+#if defined(COLORFLY_C4_PRO) && defined(USB_FULL_INIT)
 /* The deferred half of a C4 plug, run once every thread has acked the connect
  * (or, as a backstop, when the monitor thread's deadline expires). Ordered so
  * that ALL filesystem and NAND work is finished before the PHY goes live:
@@ -559,7 +559,7 @@ static void NORETURN_ATTR usb_thread(void)
 
             usb_state = USB_POWERED;
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
 #ifndef BOOTLOADER
             /* CHARGE-ONLY (System > USB > USB mode = Charge, or picked on the
              * USB screen for the rest of this plug). Decided HERE, before
@@ -653,8 +653,7 @@ static void NORETURN_ATTR usb_thread(void)
 #endif
             send_event(SYS_EVENT_USB_INSERTED, &usb_mode);
 #endif
-#if defined(HAVE_USB_POWER) && \
-    !(defined(COLORFLY_C4_PRO) && !defined(SIMULATOR))
+#if defined(HAVE_USB_POWER) && !defined(COLORFLY_C4_PRO)
             /* Power (charging-only) button */
             usb_power_only = usb_mode != USB_MODE_MASS_STORAGE;
             if(button_status() & ~USBPOWER_BTN_IGNORE) {
@@ -669,7 +668,7 @@ static void NORETURN_ATTR usb_thread(void)
             break;
             /* USB_INSERTED */
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && defined(USB_FULL_INIT)
+#if defined(COLORFLY_C4_PRO) && defined(USB_FULL_INIT)
         case USB_C4PRO_ATTACH_NOW:
             /* Backstop: a thread never acked the connect. Bring USB up anyway
              * -- a late screen beats a plug that never enumerates.
@@ -722,7 +721,7 @@ static void NORETURN_ATTR usb_thread(void)
                 usb_signal_class_notify(USB_DRIVER_MASS_STORAGE, 0);
 #endif
             }
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
             else if(c4pro_attach_deferred) {
                 c4pro_finish_deferred_attach();
             }
@@ -737,7 +736,7 @@ static void NORETURN_ATTR usb_thread(void)
             if(usb_state == USB_POWERED || usb_state == USB_INSERTED)
                 usb_stack_enable(false);
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR)
+#if defined(COLORFLY_C4_PRO)
             {
                 extern void c4pro_usb_arm_reconnect(void);
                 /* Re-arm the recalibrating connect for the next plug (the
@@ -1292,7 +1291,7 @@ bool usb_powered_only(void)
     return usb_power_only;
 }
 
-#if defined(COLORFLY_C4_PRO) && !defined(SIMULATOR) && !defined(BOOTLOADER)
+#if defined(COLORFLY_C4_PRO) && !defined(BOOTLOADER)
 void c4pro_usb_charge_only(void)
 {
     queue_post(&usb_queue, USB_C4PRO_CHARGE_ONLY, 0);
