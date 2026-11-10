@@ -44,7 +44,6 @@ static const struct button_mapping button_context_standard[] = {
     { ACTION_STD_OK,         BUTTON_SELECT|BUTTON_REL,     BUTTON_SELECT },
     { ACTION_STD_MENU,       BUTTON_MENU|BUTTON_REL,       BUTTON_MENU },
     { ACTION_STD_KEYLOCK,    BUTTON_EQ|BUTTON_REPEAT,      BUTTON_EQ },
-    { ACTION_STD_KEYLOCK,    BUTTON_LEFT|BUTTON_RIGHT|BUTTON_REPEAT,  BUTTON_LEFT|BUTTON_RIGHT },
 
     LAST_ITEM_IN_LIST
 }; /* button_context_standard */
@@ -77,7 +76,6 @@ static const struct button_mapping button_context_wps[] = {
     { ACTION_WPS_QUICKSCREEN,      BUTTON_EQ|BUTTON_REL,           BUTTON_EQ    },
     { ACTION_WPS_QUICKSCREEN,      BUTTON_DOWN|BUTTON_REPEAT,      BUTTON_DOWN  },
     { ACTION_STD_KEYLOCK,          BUTTON_EQ|BUTTON_REPEAT,        BUTTON_EQ    },
-    { ACTION_STD_KEYLOCK,          BUTTON_LEFT|BUTTON_RIGHT|BUTTON_REPEAT, BUTTON_LEFT|BUTTON_RIGHT },
 
     LAST_ITEM_IN_LIST
 }; /* button_context_wps */
@@ -205,7 +203,7 @@ static const struct button_mapping button_context_yesnoscreen[] = {
 /* get_context_mapping returns a pointer to one of the above defined arrays depending on the context */
 const struct button_mapping* get_context_mapping(int context)
 {
-    switch (context)
+    switch (context & ~CONTEXT_LOCKED)
     {
         /* anything that uses button_context_standard */
         case CONTEXT_LIST:

@@ -896,6 +896,8 @@ static inline void do_softlock(action_last_t *last, action_cur_t *cur)
 #endif
         last->unlock_combo = cur->button;
         do_key_lock(!last->keys_locked);
+        if (!has_flag(cur->button, BUTTON_REL))
+            last->wait_for_release = true;
         notify_user = true;
     }
 #if (BUTTON_REMOTE != 0)/* Allow remote actions through */
@@ -937,6 +939,8 @@ static inline void do_softlock(action_last_t *last, action_cur_t *cur)
 
     if (notify_user)
     {
+        bool lock_toggle = (action == ACTION_STD_KEYLOCK)
+            || (last->keys_locked && last->unlock_combo == cur->button);
 #ifndef BOOTLOADER
         skin_request_update_locked(last->keys_locked);
 #endif
@@ -964,6 +968,8 @@ static inline void do_softlock(action_last_t *last, action_cur_t *cur)
         action       = ACTION_REDRAW;
         last->button = BUTTON_NONE;
         button_clear_queue();
+        if (lock_toggle && !has_flag(cur->button, BUTTON_REL))
+            last->wait_for_release = true;
     }
 
     cur->action = action;
